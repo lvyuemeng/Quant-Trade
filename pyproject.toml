@@ -1,0 +1,57 @@
+[project]
+name = "quant-trade"
+version = "0.1.0"
+description = "Quantitative trading self-learning project"
+readme = "README.md"
+requires-python = ">=3.13"
+
+dependencies = [
+    "marimo>=0.19.4",
+    "polars>=1.0",
+    "narwhals>=1.0",
+    "akshare>=1.0",
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "plotly>=5.20",
+    "seaborn>=0.13",
+    "pyzmq>=27.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "mypy>=1.19.1",
+    "ruff>=0.14.13",
+    "taskipy>=1.14.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "W"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.taskipy.tasks]
+test = "pytest tests/"
+test-coverage = "pytest tests/ --cov=notebooks/utils --cov-report=html"
+test-ci = "pytest tests/ --cov=notebooks/utils --cov-report=term-missing"
+lint = "ruff check notebooks/ tests/"
+lint-fix = "ruff check --fix notebooks/ tests/"
+format = "ruff format notebooks/ tests/"
+typecheck = "mypy notebooks/ tests/"
