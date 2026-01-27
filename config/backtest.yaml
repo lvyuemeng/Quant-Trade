@@ -1,0 +1,16 @@
+backtest:
+  initial_capital: 10000000
+  commission: 0.0003
+  slippage: 0.0005
+  rebalance_freq: "M"
+  top_k: 50
+  max_weight_per_stock: 0.05
+  weight_method: "equal"
+  benchmark: "000300.SH"
+
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+  rotation: "100 MB"
+  retention: "30 days"
+  path: "logs/ashare_quant_{time}.log"

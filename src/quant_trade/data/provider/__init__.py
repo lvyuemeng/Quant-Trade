@@ -1,0 +1,1 @@
+"""Provider of raw data."""

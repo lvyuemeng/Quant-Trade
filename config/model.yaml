@@ -1,0 +1,29 @@
+model:
+  horizons: [20, 60, 252]
+  
+  lgb_params:
+    objective: "lambdarank"
+    metric: "ndcg"
+    ndcg_eval_at: [5, 10, 20]
+    boosting_type: "gbdt"
+    num_leaves: 31
+    learning_rate: 0.05
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    min_child_samples: 20
+    lambda_l1: 0.1
+    lambda_l2: 0.1
+    verbose: -1
+    seed: 42
+  
+  training:
+    num_boost_round: 1000
+    early_stopping_rounds: 50
+    train_test_split: 0.8
+  
+  ensemble:
+    weights:
+      "20d": 0.3
+      "60d": 0.4
+      "252d": 0.3

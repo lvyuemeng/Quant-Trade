@@ -8,6 +8,7 @@ app = marimo.App()
 def _():
     import marimo as mo
     from utils import get_stock_data, plot_kline
+
     return get_stock_data, mo, plot_kline
 
 

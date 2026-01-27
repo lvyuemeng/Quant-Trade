@@ -6,15 +6,26 @@ readme = "README.md"
 requires-python = ">=3.13"
 
 dependencies = [
+    # book
     "marimo>=0.19.4",
-    "polars>=1.0",
-    "narwhals>=1.0",
+    # data source
     "akshare>=1.0",
+    # data processing
     "numpy>=2.0",
-    "scipy>=1.14",
+    "narwhals>=1.0",
+    "polars>=1.0",
+    "pyarrow>=15.0",
+    # data visualization
     "plotly>=5.20",
     "seaborn>=0.13",
-    "pyzmq>=27.1.0",
+
+    "scipy>=1.14",
+    "backtrader>=1.9.78.123",
+
+    # logging
+    "loguru>=0.7.3",
+    # config
+    "pyyaml>=6.0.3",
 ]
 
 [dependency-groups]
@@ -25,7 +36,11 @@ dev = [
     "mypy>=1.19.1",
     "ruff>=0.14.13",
     "taskipy>=1.14.1",
+    "types-PyYAML",
 ]
+    
+[tool.uv]
+package = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -36,7 +51,8 @@ addopts = "-v --tb=short"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "W"]
-ignore = []
+# long line is acceptable in format.
+ignore = ["E501"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -51,7 +67,7 @@ disallow_untyped_defs = true
 test = "pytest tests/"
 test-coverage = "pytest tests/ --cov=notebooks/utils --cov-report=html"
 test-ci = "pytest tests/ --cov=notebooks/utils --cov-report=term-missing"
-lint = "ruff check notebooks/ tests/"
-lint-fix = "ruff check --fix notebooks/ tests/"
-format = "ruff format notebooks/ tests/"
-typecheck = "mypy notebooks/ tests/"
+lint = "ruff check notebooks/ tests/ src/"
+lint-fix = "ruff check --fix notebooks/ tests/ src/"
+format = "ruff format notebooks/ tests/ src/"
+typecheck = "mypy notebooks/ tests/ src/"
