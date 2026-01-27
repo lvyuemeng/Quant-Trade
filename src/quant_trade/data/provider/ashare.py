@@ -25,15 +25,15 @@ class MarginBalance(Protocol):
         ...
 
 
-class IndexValuation(Protocol):
-    """Protocol for index valuation data."""
+# class IndexValuation(Protocol):
+#     """Protocol for index valuation data."""
 
-    def fetch_index_valuation_csindex(self, symbol: str = "000300") -> pl.DataFrame:
-        """Fetch index valuation from the csindex valuation endpoint."""
-        ...
+#     def fetch_index_valuation_csindex(self, symbol: str = "000300") -> pl.DataFrame:
+#         """Fetch index valuation from the csindex valuation endpoint."""
+#         ...
 
 
-class AShareSpecificInfo(NorthboundFlow, MarginBalance, IndexValuation, Protocol):
+class AShareSpecificInfo(NorthboundFlow, MarginBalance, Protocol):
     """Combined protocol for all A-share specific information."""
 
     pass

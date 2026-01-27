@@ -1,40 +1,142 @@
 """AkShare data provider implementation."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import akshare as ak
 import pandas as pd
 import polars as pl
 import yaml
 
+from quant_trade.data.provider.utils import (
+    AdjustCN,
+    OptDateLike,
+    Period,
+    clean_timedf,
+    date_f_datelike,
+    fallback_col,
+    str_f_datelike,
+)
 from quant_trade.utils.logger import log
 
-from .traits import DataProvider
+
+def stock_code_sh_whole() -> pl.DataFrame:
+    df = ak.stock_info_sh_name_code(symbol="主板A股")
+    df = pl.from_pandas(df)
+
+    return clean_timedf(
+        df=df,
+        rename={
+            "证券代码": "ts_code",
+            "证券简称": "name",
+            "上市日期": "publish_date",
+        },
+        select=["ts_code", "name", "publish_date"],
+        date_col="publish_date",
+    )
 
 
-def _first_existing_column(
-    columns: list[str], *, candidates: list[str], label: str
-) -> str:
-    for c in candidates:
-        if c in columns:
-            return c
-    msg = f"Unable to find {label} column. Tried: {candidates}. Available columns: {columns}"
-    raise KeyError(msg)
+def stock_code_sz_whole() -> pl.DataFrame:
+    df = ak.stock_info_sz_name_code(symbol="A股列表")
+    df = pl.from_pandas(df)
+
+    return clean_timedf(
+        df=df,
+        rename={
+            "A股代码": "ts_code",
+            "A股简称": "name",
+            "A股上市日期": "publish_date",
+        },
+        date_col="publish_date",
+        select=["ts_code", "name", "publish_date"],
+    )
 
 
-def _strip_exchange_suffix(code: str) -> str:
-    """Convert AkShare-style stock code like '600313.SH' to '600313'."""
-    return code.split(".")[0]
+def stock_code_bj_whole() -> pl.DataFrame:
+    df = ak.stock_info_bj_name_code()
+    df = pl.from_pandas(df)
 
-def _to_trade_date(trade_date: str | date | None) -> date:
-    if trade_date is None:
-        return datetime.now().date()
-    if isinstance(trade_date, str):
-        return datetime.strptime(trade_date, "%Y%m%d").date()
-    return trade_date
+    return clean_timedf(
+        df=df,
+        rename={
+            "证券代码": "ts_code",
+            "证券简称": "name",
+            "上市日期": "publish_date",
+        },
+        select=["ts_code", "name", "publish_date"],
+        date_col="publish_date",
+    )
 
 
-class AkShareProvider(DataProvider):
+def stock_code_sus(date: str | datetime) -> pl.DataFrame:
+    df = ak.stock_tfp_em(date=str_f_datelike(date))
+    df = pl.from_pandas(df).select(
+        [pl.col("代码").alias("ts_code"), pl.col("名称").alias("name")]
+    )
+    df = df.with_columns(
+        [pl.col("ts_code").cast(pl.String), pl.col("name").cast(pl.String)]
+    )
+
+    return df
+
+
+def stock_code_sh_delist() -> pl.DataFrame:
+    df = ak.stock_info_sh_delist(symbol="全部")
+    df = pl.from_pandas(df).select(
+        [
+            pl.col("公司代码").alias("ts_code"),
+            pl.col("公司简称").alias("name"),
+            pl.col("暂停上市日期").alias("off_date"),
+        ]
+    )
+
+    df = df.with_columns(
+        [
+            pl.col("ts_code").cast(pl.String),
+            pl.col("name").cast(pl.String),
+            pl.col("off_date").cast(pl.String).str.to_date(strict=False),
+        ]
+    )
+
+    return df
+
+
+def stock_code_sz_delist() -> pl.DataFrame:
+    df = ak.stock_info_sz_delist(symbol="终止上市公司")
+
+    df = pl.from_pandas(df).select(
+        [
+            pl.col("证券代码").alias("ts_code"),
+            pl.col("证券简称").alias("name"),
+            pl.col("终止上市日期").alias("off_date"),
+        ]
+    )
+
+    df = df.with_columns(
+        [
+            pl.col("ts_code").cast(pl.String),
+            pl.col("name").cast(pl.String),
+            pl.col("off_date").cast(pl.String).str.to_date(strict=False),
+        ]
+    )
+
+    return df
+
+
+def stock_code_delist() -> pl.DataFrame:
+    sh_df = stock_code_sh_delist()
+    sz_df = stock_code_sz_delist()
+    return pl.concat([sh_df, sz_df], how="vertical_relaxed")
+
+
+def stock_code_whole() -> pl.DataFrame:
+    sh_df = stock_code_sh_whole()
+    sz_df = stock_code_sz_whole()
+    bj_df = stock_code_bj_whole()
+
+    return pl.concat([sh_df, sz_df, bj_df], how="vertical_relaxed")
+
+
+class AkShareProvider:
     """AkShare implementation of the DataProvider interface."""
 
     def __init__(self, config_path: str = "config/data.yaml"):
@@ -43,65 +145,74 @@ class AkShareProvider(DataProvider):
 
         log.info("Initialized AkShareProvider")
 
-    def stock_universe(
-        self, trade_date: str | date | None = None
-    ) -> pl.DataFrame:
+    def stock_universe(self, trade_date: OptDateLike = None) -> pl.DataFrame:
         """
-        Get tradeable A-share universe for a given date.
+        Get tradeable A-share universe for a given date using the complete stock list.
 
         Filters:
-        - Remove ST/*ST stocks
-        - Remove suspended stocks
-        - Remove stocks < 60 days from IPO
-        """
-        trade_date = _to_trade_date(trade_date)
+            - Remove ST/*ST(delist) stocks
+            - Remove newly listed stocks >= 360 days
 
+        Args:
+            trade_date: date in format 'YYYYMMDD'.
+
+        Returns:
+            DataFrame with 'ts_code' and 'name' columns
+        """
+        trade_date = date_f_datelike(trade_date)
         log.info(f"Fetching stock universe for {trade_date}")
 
-        df_spot = ak.stock_zh_a_spot_em()
-        df = pl.from_pandas(df_spot)
+        df = stock_code_whole()
 
-        df = df.rename(
-            {
-                "代码": "ts_code",
-                "名称": "name",
-                "成交量": "volume",
-                "换手率": "turnover_rate",
-            }
+        # Filter out stocks that were listed after the target date
+        df = df.filter(pl.col("publish_date") <= pl.lit(trade_date))
+
+        # Filter out stocks that are too new (less than min_days since IPO)
+        df = df.filter(
+            pl.col("publish_date") <= pl.lit(trade_date - timedelta(days=365))
         )
 
-        exclude_st = self.config.get("market", {}).get("exclude_st", True)
-        if exclude_st:
-            df = df.filter(~pl.col("name").str.contains("ST"))
+        # Filter out ST/*ST stocks
+        df = df.filter(~pl.col("name").str.contains("ST", literal=True))
+        delist = stock_code_delist()
+        delisted_stocks = delist.filter(pl.col("off_date") <= pl.lit(trade_date))
+        df = df.join(delisted_stocks.select("ts_code"), on="ts_code", how="anti")
 
-        exclude_suspended = self.config.get("market", {}).get("exclude_suspended", True)
-        if exclude_suspended:
-            df = df.filter(pl.col("volume") > 0)
+        df = df.sort("ts_code").select(["ts_code", "name"])
 
-        log.warning(
-            "IPO date filtering is not yet fully implemented for historical dates in AkShare without local DB."
-        )
+        return df
 
-        min_days = self.config.get("market", {}).get("min_days_since_ipo", 60)
-
-        return df.select(["ts_code", "name"])
-
-    def daily_market(
-        self, symbol: str, start_date: str, end_date: str, adjust: str = "hfq"
+    def market_ohlcv(
+        self,
+        symbol: str,
+        period: Period,
+        start_date: OptDateLike = None,
+        end_date: OptDateLike = None,
+        adjust: AdjustCN | None = "hfq",
     ) -> pl.DataFrame:
         """
         Daily OHLCV + adjustment factors.
         """
+        start_date = str_f_datelike(start_date)
+        end_date = str_f_datelike(end_date)
         log.info(
             f"Fetching market data for {symbol} from {start_date} to {end_date} (adjust={adjust})"
         )
-        df_hist = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust=adjust,
-        )
+
+        if adjust is None:
+            adjust_param = ""
+        else:
+            adjust_param = adjust
+
+        params = {
+            "symbol": symbol,
+            "period": period,
+            "start_date": start_date,
+            "end_date": end_date,
+            "adjust": adjust_param,
+            "timeout": None,
+        }
+        df_hist = ak.stock_zh_a_hist(**params)
 
         if df_hist.empty:
             return pl.DataFrame()
@@ -109,41 +220,33 @@ class AkShareProvider(DataProvider):
         df = pl.from_pandas(df_hist)
 
         # Rename to a consistent schema (matching docs/table.md naming where possible)
-        df = df.rename(
-            {
+        df = clean_timedf(
+            df,
+            rename={
                 "日期": "date",
                 "股票代码": "ts_code",
                 "开盘": "open",
+                "收盘": "close",
                 "最高": "high",
                 "最低": "low",
-                "收盘": "close",
                 "成交量": "volume",
                 "成交额": "amount",
                 "振幅": "amplitude",
                 "涨跌幅": "pct_chg",
                 "涨跌额": "change",
                 "换手率": "turnover_rate",
-            }
+            },
+            date_col="date",
         )
 
-        # Parse date to Date when possible (AkShare sometimes returns strings)
-        if df.schema.get("date") == pl.Utf8:
-            df = df.with_columns(
-                pl.col("date").str.strptime(pl.Date, "%Y-%m-%d", strict=False)
-            )
-
-        # Derived field used in docs/table.md
-        if "change" in df.columns:
-            df = df.with_columns(
-                (pl.col("close") - pl.col("change")).alias("pre_close")
-            )
-
-        # Add adjustment factor if available for proper backtesting
-        if adjust != "":
+        # adjust factor
+        if adjust is not None:
             factor = adjust + "-factor"
-            df_adj = ak.stock_zh_a_daily(symbol=symbol,start_date=start_date,end_date=end_date,adjust=factor)
+            df_adj = ak.stock_zh_a_daily(
+                symbol=symbol, start_date=start_date, end_date=end_date, adjust=factor
+            )
             df_adj = pl.from_pandas(df_adj)
-            df = df.join(df_adj.select(["date",factor]),on="date",how="left")
+            df = df.join(df_adj.select(["date", factor]), on="date", how="left")
 
         return df
 
@@ -387,7 +490,7 @@ class AkShareProvider(DataProvider):
         - max_sw3: optional safety cap when iterating all SW3 industries (keeps runtime bounded)
         """
 
-        as_of = _to_trade_date(trade_date)
+        as_of = date_f_datelike(trade_date)
         log.info(f"Fetching Shenwan industry classification as of {as_of}")
 
         # 1) Build name->code mapping for L1/L2 using the overview endpoints.
@@ -410,7 +513,7 @@ class AkShareProvider(DataProvider):
                 )
 
             third_info = pl.from_pandas(ak.sw_index_third_info())
-            code_col = _first_existing_column(
+            code_col = fallback_col(
                 third_info.columns,
                 candidates=["行业代码", "指数代码", "代码"],
                 label="SW3 industry code",
@@ -445,19 +548,19 @@ class AkShareProvider(DataProvider):
         )
 
         # Strip exchange suffix (e.g. 600313.SH -> 600313)
-        if df.schema.get("stock_code") == pl.Utf8:
-            df = df.with_columns(
-                pl.col("stock_code")
-                .map_elements(_strip_exchange_suffix)
-                .alias("ts_code")
-            )
-        else:
-            df = df.with_columns(
-                pl.col("stock_code")
-                .cast(pl.Utf8)
-                .map_elements(_strip_exchange_suffix)
-                .alias("ts_code")
-            )
+        # if df.schema.get("stock_code") == pl.Utf8:
+        #     df = df.with_columns(
+        #         pl.col("stock_code")
+        #         .map_elements(_strip_exchange_suffix)
+        #         .alias("ts_code")
+        #     )
+        # else:
+        #     df = df.with_columns(
+        #         pl.col("stock_code")
+        #         .cast(pl.Utf8)
+        #         .map_elements(_strip_exchange_suffix)
+        #         .alias("ts_code")
+        #     )
 
         df = df.with_columns(pl.lit(as_of).alias("date"))
 
@@ -496,7 +599,7 @@ class AkShareProvider(DataProvider):
         raw = ak.stock_zh_index_value_csindex(symbol=symbol)
         df = pl.from_pandas(raw)
 
-        date_col = _first_existing_column(
+        date_col = fallback_col(
             df.columns, candidates=["日期", "date"], label="index valuation date"
         )
         df = df.rename({date_col: "date"})
@@ -565,10 +668,10 @@ class AkShareProvider(DataProvider):
             raw = getattr(ak, fn_name)()
             df = pl.from_pandas(raw)
 
-            date_col = _first_existing_column(
+            date_col = fallback_col(
                 df.columns, candidates=["日期", "date"], label=f"{market} margin date"
             )
-            bal_col = _first_existing_column(
+            bal_col = fallback_col(
                 df.columns,
                 candidates=["融资融券余额"],
                 label=f"{market} margin balance",
@@ -614,7 +717,7 @@ class AkShareProvider(DataProvider):
         df_shibor_pd = ak.macro_china_shibor_all()
         df_shibor = pl.from_pandas(df_shibor_pd)
 
-        date_col = _first_existing_column(
+        date_col = fallback_col(
             df_shibor.columns,
             candidates=["日期", "date"],
             label="shibor date",
@@ -633,12 +736,12 @@ class AkShareProvider(DataProvider):
         )
 
         # Map key tenors expected by docs/table.md
-        shibor_1w_col = _first_existing_column(
+        shibor_1w_col = fallback_col(
             df_shibor.columns,
             candidates=["1W-定价"],
             label="shibor 1W pricing",
         )
-        shibor_3m_col = _first_existing_column(
+        shibor_3m_col = fallback_col(
             df_shibor.columns,
             candidates=["3M-定价"],
             label="shibor 3M pricing",
