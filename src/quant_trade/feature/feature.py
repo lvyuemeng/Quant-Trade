@@ -10,173 +10,169 @@ import polars as pl
 from quant_trade.utils.logger import log
 
 
-class FeatureEngineer:
-    """Feature engineering class to calculate various financial indicators."""
+class CNFundamental:
+    """Feature engineering class for fundamental metrics (profitability, growth, cost structure).
 
-    def __init__(self):
-        pass
+    This class requires the input `DataFrame` to contain specific columns that correspond to
+    standardized financial statement items. The columns are grouped into logical categories
+    for clarity.
 
-    def calculate_quality_metrics(self, fundamentals_df: pl.DataFrame) -> pl.DataFrame:
-        """Calculate quality metrics as per docs/table.md Table 3."""
+    **REQUIRED COLUMNS** in the input `DataFrame`:
+
+    ```
+    Core Identifiers:                (CN)
+        ts_code (str):               股票代码
+        name (str):                  股票简称
+        announcement_date (date):    公告日期
+
+    Profit & Revenue (Core Performance):
+        net_profit (float):          净利润
+        operating_profit (float):    营业利润
+        total_profit (float):        利润总额
+        total_revenue (float):       营业总收入
+
+    Growth Rates (Year-over-Year):
+        net_profit_yoy (float):      净利润同比
+        total_revenue_yoy (float):   营业总收入同比
+
+    Cost Structure (Operating Expenses Breakdown):
+        operating_cost (float):      营业总支出-营业支出
+        selling_cost (float):        营业总支出-销售费用
+        admin_cost (float):          营业总支出-管理费用
+        finance_cost (float):        营业总支出-财务费用
+        total_cost (float):          营业总支出-营业总支出
+
+    Assets:
+        cash (float):                资产-货币资金
+        accounts_receivable (float): 资产-应收账款
+        inventory (float):           资产-存货
+        total_assets (float):        资产-总资产
+        total_assets_yoy (float):    资产-总资产同比 (%)
+
+    Liabilities:
+        accounts_payable (float):    负债-应付账款
+        advance_receipts (float):    负债-预收账款
+        total_debts (float):         负债-总负债
+        total_debts_yoy (float):     负债-总负债同比 (%)
+
+    Ratios & Equity:
+        debt_to_assets (float):      资产负债率 (%)
+        total_equity (float):        股东权益合计
+
+    Cash Flow Components:
+        net_cashflow (float):        净现金流-净现金流
+        net_cashflow_yoy (float):    净现金流-同比增长
+        cfo (float):                 经营性现金流-现金流量净额
+        cfo_share (float):           经营性现金流-净现金流占比
+        cfi (float):                 投资性现金流-现金流量净额
+        cfi_share (float):           投资性现金流-净现金流占比 (%)
+        cff (float):                 融资性现金流-现金流量净额
+        cff_share (float):           融资性现金流-净现金流占比 (%)
+
+    All monetary values are expected to be in yuan (元) unless otherwise specified.
+    Percentage values are in standard percentage units (e.g., 10.5 for 10.5%).
+    ```
+    """
+
+    IDENT_COLS = ["ts_code", "name", "announcement_date"]
+
+    @staticmethod
+    def quality_metrics(df: pl.DataFrame) -> pl.DataFrame:
+        """Calculate quality metrics."""
         log.info("Calculating quality metrics")
 
-        # Calculate ROE, ROA, ROIC, margins
-        result_df = fundamentals_df.with_columns(
+        metric = df.select(
+            CNFundamental.IDENT_COLS,
             [
-                # ROE (Return on Equity)
-                (pl.col("net_profit") / pl.col("total_equity"))
-                .alias("roe")
-                .filter(
-                    pl.col("total_equity").is_not_null() & (pl.col("total_equity") != 0)
+                (pl.col("net_profit") / pl.col("total_equity")).alias("roe"),
+                (pl.col("net_profit") / pl.col("total_assets")).alias("roa"),
+                (pl.col("gross_profit") / pl.col("total_revenue")).alias(
+                    "gross_margin"
                 ),
-                # ROA (Return on Assets)
-                (pl.col("net_profit") / pl.col("total_assets"))
-                .alias("roa")
-                .filter(
-                    pl.col("total_assets").is_not_null() & (pl.col("total_assets") != 0)
+                (pl.col("operatig_profit") / pl.col("total_revenue")).alias(
+                    "operating_margin"
                 ),
-                # Gross Margin
-                (pl.col("gross_profit") / pl.col("total_revenue"))
-                .alias("gross_margin")
-                .filter(
-                    pl.col("total_revenue").is_not_null()
-                    & (pl.col("total_revenue") != 0)
-                    & pl.col("gross_profit").is_not_null()
-                ),
-                # Operating Margin
-                (pl.col("operating_profit") / pl.col("total_revenue"))
-                .alias("operating_margin")
-                .filter(
-                    pl.col("total_revenue").is_not_null()
-                    & (pl.col("total_revenue") != 0)
-                    & pl.col("operating_profit").is_not_null()
-                ),
-                # Net Margin
-                (pl.col("net_profit") / pl.col("total_revenue"))
-                .alias("net_margin")
-                .filter(
-                    pl.col("total_revenue").is_not_null()
-                    & (pl.col("total_revenue") != 0)
-                ),
-            ]
+                (pl.col("net_profit") / pl.col("total_revenue")).alias("net_margin"),
+                (pl.col("net_profit") / pl.col("total_revenue")).alias("net_margin"),
+            ],
         )
+        return metric
 
-        return result_df
-
-    def calculate_leverage_metrics(self, fundamentals_df: pl.DataFrame) -> pl.DataFrame:
-        """Calculate leverage and safety metrics as per docs/table.md Table 3."""
+    @staticmethod
+    def leverage_metrics(df: pl.DataFrame) -> pl.DataFrame:
+        """Calculate leverage and safety metrics."""
         log.info("Calculating leverage metrics")
 
-        result_df = fundamentals_df.with_columns(
+        metric = df.select(
+            CNFundamental.IDENT_COLS,
+            "total_debts",
             [
-                # Debt to Asset Ratio
                 (
-                    (pl.col("total_debt") / pl.col("total_assets")).alias(
-                        "debt_to_asset"
-                    )
-                ).filter(
-                    pl.col("total_assets").is_not_null()
-                    & (pl.col("total_assets") != 0)
-                    & pl.col("total_debt").is_not_null()
-                ),
-                # Debt to Equity Ratio
-                (
-                    (pl.col("total_debt") / pl.col("total_equity")).alias(
+                    (pl.col("total_debts") / pl.col("total_equity")).alias(
                         "debt_to_equity"
                     )
-                ).filter(
-                    pl.col("total_equity").is_not_null()
-                    & (pl.col("total_equity") != 0)
-                    & pl.col("total_debt").is_not_null()
                 ),
-                # Current Ratio
                 (
-                    (pl.col("current_assets") / pl.col("current_liabilities")).alias(
-                        "current_ratio"
-                    )
-                ).filter(
-                    pl.col("current_liabilities").is_not_null()
-                    & (pl.col("current_liabilities") != 0)
-                    & pl.col("current_assets").is_not_null()
+                    (
+                        (
+                            pl.col("cash")
+                            + pl.col("accounts_receivable")
+                            + pl.col("inventory")
+                        )
+                        / (pl.col("accounts_payable") + pl.col("advance_receipts"))
+                    ).alias("current_ratio")
                 ),
-            ]
+                (
+                    (pl.col("cash") + pl.col("accounts_receivable"))
+                    / (pl.col("accounts_payable") + pl.col("advance_receipts")).alias(
+                        "quick_ratio"
+                    )
+                ),
+                (
+                    pl.col("operating_profit")
+                    / pl.col("finance_cost").alias("interest_coverage")
+                ),
+            ],
         )
+        return metric
 
-        return result_df
-
-    def calculate_growth_metrics(self, fundamentals_df: pl.DataFrame) -> pl.DataFrame:
-        """Calculate growth metrics as per docs/table.md Table 3."""
+    @staticmethod
+    def growth_metrics(df: pl.DataFrame) -> pl.DataFrame:
+        """Calculate growth metrics."""
         log.info("Calculating growth metrics")
-
-        # This requires historical data to calculate YoY and QoQ growth
-        # We'll calculate using shift operations to get previous period values
-        result_df = fundamentals_df.sort(["ts_code", "announcement_date"]).with_columns(
+        metric = df.select(
             [
-                # YoY growth (requires same quarter from previous year)
-                (
-                    (
-                        pl.col("net_profit")
-                        - pl.col("net_profit").shift(1).over("ts_code")
-                    )
-                    / pl.col("net_profit").shift(1).over("ts_code")
-                )
-                .alias("profit_growth_yoy")
-                .filter(
-                    pl.col("net_profit").shift(1).over("ts_code").is_not_null()
-                    & (pl.col("net_profit").shift(1).over("ts_code") != 0)
-                ),
-                (
-                    (
-                        pl.col("total_revenue")
-                        - pl.col("total_revenue").shift(1).over("ts_code")
-                    )
-                    / pl.col("total_revenue").shift(1).over("ts_code")
-                )
-                .alias("revenue_growth_yoy")
-                .filter(
-                    pl.col("total_revenue").shift(1).over("ts_code").is_not_null()
-                    & (pl.col("total_revenue").shift(1).over("ts_code") != 0)
+                CNFundamental.IDENT_COLS,
+                pl.col("total_assets_yoy"),
+                pl.col("total_debts_yoy"),
+                (pl.col("net_profit_yoy") - pl.col("total_revenue_yoy")).alias(
+                    "profit_growth_premium"
                 ),
             ]
         )
+        return metric
 
-        return result_df
-
-    def calculate_valuation_metrics(
-        self, market_df: pl.DataFrame, fundamentals_df: pl.DataFrame
-    ) -> pl.DataFrame:
-        """Calculate valuation metrics as per docs/table.md Table 4."""
+    @staticmethod
+    def value_metrics(df: pl.DataFrame) -> pl.DataFrame:
+        """Calculate valuation metrics."""
         log.info("Calculating valuation metrics")
 
-        # Join market and fundamentals data
-        joined_df = market_df.join(fundamentals_df, on=["ts_code", "date"], how="left")
-
-        result_df = joined_df.with_columns(
+        metric = df.select(
             [
-                # P/E TTM (requires TTM earnings data which might be in fundamentals)
-                ((pl.col("amount") / pl.col("volume")) / pl.col("net_profit"))
-                .alias("pe_ttm")  # Simplified calculation
-                .filter(
-                    pl.col("net_profit").is_not_null() & (pl.col("net_profit") != 0)
-                ),
-                # P/B (Price to Book)
-                ((pl.col("amount") / pl.col("volume")) / pl.col("total_equity"))
-                .alias("pb")
-                .filter(
-                    pl.col("total_equity").is_not_null() & (pl.col("total_equity") != 0)
-                ),
-                # P/S (Price to Sales) - would need revenue data
-                ((pl.col("amount") / pl.col("volume")) / pl.col("total_revenue"))
-                .alias("ps")
-                .filter(
-                    pl.col("total_revenue").is_not_null()
-                    & (pl.col("total_revenue") != 0)
+                CNFundamental.IDENT_COLS,
+                (pl.col("cfo") / pl.col("net_profit")).alias("cfo_to_net_profit"),
+                (pl.col("cfo") + pl.col("cfi")).alias("cf_free"),
+                (pl.col("cfo") / pl.col("total_assets")).alias("cf_adequacy"),
+                (pl.col("cfo_share")),
+                (pl.col("cfi").abs() / pl.col("total_assets")).alias(
+                    "invest_intensity"
                 ),
             ]
         )
+        return metric
 
-        return result_df
 
+class FeatureEngineer:
     def calculate_behavioral_features(self, market_df: pl.DataFrame) -> pl.DataFrame:
         """Calculate behavioral features as per docs/table.md Table 5."""
         log.info("Calculating behavioral features")

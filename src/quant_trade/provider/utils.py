@@ -5,8 +5,8 @@ from typing import Literal
 import polars as pl
 
 type DateLike = str | date
-type OptDateLike = DateLike | None
 type Period = Literal["daily", "weekly", "monthly"]
+type Quarter = Literal[1, 2, 3, 4]
 type AdjustCN = Literal["hfq", "qfq"]
 
 
@@ -37,7 +37,7 @@ def normal_stock_code(raw_code: str, length: int = 6) -> str:
     return matched
 
 
-def _normal_stock_code_expr(
+def _normal_expr_stock_code(
     code_col: str | pl.Expr, length: int = 6, alias: str | None = None
 ) -> pl.Expr:
     """
@@ -67,7 +67,7 @@ def _normal_stock_code_expr(
     return matched
 
 
-def normal_stock_code_df(
+def normal_df_stock_code(
     df: pl.DataFrame, col: str = "ts_code", length: int = 6, inplace: bool = True
 ) -> pl.DataFrame:
     """
@@ -84,68 +84,33 @@ def normal_stock_code_df(
     """
     output_col = col if inplace else f"{col}_normalized"
 
-    return df.with_columns(_normal_stock_code_expr(col, length, output_col))
+    return df.with_columns(_normal_expr_stock_code(col, length, output_col))
 
 
-def date_f_datelike(date: OptDateLike) -> date:
-    match date:
-        case None:
-            return datetime.now().date()
-        case str():
-            return datetime.strptime(date, "%Y%m%d").date()
-        case _:  # date
-            return date
-
-
-def str_f_datelike(date: OptDateLike) -> str:
-    match date:
-        case None:
-            return datetime.now().date().strftime("%Y%m%d")
-        case str():
-            return date
-        case _:  # date
-            return date.strftime("%Y%m%d")
-
-
-def clean_timedf(
+def normal_df_time(
     df: pl.DataFrame,
-    rename: dict,
-    drop: list | str | None = None,
-    select: list | None = None,  # Optional columns to select for consistent schema
     date_col: str | None = None,  # Column to normalize
     date_format: str | None = None,  # Optional format string
 ) -> pl.DataFrame:
     """
-    Internal helper to clean and standardize a stock DataFrame.
+    Internal helper to normalize date of a stock DataFrame.
 
     Args:
         df: Raw Polars DataFrame from akshare
-        rename_map: Dictionary mapping original to new column names
-        drop_cols: Column(s) to drop (string or list of strings)
         date_col: Name of the column containing date strings
         date_format: Optional format string for parsing (e.g., "%Y/%m/%d")
-        select_cols: Optional list of columns to select for consistent schema
     """
-    res_df = df.rename(rename)
+    if date_col is None or date_col not in df.columns:
+        return df
 
-    if drop:
-        res_df = df.drop(drop)
-
-    if select:
-        existing_cols = [col for col in select if col in res_df.columns]
-        res_df = res_df.select(existing_cols)
-
-    if date_col is None or date_col not in res_df.columns:
-        return res_df
-
-    match res_df.schema[date_col]:
+    match df.schema[date_col]:
         case pl.Date:
-            return res_df
+            return df
         case pl.Datetime:
             # Convert datetime to date
             date_expr = pl.col(date_col).dt.date()
-            res_df = res_df.with_columns(date_expr)
-            return res_df
+            df = df.with_columns(date_expr)
+            return df
         case pl.Utf8:
             # Parse string to date
             if date_format:
@@ -154,13 +119,13 @@ def clean_timedf(
                 )
             else:
                 date_expr = pl.col(date_col).str.to_date(strict=False)
-            res_df = res_df.with_columns(date_expr)
-            return res_df
+            df = df.with_columns(date_expr)
+            return df
         case _:
             # Try to cast other types to date
             date_expr = pl.col(date_col).cast(pl.Date, strict=False)
-            res_df = res_df.with_columns(date_expr)
-            return res_df
+            df = df.with_columns(date_expr)
+            return df
 
 
 def fallback_col(columns: list[str], candidates: list[str], label: str) -> str:
@@ -184,3 +149,26 @@ def fallback_col(columns: list[str], candidates: list[str], label: str) -> str:
 
     msg = f"Unable to find {label} column. Tried: {candidates}. Available columns: {columns}"
     raise KeyError(msg)
+
+
+def date_f_datelike(date: DateLike) -> date:
+    match date:
+        case str():
+            return datetime.strptime(date, "%Y%m%d").date()
+        case _:  # date
+            return date
+
+
+def str_f_datelike(date: DateLike) -> str:
+    match date:
+        case str():
+            return date
+        case _:  # date
+            return date.strftime("%Y%m%d")
+
+
+def str_f_quater(year: int | None, quarter: Quarter) -> str:
+    year_now = datetime.now().year
+    year = year if year and year <= year_now else year_now
+    quarter_ends = ["0331", "0630", "0930", "1231"]
+    return f"{year}{quarter_ends[quarter - 1]}"
