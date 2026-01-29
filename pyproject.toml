@@ -18,25 +18,25 @@ dependencies = [
     # data visualization
     "plotly>=5.20",
     "seaborn>=0.13",
-
-    "scipy>=1.14",
-    "backtrader>=1.9.78.123",
-
+    # "scipy>=1.14",
+    # "backtrader>=1.9.78.123",
     # logging
     "loguru>=0.7.3",
     # config
-    "pyyaml>=6.0.3",
+    # "pyyaml>=6.0.3",
+    # database
+    "arcticdb>=6.8.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.23",
+    # "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
     "mypy>=1.19.1",
     "ruff>=0.14.13",
     "taskipy>=1.14.1",
-    "types-PyYAML",
+    # "types-PyYAML",
 ]
     
 [tool.uv]

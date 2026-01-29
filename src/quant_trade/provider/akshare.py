@@ -4,7 +4,6 @@ from datetime import date, datetime, timedelta
 
 import akshare as ak
 import polars as pl
-import yaml
 
 from quant_trade.provider.utils import (
     AdjustCN,
@@ -16,7 +15,7 @@ from quant_trade.provider.utils import (
     str_f_datelike,
     str_f_quater,
 )
-from quant_trade.utils.logger import log
+from quant_trade.config.logger import log
 
 
 def stock_code_sh_whole() -> pl.DataFrame:
@@ -136,27 +135,21 @@ def stock_code_whole() -> pl.DataFrame:
 class AkShareMicro:
     """AkShare implementation of the micro data interface."""
 
-    def __init__(self, config_path: str = "config/data.yaml"):
-        with open(config_path) as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self):
+        # with open(config_path) as f:
+        #     self.config = yaml.safe_load(f)
+        log.info("Initialized AkShareMicro.")
 
-        log.info("Initialized AkShareProvider")
-
-    def stock_name_code_map(self) -> pl.DataFrame:
+    def stock_whole(self) -> pl.DataFrame:
         """
-        Fetch A-share stock code and name mapping.
+        Fetch A-Share stock universe in general.
         """
-        log.info("Fetching stock code and name mapping")
-        df = ak.stock_info_a_code_name()
-        df = pl.from_pandas(df)
-
-        df = df.rename({"code": "ts_code", "name": "name"})
-
+        df = stock_code_whole()
         return df
 
-    def stock_universe(self, trade_date: DateLike | None = None) -> pl.DataFrame:
+    def stock_slice(self, trade_date: DateLike | None = None) -> pl.DataFrame:
         """
-        Get tradeable A-share universe for a given date using the complete stock list.
+        Get tradeable A-share universe for a given date from the given complete stock list.
 
         Filters:
             - Remove ST/*ST(delist) stocks
@@ -171,9 +164,8 @@ class AkShareMicro:
         trade_date = (
             date_f_datelike(trade_date) if trade_date else datetime.now().date()
         )
+        df = self.stock_whole()
         log.info(f"Fetching stock universe for {trade_date}")
-
-        df = stock_code_whole()
 
         # Filter out stocks that were listed after the target date
         df = df.filter(pl.col("publish_date") <= pl.lit(trade_date))
@@ -390,14 +382,14 @@ class AkShareMicro:
 class AkShareMacro:
     """AkShare implementation of the macro data interface."""
 
-    def __init__(self, config_path: str = "config/data.yaml"):
-        with open(config_path) as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self):
+        # with open(config_path) as f:
+        #     self.config = yaml.safe_load(f)
 
-        log.info("Initialized AkShareProvider")
+        log.info("Initialized AkShareMacro.")
 
     def northbound_flow(
-        self, start_date: DateLike | None, end_date: DateLike | None
+        self, start_date: DateLike | None = None, end_date: DateLike | None = None
     ) -> pl.DataFrame:
         """Fetch northbound flow (沪深港通 北向) using Eastmoney historical data.
 
@@ -414,25 +406,33 @@ class AkShareMacro:
         end_date = date_f_datelike(end_date) if end_date else datetime.now().date()
         log.info(f"Fetching northbound flow from {start_date} to {end_date}")
 
-        df = ak.stock_hsgt_hist_em(symbol="北向资金")
+        sh_df = ak.stock_hsgt_hist_em(symbol="港股通沪")
+        sh_df = pl.from_pandas(sh_df)
+        sz_df = ak.stock_hsgt_hist_em(symbol="港股通深")
+        sz_df = pl.from_pandas(sz_df)
 
-        df = pl.from_pandas(df)
-        df = df.rename(
-            {
-                "日期": "date",
-                "当日成交净买额": "net_buy",
-                "当日资金流入": "fund_inflow",
-                "历史累计净买额": "cum_net_by",
-            }
+        def _prepare(df: pl.DataFrame) -> pl.DataFrame:
+            return df.rename(
+                {
+                    "日期": "date",
+                    "当日成交净买额": "net_buy",
+                    "当日资金流入": "fund_inflow",
+                    "历史累计净买额": "cum_net_buy",
+                }
+            ).select(["date", "net_buy", "fund_inflow", "cum_net_buy"])
+
+        sh_df = _prepare(sh_df)
+        sz_df = _prepare(sz_df)
+
+        combined = pl.concat([sz_df, sh_df]).group_by("date").sum().sort("date")
+        combined = normal_df_time(combined, date_col="date").filter(
+            (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
         )
 
-        df = normal_df_time(df, date_col="date")
-        df = df.filter((pl.col("date") >= start_date) & (pl.col("date") <= end_date))
-
-        return df.sort("date")
+        return combined
 
     def market_margin_short(
-        self, start_date: DateLike | None, end_date: DateLike | None
+        self, start_date: DateLike | None = None, end_date: DateLike | None = None
     ) -> pl.DataFrame:
         """Fetch total A-share margin + short data (SH+SZ) as a daily time series.
 
@@ -456,16 +456,20 @@ class AkShareMacro:
         sh_df = pl.from_pandas(sh_df)
 
         def process_margin_data(df: pl.DataFrame) -> pl.DataFrame:
-            return df.rename(
-                {
-                    "日期": "date",
-                    "融资买入额": "margin_buy_amount",
-                    "融资余额": "margin_balance",
-                    "融券卖出量": "short_sell_volume",
-                    "融券余额": "short_balance",
-                    "融资融券余额": "total_margin_balance",
-                }
-            ).drop("融券余量")
+            return (
+                df.rename(
+                    {
+                        "日期": "date",
+                        "融资买入额": "margin_buy_amount",
+                        "融资余额": "margin_balance",
+                        "融券卖出量": "short_sell_volume",
+                        "融券余额": "short_balance",
+                        "融资融券余额": "total_margin_balance",
+                    }
+                )
+                .drop("融券余量")
+                .with_columns(pl.all().exclude("date").cast(pl.Float64))
+            )
 
         sz_df = process_margin_data(sz_df)
         sh_df = process_margin_data(sh_df)
@@ -477,7 +481,7 @@ class AkShareMacro:
         return combined
 
     def shibor(
-        self, start_date: DateLike | None, end_date: DateLike | None
+        self, start_date: DateLike | None = None, end_date: DateLike | None = None
     ) -> pl.DataFrame:
         """Fetch the shibor data as a daily time series
 
@@ -523,7 +527,7 @@ class AkShareMacro:
         return df
 
     def csi1000_daily_ohlcv(
-        self, start_date: DateLike | None, end_date: DateLike | None
+        self, start_date: DateLike | None = None, end_date: DateLike | None = None
     ) -> pl.DataFrame:
         start_date = date_f_datelike(start_date) if start_date else date(2005, 1, 5)
         end_date = date_f_datelike(end_date) if end_date else datetime.now().date()
@@ -539,9 +543,9 @@ class AkShareMacro:
         return df
 
     def csi1000qvix_daily_ohlc(
-        self, start_date: DateLike | None, end_date: DateLike | None
+        self, start_date: DateLike | None = None, end_date: DateLike | None = None
     ) -> pl.DataFrame:
-        start_date = date_f_datelike(start_date) if start_date else date(2005, 1, 5)
+        start_date = date_f_datelike(start_date) if start_date else date(2005, 2, 9)
         end_date = date_f_datelike(end_date) if end_date else datetime.now().date()
         log.info(f"Fetching csi1000qvix daily from {start_date} to {end_date}")
 
@@ -620,7 +624,7 @@ class SWIndustryCls:
                 "申万3级": "sw_l3_name",
             }
         ).select(
-            ["ts_code_rawname", "join_date", "sw_l1_name", "sw_l2_name", "sw_l3_name"]
+            ["ts_code_suffix", "join_date", "sw_l1_name", "sw_l2_name", "sw_l3_name"]
         )
         df = df.with_columns([pl.lit(sw_l3_code).alias("sw_l3_code")])
 
@@ -678,7 +682,7 @@ class SWIndustryCls:
 
         return combined
 
-    def stock_l1_industry_cls(self, start_date: DateLike | None) -> pl.DataFrame:
+    def stock_l1_industry_cls(self, start_date: DateLike | None = None) -> pl.DataFrame:
         df = self._l1_industry_cls(self.stock_industry_cls())
         return self._time_industry_cls(df, start_date) if start_date else df
 

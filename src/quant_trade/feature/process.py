@@ -10,20 +10,20 @@ from typing import Literal
 import numpy as np
 import polars as pl
 
-from quant_trade.utils.logger import log
+from quant_trade.config.logger import log
 
 type Freq = Literal["daily", "weekly", "quarterly", "yearly"]
 
 
-def _resample(df: pl.DataFrame, rules: dict[str, pl.Expr], freq: Freq) -> pl.DataFrame:
-    if freq == "daily":
-        return df
-    aggs = [rules[c].alias(c) for c in rules.keys() if c in df.columns]
-    freq_map = {"W": "1w", "M": "1mo", "Q": "3mo", "Y": "1y"}
-    if (date_range := freq_map.get(freq)) is None:
-        raise ValueError(freq)
+# def _resample(df: pl.DataFrame, rules: dict[str, pl.Expr], freq: Freq) -> pl.DataFrame:
+#     if freq == "daily":
+#         return df
+#     aggs = [rules[c].alias(c) for c in rules.keys() if c in df.columns]
+#     freq_map = {"W": "1w", "M": "1mo", "Q": "3mo", "Y": "1y"}
+#     if (date_range := freq_map.get(freq)) is None:
+#         raise ValueError(freq)
 
-    return df.group_by_dynamic("date", every=date_range).agg(aggs).sort("date")
+#     return df.group_by_dynamic("date", every=date_range).agg(aggs).sort("date")
 
 
 class Fundamental:
@@ -611,17 +611,15 @@ class SectorGroup:
     @staticmethod
     def normalize(
         df: pl.DataFrame,
-        sector: pl.DataFrame,
         factors: list[str],
         by: list[str],
         limits: tuple[float, float] = (0.02, 0.98),
     ) -> pl.DataFrame:
-        merged = df.join(sector, on="ts_code", how="semi")
         ops: list[pl.Expr] = []
         for col in factors:
-            if col not in merged.columns:
+            if col not in df.columns:
                 continue
             ops.append(CrossSection.winsorize(col, by=by, limits=limits))
             ops.append(CrossSection.standardize(col, by=by).alias(f"{col}_z"))
 
-        return merged.with_columns(ops)
+        return df.with_columns(ops)
