@@ -5,14 +5,16 @@ including quality metrics, leverage ratios, growth metrics, valuation ratios,
 behavioral indicators, and macro context features.
 """
 
-from typing import Literal
+from collections.abc import Sequence
+from typing import Literal, Protocol
 
 import numpy as np
 import polars as pl
+import polars.selectors as cs
 
 from quant_trade.config.logger import log
 
-type Freq = Literal["daily", "weekly", "quarterly", "yearly"]
+# type Freq = Literal["daily", "weekly", "quarterly", "yearly"]
 
 
 # def _resample(df: pl.DataFrame, rules: dict[str, pl.Expr], freq: Freq) -> pl.DataFrame:
@@ -26,600 +28,1346 @@ type Freq = Literal["daily", "weekly", "quarterly", "yearly"]
 #     return df.group_by_dynamic("date", every=date_range).agg(aggs).sort("date")
 
 
+class Metric(Protocol):
+    @staticmethod
+    def metrics(df: pl.DataFrame) -> pl.DataFrame: ...
+
+
 class Fundamental:
-    """Feature engineering class for fundamental metrics (profitability, growth, cost structure).
-
-    This class requires the input `DataFrame` to contain specific columns that correspond to
-    standardized financial statement items. The columns are grouped into logical categories
-    for clarity.
-
-    **REQUIRED COLUMNS** in the input `DataFrame`:
-
-    ```
-    Core Identifiers:                (CN)
-        ts_code (str):               股票代码
-        name (str):                  股票简称
-        announcement_date (date):    公告日期
-
-    Profit & Revenue (Core Performance):
-        net_profit (float):          净利润
-        operating_profit (float):    营业利润
-        total_profit (float):        利润总额
-        total_revenue (float):       营业总收入
-
-    Growth Rates (Year-over-Year):
-        net_profit_yoy (float):      净利润同比
-        total_revenue_yoy (float):   营业总收入同比
-
-    Cost Structure (Operating Expenses Breakdown):
-        operating_cost (float):      营业总支出-营业支出
-        selling_cost (float):        营业总支出-销售费用
-        admin_cost (float):          营业总支出-管理费用
-        finance_cost (float):        营业总支出-财务费用
-        total_cost (float):          营业总支出-营业总支出
-
-    Assets:
-        cash (float):                资产-货币资金
-        accounts_receivable (float): 资产-应收账款
-        inventory (float):           资产-存货
-        total_assets (float):        资产-总资产
-        total_assets_yoy (float):    资产-总资产同比 (%)
-
-    Liabilities:
-        accounts_payable (float):    负债-应付账款
-        advance_receipts (float):    负债-预收账款
-        total_debts (float):         负债-总负债
-        total_debts_yoy (float):     负债-总负债同比 (%)
-
-    Ratios & Equity:
-        debt_to_assets (float):      资产负债率 (%)
-        total_equity (float):        股东权益合计
-
-    Cash Flow Components:
-        net_cashflow (float):        净现金流-净现金流
-        net_cashflow_yoy (float):    净现金流-同比增长
-        cfo (float):                 经营性现金流-现金流量净额
-        cfo_share (float):           经营性现金流-净现金流占比
-        cfi (float):                 投资性现金流-现金流量净额
-        cfi_share (float):           投资性现金流-净现金流占比 (%)
-        cff (float):                 融资性现金流-现金流量净额
-        cff_share (float):           融资性现金流-净现金流占比 (%)
-
-    All monetary values are expected to be in unit of its currency unless otherwise specified.
-    Percentage values are in standard percentage units (e.g., 10.5 for 10.5%).
-    ```
+    """
+    Fundamental factor engineering for Chinese A-shares quarterly data.
+    Designed to work directly on AkShare Eastmoney merged fundamentals.
+    All monetary values in CNY yuan, growth rates as decimal (0.25 = 25%).
     """
 
     IDENT_COLS = ["ts_code", "name", "announcement_date"]
 
     @staticmethod
-    def quality_metrics(df: pl.DataFrame) -> pl.DataFrame:
-        """Calculate quality metrics."""
-        log.info("Calculating quality metrics")
+    def _safe_div(
+        num: str | pl.Expr,
+        den: str | pl.Expr,
+        alias: str,
+        *,
+        min_den: float = 1e-6,
+        handle_neg_den: Literal["null", "abs", "keep"] = "null",
+        fill_null: float | None = None,
+    ) -> pl.Expr:
+        n = pl.col(num) if isinstance(num, str) else num
+        d = pl.col(den) if isinstance(den, str) else den
 
-        metric = df.select(
-            Fundamental.IDENT_COLS,
-            [
-                (pl.col("net_profit") / pl.col("total_equity")).alias("roe"),
-                (pl.col("net_profit") / pl.col("total_assets")).alias("roa"),
-                (pl.col("gross_profit") / pl.col("total_revenue")).alias(
-                    "gross_margin"
-                ),
-                (pl.col("operatig_profit") / pl.col("total_revenue")).alias(
-                    "operating_margin"
-                ),
-                (pl.col("net_profit") / pl.col("total_revenue")).alias("net_margin"),
-                (pl.col("net_profit") / pl.col("total_revenue")).alias("net_margin"),
-            ],
-        )
-        return metric
+        d_adj = d.abs() if handle_neg_den == "abs" else d
+        d_safe = d_adj.clip(lower_bound=min_den)
 
-    @staticmethod
-    def leverage_metrics(df: pl.DataFrame) -> pl.DataFrame:
-        """Calculate leverage and safety metrics."""
-        log.info("Calculating leverage metrics")
+        ratio = n / d_safe
 
-        metric = df.select(
-            Fundamental.IDENT_COLS,
-            "total_debts",
-            [
-                (
-                    (pl.col("total_debts") / pl.col("total_equity")).alias(
-                        "debt_to_equity"
-                    )
-                ),
-                (
-                    (
-                        (
-                            pl.col("cash")
-                            + pl.col("accounts_receivable")
-                            + pl.col("inventory")
-                        )
-                        / (pl.col("accounts_payable") + pl.col("advance_receipts"))
-                    ).alias("current_ratio")
-                ),
-                (
-                    (pl.col("cash") + pl.col("accounts_receivable"))
-                    / (pl.col("accounts_payable") + pl.col("advance_receipts")).alias(
-                        "quick_ratio"
-                    )
-                ),
-                (
-                    pl.col("operating_profit")
-                    / pl.col("finance_cost").alias("interest_coverage")
-                ),
-            ],
-        )
-        return metric
+        if handle_neg_den == "null":
+            ratio = pl.when(d <= 0).then(None).otherwise(ratio)
+
+        if fill_null is not None:
+            ratio = ratio.fill_null(fill_null)
+
+        return ratio.alias(alias)
 
     @staticmethod
-    def growth_metrics(df: pl.DataFrame) -> pl.DataFrame:
-        """Calculate growth metrics."""
-        log.info("Calculating growth metrics")
-        metric = df.select(
-            [
-                Fundamental.IDENT_COLS,
-                pl.col("total_assets_yoy"),
-                pl.col("total_debts_yoy"),
-                (pl.col("net_profit_yoy") - pl.col("total_revenue_yoy")).alias(
-                    "profit_growth_premium"
+    def quality(df: pl.DataFrame) -> pl.DataFrame:
+        """Profitability, margins, efficiency"""
+        log.info("Computing quality / profitability metrics")
+        return (
+            df.with_columns(
+                gross_profit=pl.col("total_revenue") - pl.col("operating_cost"),
+            )
+            .with_columns(
+                Fundamental._safe_div("gross_profit", "total_revenue", "gross_margin"),
+                Fundamental._safe_div(
+                    "operating_profit", "total_revenue", "operating_margin"
                 ),
+                Fundamental._safe_div("net_profit", "total_revenue", "net_margin"),
+                Fundamental._safe_div(
+                    "net_profit", "total_equity", "roe", handle_neg_den="null"
+                ),
+                Fundamental._safe_div(
+                    "net_profit", "total_assets", "roa", handle_neg_den="null"
+                ),
+                Fundamental._safe_div(
+                    "total_revenue", "total_assets", "asset_turnover"
+                ),
+            )
+            .select(
+                *Fundamental.IDENT_COLS,
+                cs.starts_with(
+                    "gross_margin",
+                    "operating_margin",
+                    "net_margin",
+                    "roe",
+                    "roa",
+                    "asset_turnover",
+                ),
+            )
+        )
+
+    @staticmethod
+    def leverage(df: pl.DataFrame) -> pl.DataFrame:
+        """Leverage, liquidity, coverage ratios"""
+        log.info("Computing leverage & safety metrics")
+        return (
+            df.with_columns(
+                current_assets=pl.col("cash")
+                + pl.col("accounts_receivable")
+                + pl.col("inventory"),
+                current_liabilities=pl.col("accounts_payable")
+                + pl.col("advance_receipts"),
+            )
+            .with_columns(
+                Fundamental._safe_div("total_debts", "total_equity", "debt_to_equity"),
+                Fundamental._safe_div(
+                    "current_assets",
+                    "current_liabilities",
+                    "current_ratio",
+                    handle_neg_den="abs",
+                ),
+                Fundamental._safe_div(
+                    pl.col("cash") + pl.col("accounts_receivable"),
+                    "current_liabilities",
+                    "quick_ratio",
+                    handle_neg_den="abs",
+                ),
+                Fundamental._safe_div(
+                    "operating_profit", "finance_cost", "interest_coverage", min_den=1.0
+                ),
+            )
+            .select(
+                *Fundamental.IDENT_COLS,
+                "debt_to_equity",
+                "current_ratio",
+                "quick_ratio",
+                "interest_coverage",
+                "debt_to_assets",
+            )
+        )
+
+    @staticmethod
+    def growth(df: pl.DataFrame) -> pl.DataFrame:
+        """YoY growth rates and quality signals"""
+        log.info("Computing growth metrics")
+        return (
+            df.with_columns(
+                revenue_growth_yoy=pl.col("total_revenue_yoy"),
+                net_profit_growth_yoy=pl.col("net_profit_yoy"),
+                assets_growth_yoy=pl.col("total_assets_yoy"),
+                debt_growth_yoy=pl.col("total_debts_yoy"),
+                profit_growth_premium=pl.col("net_profit_yoy")
+                - pl.col("total_revenue_yoy"),
+            )
+            .with_columns(
+                roe_last=Fundamental._safe_div(
+                    "net_profit", "total_equity", "roe_last", handle_neg_den="null"
+                ).fill_null(0),
+            )
+            .select(
+                *Fundamental.IDENT_COLS, cs.ends_with("_yoy", "_premium", "roe_last")
+            )
+        )
+
+    @staticmethod
+    def cashflow(df: pl.DataFrame) -> pl.DataFrame:
+        """Cash flow quality, accrual, efficiency"""
+        log.info("Computing cash flow metrics")
+        return (
+            df.with_columns(
+                fcf_proxy=pl.col("cfo") + pl.col("cfi"),
+                accrual=pl.col("net_profit") - pl.col("cfo"),
+            )
+            .with_columns(
+                Fundamental._safe_div(
+                    "cfo", "net_profit", "cfo_to_profit", fill_null=0
+                ),
+                Fundamental._safe_div(
+                    "fcf_proxy", "net_profit", "fcf_to_profit", fill_null=0
+                ),
+                Fundamental._safe_div("cfo", "total_assets", "cfo_yield"),
+                Fundamental._safe_div("accrual", "total_assets", "accrual_ratio"),
+            )
+            .select(
+                *Fundamental.IDENT_COLS,
+                "cfo_to_profit",
+                "fcf_to_profit",
+                "cfo_yield",
+                "cfo_share",
+                "accrual",
+                "accrual_ratio",
+            )
+        )
+
+    @staticmethod
+    def rolling_ttm(df: pl.DataFrame, min_periods: int = 3) -> pl.DataFrame:
+        """
+        Compute trailing twelve months (TTM) aggregates and momentum.
+        Assumes df is sorted by ['ts_code', 'announcement_date'].
+        Uses group_by_dynamic with 4-quarter window.
+        """
+        log.info(f"Computing TTM rolling metrics (min_periods={min_periods})")
+
+        if "announcement_date" not in df.columns:
+            raise ValueError("announcement_date column missing — cannot compute TTM")
+
+        # Ensure sorted
+        df = df.sort(["ts_code", "announcement_date"])
+
+        # Use group_by_dynamic with fixed 4-quarter window
+        return (
+            df.group_by_dynamic(
+                index_column="announcement_date",
+                every="1q",
+                period="4q",
+                offset="-3q",  # shift back 3 quarters to make current + prior 3
+                group_by="ts_code",
+                closed="left",
+                label="left",
+            )
+            .agg(
+                ttm_revenue=pl.col("total_revenue").sum(),
+                ttm_net_profit=pl.col("net_profit").sum(),
+                ttm_cfo=pl.col("cfo").sum(),
+                ttm_fcf=(pl.col("cfo") + pl.col("cfi")).sum(),
+                count=pl.len(),
+            )
+            .filter(pl.col("count") >= min_periods)
+            .with_columns(
+                # Momentum: latest quarter vs previous TTM
+                profit_momentum=(
+                    pl.col("ttm_net_profit").last() / pl.col("ttm_net_profit").shift(1)
+                    - 1
+                )
+                .fill_null(0)
+                .over("ts_code"),
+                # Latest equity & assets (approximate for TTM ratios)
+                latest_equity=pl.col("total_equity").last().over("ts_code"),
+                latest_assets=pl.col("total_assets").last().over("ts_code"),
+            )
+            .with_columns(
+                Fundamental._safe_div(
+                    "ttm_net_profit", "latest_equity", "ttm_roe", handle_neg_den="null"
+                ),
+                Fundamental._safe_div("ttm_cfo", "latest_assets", "ttm_cfo_yield"),
+            )
+            .select(
+                "ts_code",
+                pl.col("announcement_date").alias("report_date"),
+                cs.starts_with("ttm_"),
+                "profit_momentum",
+            )
+        )
+
+    @staticmethod
+    def metrics(df: pl.DataFrame) -> pl.DataFrame:
+        """Combine all fundamental feature groups + optional TTM rolling"""
+        log.info("Computing full fundamental feature set")
+
+        # Base selection — only needed columns
+        base = df.select(
+            Fundamental.IDENT_COLS
+            + [
+                "net_profit",
+                "total_revenue",
+                "operating_profit",
+                "operating_cost",
+                "total_assets",
+                "total_equity",
+                "total_debts",
+                "cash",
+                "accounts_receivable",
+                "inventory",
+                "accounts_payable",
+                "advance_receipts",
+                "finance_cost",
+                "cfo",
+                "cfi",
+                "net_profit_yoy",
+                "total_revenue_yoy",
+                "total_assets_yoy",
+                "total_debts_yoy",
+                "cfo_share",
+                "debt_to_assets",
             ]
         )
-        return metric
 
-    @staticmethod
-    def value_metrics(df: pl.DataFrame) -> pl.DataFrame:
-        """Calculate valuation metrics."""
-        log.info("Calculating valuation metrics")
+        q = Fundamental.quality(base)
+        lev = Fundamental.leverage(base)
+        g = Fundamental.growth(base)
+        cf = Fundamental.cashflow(base)
 
-        metric = df.select(
-            [
-                Fundamental.IDENT_COLS,
-                (pl.col("cfo") / pl.col("net_profit")).alias("cfo_to_net_profit"),
-                (pl.col("cfo") + pl.col("cfi")).alias("cf_free"),
-                (pl.col("cfo") / pl.col("total_assets")).alias("cf_adequacy"),
-                (pl.col("cfo_share")),
-                (pl.col("cfi").abs() / pl.col("total_assets")).alias(
-                    "invest_intensity"
-                ),
-            ]
+        # Outer joins to preserve all rows
+        combined = (
+            q.join(lev, on=Fundamental.IDENT_COLS, how="full", coalesce=True)
+            .join(g, on=Fundamental.IDENT_COLS, how="full", coalesce=True)
+            .join(cf, on=Fundamental.IDENT_COLS, how="full", coalesce=True)
         )
-        return metric
+
+        # Add rolling TTM if enough history (heuristic)
+        if df.height > 2000 and "announcement_date" in df.columns:
+            try:
+                ttm = Fundamental.rolling_ttm(df, min_periods=3)
+                combined = combined.join(
+                    ttm.rename({"report_date": "announcement_date"}),
+                    on=["ts_code", "announcement_date"],
+                    how="left",
+                )
+            except Exception as e:
+                log.warning(f"TTM rolling computation skipped: {e}")
+
+        return combined.sort(["ts_code", "announcement_date"])
 
 
 class Behavioral:
     """
     Feature engineering class for behavioral (market microstructure and price action) metrics.
+    Designed to be robust for stocks, indices, and volatility indices (QVIX-like).
 
-    This class processes market data to generate technical indicators, price patterns,
-    and market microstructure features for quantitative analysis.
+    Required core columns (OHLCV):
+        date (date), ts_code (str, optional for index), open, high, low, close
+    Optional: volume, amount, amplitude, pct_chg, change, turnover_rate
 
-    REQUIRED COLUMNS in the input DataFrame for behavioral analysis:
-
-    Core Market Data (OHLCV):     (CN)
-        date (date):              交易日日期
-        ts_code (str):            股票/指数代码
-        open (float):             开盘价
-        high (float):             最高价
-        low (float):              最低价
-        close (float):            收盘价
-        volume (float/int):       成交量 (股/手)
-        amount (float):           成交额 (元)
-
-    Derived Market Metrics:
-        amplitude (float):        振幅 [(high-low)/prev_close]
-        pct_chg (float):          涨跌幅 (%)
-        change (float):           涨跌额 (close - prev_close)
-        turnover_rate (float):    换手率 (%)
-
-    For Index Data:
-        date (date):              日期
-        open (float):             开盘价
-        high (float):             最高价
-        low (float):              最低价
-        close (float):            收盘价
-        volume (float/int):       成交量 (可选)
-
-    For QVIX Volatility Data:
-        date (date):              日期
-        open (float):             开盘价 (波动率指数)
-        high (float):             最高价 (波动率指数)
-        low (float):              最低价 (波动率指数)
-        close (float):            收盘价 (波动率指数)
-
-    Note: All price data should be in consistent currency units (typically yuan).
-    Volume and amount data should be in appropriate units as specified.
+    Behavior when columns missing:
+    - Returns frame with IDENT_COLS + expected feature columns (all null if input missing)
+    - Never returns completely empty schema (avoids join crashes)
     """
 
     IDENT_COLS = [
-        "ts_code",
-        "date",
-    ]
+        "date"
+    ]  # for index/QVIX; can be extended to ["ts_code", "date"] for stocks
+
+    @staticmethod
+    def _ensure_base_schema(df: pl.DataFrame) -> pl.DataFrame:
+        """Add missing IDENT_COLS with nulls if needed."""
+        missing = [c for c in Behavioral.IDENT_COLS if c not in df.columns]
+        if missing:
+            log.debug(f"Adding missing identifier columns: {missing}")
+            for c in missing:
+                dtype = pl.Date if c == "date" else pl.Utf8
+                df = df.with_columns(pl.lit(None).cast(dtype).alias(c))
+        return df
 
     @staticmethod
     def momentum(df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Captures Trend Strength, Reversion, and Efficiency.
-        """
-        return df.select(
-            Behavioral.IDENT_COLS,
-            [
-                (pl.col("close") / pl.col("close").shift(1) - 1).alias("ret_1"),
-                (pl.col("close") / pl.col("close").shift(4) - 1).alias("ret_4"),
-                (pl.col("close") / pl.col("close").shift(12) - 1).alias("ret_12"),
-                pl.col("close").rolling_mean(4).alias("ma_4"),
-                pl.col("close").rolling_mean(12).alias("ma_12"),
-                pl.col("close").rolling_mean(24).alias("ma_24"),
-                (pl.col("close") / pl.col("ma_12") - 1).alias("ma12_dev"),
-                (pl.col("close") / pl.col("ma_24") - 1).alias("ma24_dev"),
-                pl.col("close").pct_change(4).alias("roc_4"),
-                pl.col("close").pct_change(12).alias("roc_12"),
-                pl.col("high").rolling_max(20).alias("ch_high"),
-                pl.col("low").rolling_min(20).alias("ch_low"),
-                (
+        """Price momentum, moving average deviation, ROC, channel position."""
+        log.info("Behavioral.momentum: computing momentum features")
+        df = Behavioral._ensure_base_schema(df.sort("date"))
+
+        if "close" not in df.columns:
+            log.warning("No 'close' column → returning empty momentum features")
+            return df.select(*Behavioral.IDENT_COLS)
+
+        return (
+            df.with_columns(
+                ret_1=pl.col("close").pct_change(1),
+                ret_4=pl.col("close").pct_change(4),
+                ret_12=pl.col("close").pct_change(12),
+                ma_4=pl.col("close").rolling_mean(4, min_samples=2),
+                ma_12=pl.col("close").rolling_mean(12, min_samples=4),
+                ma_24=pl.col("close").rolling_mean(24, min_samples=8),
+            )
+            .with_columns(
+                ma12_dev=(pl.col("close") / pl.col("ma_12") - 1).clip(-10, 10),
+                ma24_dev=(pl.col("close") / pl.col("ma_24") - 1).clip(-10, 10),
+                roc_4=pl.col("close").pct_change(4),
+                roc_12=pl.col("close").pct_change(12),
+            )
+            .with_columns(
+                ch_high=pl.col("high").rolling_max(20, min_samples=5)
+                if "high" in df.columns
+                else None,
+                ch_low=pl.col("low").rolling_min(20, min_samples=5)
+                if "low" in df.columns
+                else None,
+            )
+            .with_columns(
+                ch_pos=(
                     (pl.col("close") - pl.col("ch_low"))
-                    / (pl.col("ch_high") - pl.col("ch_low"))
-                ).alias("ch_pos"),
-                (pl.col("close") > pl.col("ma_12")).cast(pl.Int8).alias("above_ma12"),
-                (pl.col("ma_4") > pl.col("ma_12")).cast(pl.Int8).alias("ma_cross_up"),
-            ],
+                    / (pl.col("ch_high") - pl.col("ch_low")).clip(lower_bound=1e-8)
+                ).clip(0, 1)
+                if "ch_high" in df.columns and "ch_low" in df.columns
+                else None,
+                above_ma12=(pl.col("close") > pl.col("ma_12")).cast(pl.Int8),
+                ma_cross_up=(pl.col("ma_4") > pl.col("ma_12")).cast(pl.Int8),
+            )
+            .select(
+                *Behavioral.IDENT_COLS,
+                cs.starts_with(
+                    "ret_", "ma", "roc_", "ch_pos", "above_ma12", "ma_cross_up"
+                ),
+            )
         )
 
     @staticmethod
-    def volatiity(df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Captures Variance, Range, and Regime.
-        """
-        df = df.with_columns(pl.col("close").log().diff().alias("log_ret_1"))
-        # Parkinson Volatility (High-Low based, more efficient than Close-Close)
-        parkinson = (
-            (pl.col("high") / pl.col("low")).log() ** 2 / (4 * np.log(2))
-        ).sqrt()
+    def volatility(df: pl.DataFrame) -> pl.DataFrame:
+        """Volatility estimators (Parkinson, Garman-Klass, realized, ATR)."""
+        log.info("Behavioral.volatility: computing volatility features")
+        df = Behavioral._ensure_base_schema(df.sort("date"))
 
-        # Garman-Klass Volatility (Includes Open-Close information)
-        gk_comp1 = 0.5 * ((pl.col("high") / pl.col("low")).log() ** 2)
-        gk_comp2 = (2 * np.log(2) - 1) * ((pl.col("close") / pl.col("open")).log() ** 2)
-        gk = (gk_comp1 - gk_comp2).sqrt()
+        if "close" not in df.columns:
+            log.warning("No 'close' → returning empty volatility features")
+            return df.select(*Behavioral.IDENT_COLS)
 
-        # True Range
-        tr = pl.max_horizontal(
+        df = df.with_columns(log_ret_1=pl.col("close").log().diff())
+
+        exprs: list[pl.Expr] = []
+
+        # Parkinson (high-low)
+        if all(c in df.columns for c in ["high", "low"]):
+            exprs.append(
+                ((pl.col("high") / pl.col("low")).log() ** 2 / (4 * np.log(2)))
+                .sqrt()
+                .rolling_mean(20, min_samples=5)
+                .alias("vola_parkinson")
+            )
+
+        # Garman-Klass (OHLC)
+        if all(c in df.columns for c in ["open", "high", "low", "close"]):
+            exprs.append(
+                (
+                    0.5 * (pl.col("high") / pl.col("low")).log() ** 2
+                    - (2 * np.log(2) - 1)
+                    * (pl.col("close") / pl.col("open")).log() ** 2
+                )
+                .sqrt()
+                .rolling_mean(20, min_samples=5)
+                .alias("vola_gk")
+            )
+
+        # Realized volatility
+        exprs.extend(
             [
-                pl.col("high") - pl.col("low"),
-                (pl.col("high") - pl.col("close").shift(1)).abs(),
-                (pl.col("low") - pl.col("close").shift(1)).abs(),
+                pl.col("log_ret_1").rolling_std(20, min_samples=10).alias("vola_20"),
+                pl.col("log_ret_1").rolling_std(60, min_samples=20).alias("vola_60"),
             ]
         )
+
+        # ATR % and regime ratio
+        if "high" in df.columns and "low" in df.columns and "close" in df.columns:
+            df = df.with_columns(
+                tr=pl.max_horizontal(
+                    pl.col("high") - pl.col("low"),
+                    (pl.col("high") - pl.col("close").shift(1)).abs(),
+                    (pl.col("low") - pl.col("close").shift(1)).abs(),
+                )
+            )
+            exprs.append(
+                (pl.col("tr").rolling_mean(14, min_samples=5) / pl.col("close"))
+                .clip(0, 1)
+                .alias("atr_pct")
+            )
+
+        df = df.with_columns(*exprs)
+
+        if "vola_20" in df.columns and "vola_60" in df.columns:
+            df = df.with_columns(
+                vola_regime_ratio=(
+                    pl.col("vola_20") / pl.col("vola_60").clip(lower_bound=1e-8)
+                ).clip(0.1, 10)
+            )
+
         return df.select(
-            Behavioral.IDENT_COLS,
-            [
-                parkinson.alias("vola_parkinson"),
-                gk.alias("vola_gk"),
-                # Realized Volatility (Standard Deviation of returns)
-                pl.col("log_ret_1").rolling_std(20).alias("vola_20"),
-                pl.col("log_ret_1").rolling_std(60).alias("vola_60"),
-                # Volatility Regime (Current Vol / Long-term Vol) - Mean Reversion Signal
-                (
-                    pl.col("log_ret_1").rolling_std(20)
-                    / (pl.col("log_ret_1").rolling_std(60) + 1e-9)
-                ).alias("vola_regime_ratio"),
-                # Normalized ATR
-                (tr.rolling_mean(14) / pl.col("close")).alias("atr_pct"),
-            ],
+            *Behavioral.IDENT_COLS, cs.starts_with("vola_", "atr_pct", "tr")
         )
 
     @staticmethod
     def volume(df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Captures Liquidity shocks and VWAP deviations.
-        """
-        if "volume" not in df.columns:
-            raise ValueError(
-                f"volume is not in the given data frame. columns: \n {df.columns}"
+        """Volume deviation, spikes, VWAP deviation."""
+        log.info("Behavioral.volume: computing volume features")
+        df = Behavioral._ensure_base_schema(df.sort("date"))
+
+        if "volume" not in df.columns or df["volume"].null_count() == df.height:
+            log.info("No valid volume → returning null volume features")
+            return df.select(
+                *Behavioral.IDENT_COLS,
+                pl.lit(None).alias("vol_dev20"),
+                pl.lit(None).alias("vol_dev60"),
+                pl.lit(None).alias("vol_spike"),
+                pl.lit(None).alias("vwap_dev_1d"),
+                pl.lit(None).alias("avg_trade_price"),
             )
 
-        vol_ma20 = pl.col("volume").rolling_mean(20)
-
         exprs = [
-            # 1. Volume Trend
-            (pl.col("volume") / vol_ma20 - 1).alias("vol_dev20"),
-            (pl.col("volume") / pl.col("volume").rolling_mean(60) - 1).alias(
-                "vol_dev60"
-            ),
-            # 2. Volume Shock
-            (pl.col("volume") > vol_ma20 * 2).cast(pl.Int8).alias("vol_spike"),
+            (pl.col("volume") / pl.col("volume").rolling_mean(20, min_samples=5) - 1)
+            .clip(-5, 5)
+            .alias("vol_dev20"),
+            (pl.col("volume") / pl.col("volume").rolling_mean(60, min_samples=10) - 1)
+            .clip(-5, 5)
+            .alias("vol_dev60"),
+            (pl.col("volume") > pl.col("volume").rolling_mean(20, min_samples=5) * 2)
+            .cast(pl.Int8)
+            .alias("vol_spike"),
         ]
 
-        if "amount" in df.columns:
-            avg_price = pl.col("amount") / (pl.col("volume") + 1e-9)
-            exprs.append((pl.col("close") / avg_price - 1).alias("vwap_dev_1d"))
-            exprs.append((pl.col("amount") / pl.col("volume")).alias("avg_trade_price"))
+        if "amount" in df.columns and "volume" in df.columns:
+            exprs.extend(
+                [
+                    (
+                        pl.col("close")
+                        / (pl.col("amount") / (pl.col("volume") + 1e-8)).clip(
+                            lower_bound=1e-6
+                        )
+                        - 1
+                    )
+                    .clip(-0.5, 0.5)
+                    .alias("vwap_dev_1d"),
+                    (pl.col("amount") / (pl.col("volume") + 1e-8))
+                    .clip(lower_bound=1e-6)
+                    .alias("avg_trade_price"),
+                ]
+            )
 
-        # Return only the new calculated columns
-        return df.select(Behavioral.IDENT_COLS, exprs)
+        return df.with_columns(exprs).select(
+            *Behavioral.IDENT_COLS,
+            cs.starts_with("vol_", "vwap_dev", "avg_trade_price"),
+        )
 
     @staticmethod
     def structure(df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Captures Time-Series properties: Autocorrelation and Variance Ratio.
-        CRITICAL FIX: Removed full-series look-ahead bias using rolling windows.
-        """
-        df = df.with_columns(pl.col("close").log().diff().alias("log_ret_1"))
-        return df.select(
-            Behavioral.IDENT_COLS,
-            [
-                (
-                    pl.col("close").log().diff(2).rolling_var(60)
-                    / (pl.col("log_ret_1").rolling_var(60) * 2 + 1e-9)
-                ).alias("vr_2"),
-                pl.rolling_corr(
-                    pl.col("log_ret_1"), pl.col("log_ret_1").shift(1), window_size=60
-                ).alias("ac_1"),
-                pl.corr(pl.col("log_ret_1"), pl.col("log_ret_1").shift(5)).alias(
-                    "ac_5"
-                ),
-                (pl.col("close") / pl.col("high").rolling_max(50) - 1).alias(
-                    "near_high"
-                ),
-                (pl.col("close") / pl.col("low").rolling_min(50) - 1).alias("near_low"),
+        """Variance ratio, autocorrelation, gap, near-high/low position."""
+        log.info("Behavioral.structure: computing microstructure features")
+        df = Behavioral._ensure_base_schema(df.sort("date"))
+
+        if "close" not in df.columns:
+            log.warning("No 'close' → skipping structure features")
+            return df.select(*Behavioral.IDENT_COLS)
+
+        df = df.with_columns(log_ret_1=pl.col("close").log().diff())
+
+        exprs = [
+            # Variance ratio (2-day vs 1-day)
+            (
+                pl.col("log_ret_1").diff(1).rolling_var(60, min_samples=20)
+                / (2 * pl.col("log_ret_1").rolling_var(60, min_samples=20) + 1e-9)
+            )
+            .clip(0.1, 5)
+            .alias("vr_2"),
+            # Autocorrelation at lag 1 and 5
+            pl.rolling_corr(
+                pl.col("log_ret_1"),
+                pl.col("log_ret_1").shift(1),
+                window_size=60,
+                min_samples=20,
+            ).alias("ac_1"),
+            pl.rolling_corr(
+                pl.col("log_ret_1"),
+                pl.col("log_ret_1").shift(5),
+                window_size=60,
+                min_samples=20,
+            ).alias("ac_5"),
+        ]
+
+        if "high" in df.columns:
+            exprs.append(
+                (pl.col("close") / pl.col("high").rolling_max(50, min_samples=10) - 1)
+                .clip(-1, 0.5)
+                .alias("near_high")
+            )
+
+        if "low" in df.columns:
+            exprs.append(
+                (pl.col("close") / pl.col("low").rolling_min(50, min_samples=10) - 1)
+                .clip(-0.5, 1)
+                .alias("near_low")
+            )
+
+        if all(c in df.columns for c in ["open", "close"]):
+            exprs.append(
                 (
                     (pl.col("open") - pl.col("close").shift(1))
-                    / pl.col("close").shift(1)
-                ).alias("gap"),
-            ],
+                    / pl.col("close").shift(1).clip(lower_bound=1e-8)
+                )
+                .clip(-0.2, 0.2)
+                .alias("gap")
+            )
+
+        return df.with_columns(exprs).select(
+            *Behavioral.IDENT_COLS, cs.starts_with("vr_", "ac_", "near_", "gap")
         )
+
+    @staticmethod
+    def metrics(df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Combine all behavioral feature groups.
+        Uses full outer joins + coalesce=True for clean keys.
+        """
+        log.info("Behavioral.metrics: computing full behavioral feature suite")
+
+        if df.is_empty() or "date" not in df.columns:
+            log.warning("Input empty or missing 'date' → returning empty schema")
+            return pl.DataFrame(schema={"date": pl.Date})
+
+        df = df.sort("date")
+        mom = Behavioral.momentum(df)
+        vola = Behavioral.volatility(df)
+        vol = Behavioral.volume(df)
+        stru = Behavioral.structure(df)
+        combined = (
+            mom.join(vola, on=Behavioral.IDENT_COLS, how="full", coalesce=True)
+            .join(vol, on=Behavioral.IDENT_COLS, how="full", coalesce=True)
+            .join(stru, on=Behavioral.IDENT_COLS, how="full", coalesce=True)
+        )
+
+        return combined.sort("date")
 
 
 class Northbound:
     """
-    Feature extractor for northbound capital flow (沪深港通 北向资金).
-
-    Accepted input columns:
-    - date (date)
-    - net_buy (float): 当日成交净买额
-    - fund_inflow (float): 当日资金流入
-    - cum_net_by (float): 历史累计净买额
-
-    Returns:
-    - flow momentum
-    - flow volatility
-    - flow regime indicators
+    Northbound (沪深港通 北向资金) behavioral feature extractor.
+    Input: daily northbound flow data from AkShare (net_buy, fund_inflow, cum_net_buy, date)
+    Output: wide-format feature table with momentum, persistence, acceleration signals.
+    All features are null-safe and work with partial/missing data.
     """
 
     IDENT_COLS = ["date"]
 
     @staticmethod
+    def _safe_zscore(
+        col: str,
+        mean_win: int = 20,
+        std_win: int = 60,
+        min_periods_mean: int | None = None,
+        min_periods_std: int | None = None,
+    ) -> pl.Expr:
+        """Rolling z-score with configurable min_periods and safe division."""
+        m_win = min_periods_mean or max(3, mean_win // 3)
+        s_win = min_periods_std or max(5, std_win // 3)
+
+        mean_expr = pl.col(col).rolling_mean(mean_win, min_samples=m_win)
+        std_expr = (
+            pl.col(col).rolling_std(std_win, min_samples=s_win).clip(lower_bound=1e-8)
+        )
+
+        z = (pl.col(col) - mean_expr) / std_expr
+        return z.clip(-10, 10).alias(f"{col}_z")
+
+    @staticmethod
     def flow(df: pl.DataFrame) -> pl.DataFrame:
-        z = (pl.col("net_buy") - pl.col("net_buy").rolling_mean(20)) / (
-            pl.col("net_buy").rolling_std(60)
+        """Short/medium-term flow strength & shock signals."""
+        log.info("Northbound.flow: computing flow z-score & shock signals")
+
+        if "net_buy" not in df.columns:
+            log.warning("No 'net_buy' column → returning empty flow features")
+            return df.select(*Northbound.IDENT_COLS)
+
+        df = df.sort("date")
+
+        df = df.with_columns(
+            Northbound._safe_zscore(
+                "net_buy",
+                mean_win=10,
+                std_win=30,
+                min_periods_mean=5,
+                min_periods_std=10,
+            ).alias("nb_flow_z_short"),
+            Northbound._safe_zscore("net_buy", mean_win=20, std_win=60).alias(
+                "nb_flow_z"
+            ),
+            Northbound._safe_zscore("net_buy", mean_win=60, std_win=120).alias(
+                "nb_flow_z_long"
+            ),
+        )
+
+        z_cols = ["nb_flow_z_short", "nb_flow_z", "nb_flow_z_long"]
+        df = df.with_columns(
+            # Absolute values (per window)
+            pl.col("nb_flow_z_short").abs().alias("nb_flow_z_short_abs"),
+            pl.col("nb_flow_z").abs().alias("nb_flow_z_abs"),
+            pl.col("nb_flow_z_long").abs().alias("nb_flow_z_long_abs"),
+            # Positive / shock indicators (per window)
+            pl.col(z_cols).gt(0).cast(pl.Int8).name.prefix("nb_flow_pos_"),
+            pl.col(z_cols).abs().gt(2).cast(pl.Int8).name.prefix("nb_flow_shock_"),
+        )
+        df = df.with_columns(
+            # Max absolute z-score across windows
+            nb_flow_abs_max=pl.max_horizontal(
+                cs.contains(
+                    "_abs"
+                )  # selects nb_flow_z_short_abs, nb_flow_z_abs, nb_flow_z_long_abs
+            ),
+            # Any shock across windows
+            nb_flow_shock_any=pl.max_horizontal(cs.starts_with("nb_flow_shock_")).cast(
+                pl.Int8
+            ),
+            # Average absolute z (optional, for overall strength)
+            nb_flow_abs_avg=pl.mean_horizontal(cs.contains("_abs")),
         )
 
         return df.select(
-            Northbound.IDENT_COLS,
-            [
-                z.alias("nb_flow_z"),
-                z.abs().alias("nb_flow_abs_z"),
-                (z > 0).cast(pl.Int8).alias("nb_flow_pos"),
-                (z.abs() > 2).cast(pl.Int8).alias("nb_flow_shock"),
-            ],
+            *Northbound.IDENT_COLS,
+            cs.starts_with(
+                "nb_flow_z",
+                "nb_flow_pos",
+                "nb_flow_shock",
+                "nb_flow_abs",
+                "nb_flow_conviction",
+            ),
         )
 
     @staticmethod
     def persistence(df: pl.DataFrame) -> pl.DataFrame:
-        signed_strength = pl.col("net_buy").sign() * pl.col(
-            "net_buy"
-        ).abs().rolling_mean(5)
+        """Trend strength, conviction, and cumulative pressure."""
+        log.info("Northbound.persistence: computing persistence & trend signals")
 
-        return df.select(
-            Northbound.IDENT_COLS,
-            [
-                signed_strength.alias("nb_flow_conviction"),
-                signed_strength.rolling_mean(20).alias("nb_flow_trend"),
-            ],
+        if "net_buy" not in df.columns:
+            return df.select(*Northbound.IDENT_COLS)
+
+        return df.with_columns(
+            # Rolling sign-weighted conviction (stronger when consistent direction)
+            nb_flow_conviction=(
+                pl.col("net_buy").sign()
+                * pl.col("net_buy").abs().rolling_mean(20, min_samples=5)
+            ),
+            # Long-term trend strength
+            nb_flow_trend=pl.col("net_buy").rolling_mean(60, min_samples=15),
+            # Cumulative z-score direction (persistent buying/selling pressure)
+            nb_cum_z_trend=Northbound._safe_zscore(
+                "net_buy", mean_win=60, std_win=120
+            ).rolling_mean(20, min_samples=5),
+        ).select(
+            *Northbound.IDENT_COLS,
+            cs.starts_with("nb_flow_conviction", "nb_flow_trend", "nb_cum_z_trend"),
         )
 
     @staticmethod
     def accel(df: pl.DataFrame) -> pl.DataFrame:
-        accel = pl.col("net_buy").diff().diff()
+        """Acceleration / deceleration of flow (second difference)."""
+        log.info("Northbound.accel: computing flow acceleration")
+
+        if "net_buy" not in df.columns:
+            log.warning("No 'net_buy' → returning empty accel features")
+            return df.select(*Northbound.IDENT_COLS)
+
+        df = df.sort("date").with_columns(
+            nb_flow_delta=pl.col("net_buy").diff(),
+            nb_flow_accel=pl.col("net_buy").diff().diff(),
+        )
+
+        df = df.with_columns(
+            nb_flow_accel_clipped=pl.col("nb_flow_accel").clip(-1e6, 1e6)
+        )
+        df = df.with_columns(
+            nb_flow_accel_up=(pl.col("nb_flow_accel_clipped") > 0).cast(pl.Int8),
+            nb_flow_accel_down=(pl.col("nb_flow_accel_clipped") < 0).cast(pl.Int8),
+            # Shock: accel > 95th percentile of historical accel (absolute)
+            nb_flow_shock_accel=(
+                pl.col("nb_flow_accel_clipped").abs()
+                > pl.col("nb_flow_accel_clipped")
+                .abs()
+                .rolling_quantile(0.95, window_size=60, min_samples=20)
+            ).cast(pl.Int8),
+        )
 
         return df.select(
-            Northbound.IDENT_COLS,
-            [
-                accel.alias("nb_flow_accel"),
-                (accel > 0).cast(pl.Int8).alias("nb_flow_accel_up"),
-            ],
+            *Northbound.IDENT_COLS,
+            cs.starts_with("nb_flow_delta", "nb_flow_accel", "nb_flow_shock_accel"),
         )
+
+    @staticmethod
+    def metrics(df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Combine all Northbound feature groups.
+        Uses full outer join + coalesce=True for clean keys and union semantics.
+        """
+        log.info("Northbound.metrics: computing full northbound feature suite")
+
+        if df.is_empty() or "date" not in df.columns:
+            log.warning("Input empty or missing 'date' → returning minimal schema")
+            return pl.DataFrame(schema={"date": pl.Date})
+
+        df = df.sort("date")
+
+        f = Northbound.flow(df)
+        p = Northbound.persistence(df)
+        a = Northbound.accel(df)
+
+        combined = f.join(p, on=Northbound.IDENT_COLS, how="full", coalesce=True).join(
+            a, on=Northbound.IDENT_COLS, how="full", coalesce=True
+        )
+        return combined.with_columns(
+            # Overall shock: ANY shock from flow or accel windows
+            nb_shock_any=pl.any_horizontal(
+                cs.starts_with("nb_flow_shock"), cs.starts_with("nb_flow_accel")
+            ).cast(pl.Int8),
+            # Optional: overall positive flow strength
+            nb_flow_pos_any=pl.any_horizontal(cs.starts_with("nb_flow_pos")).cast(
+                pl.Int8
+            ),
+        ).sort("date")
 
 
 class MarginShort:
     """
-    Feature extractor for total A-share margin & short balance (SH + SZ).
-
-    Accepted input columns:
-    - date
-    - margin_balance
-    - margin_buy_amount
-    - short_sell_volume
-    - short_balance
-    - total_margin_balance
-
-    Returns:
-    - leverage level
-    - leverage impulse
-    - leverage regime indicators
+    Feature extractor for A-share margin & short-selling data (SH+SZ combined).
+    All operations use consistent clipping and null-safe logic.
     """
 
     IDENT_COLS = ["date"]
 
     @staticmethod
+    def _safe_ratio(
+        num_col: str,
+        den_col: str,
+        alias: str,
+        min_den: float = 1e-6,
+        clip_lower: float = 0.0,
+        clip_upper: float | None = None,
+    ) -> pl.Expr:
+        """Safe division with configurable bounds."""
+        num = pl.col(num_col)
+        den = pl.col(den_col).clip(lower_bound=min_den)
+        ratio = num / den
+        if clip_upper is not None:
+            ratio = ratio.clip(lower_bound=clip_lower, upper_bound=clip_upper)
+        else:
+            ratio = ratio.clip(lower_bound=clip_lower)
+        return ratio.alias(alias)
+
+    @staticmethod
     def level(df: pl.DataFrame) -> pl.DataFrame:
-        return df.select(
-            MarginShort.IDENT_COLS,
-            [
-                pl.col("total_margin_balance").alias("margin_total"),
-                pl.col("total_margin_balance").rolling_mean(20).alias("margin_ma20"),
-                (
-                    pl.col("total_margin_balance")
-                    / pl.col("total_margin_balance").rolling_mean(60)
+        log.info("MarginShort.level: computing margin level & deviation")
+        if "total_margin_balance" not in df.columns:
+            log.warning("No 'total_margin_balance' → empty level features")
+            return df.select(*MarginShort.IDENT_COLS)
+
+        return (
+            df.sort("date")
+            .with_columns(
+                margin_ma20=pl.col("total_margin_balance").rolling_mean(
+                    20, min_samples=5
+                ),
+                margin_ma60=pl.col("total_margin_balance").rolling_mean(
+                    60, min_samples=15
+                ),
+                margin_ma120=pl.col("total_margin_balance").rolling_mean(
+                    120, min_samples=30
+                ),
+            )
+            .with_columns(
+                margin_dev60=(
+                    pl.col("total_margin_balance") / pl.col("margin_ma60").clip(1e-6)
                     - 1
-                ).alias("margin_dev60"),
-            ],
+                ).clip(-0.8, 2.0),
+                margin_dev120=(
+                    pl.col("total_margin_balance") / pl.col("margin_ma120").clip(1e-6)
+                    - 1
+                ).clip(-0.8, 2.0),
+                leverage_dev=(
+                    pl.col("total_margin_balance") / pl.col("margin_ma120").clip(1e-6)
+                    - 1
+                ).clip(-0.8, 2.0),
+            )
+            .select(
+                *MarginShort.IDENT_COLS,
+                "total_margin_balance",
+                cs.starts_with("margin_ma"),
+                cs.starts_with("margin_dev"),
+                "leverage_dev",
+            )
         )
 
     @staticmethod
     def impulse(df: pl.DataFrame) -> pl.DataFrame:
-        delta = pl.col("total_margin_balance").diff()
+        log.info("MarginShort.impulse: computing margin flow impulse")
+        if "total_margin_balance" not in df.columns:
+            return df.select(*MarginShort.IDENT_COLS)
 
-        return df.select(
-            MarginShort.IDENT_COLS,
-            [
-                delta.alias("margin_delta"),
-                delta.diff().alias("margin_accel"),
-                delta.rolling_mean(5).alias("margin_impulse5"),
-                delta.rolling_mean(20).alias("margin_impulse20"),
-            ],
+        return (
+            df.sort("date")
+            .with_columns(
+                margin_delta=pl.col("total_margin_balance").diff(),
+            )
+            .with_columns(
+                # Use relative change — much safer than absolute diff
+                margin_delta_pct=pl.col("total_margin_balance")
+                .pct_change()
+                .clip(-1.0, 1.0),
+                margin_accel_pct=pl.col("total_margin_balance")
+                .pct_change()
+                .diff()
+                .clip(-1.0, 1.0),
+            )
+            .with_columns(
+                margin_impulse5=pl.col("margin_delta_pct").rolling_mean(
+                    5, min_samples=3
+                ),
+                margin_impulse20=pl.col("margin_delta_pct").rolling_mean(
+                    20, min_samples=8
+                ),
+                margin_impulse_up=(pl.col("margin_delta_pct") > 0).cast(pl.Int8),
+            )
+            .select(
+                *MarginShort.IDENT_COLS,
+                cs.starts_with("margin_delta", "margin_impulse"),
+            )
         )
 
     @staticmethod
     def stress(df: pl.DataFrame) -> pl.DataFrame:
-        short_long_ratio = (
-            pl.col("short_sell_volume") / pl.col("margin_buy_amount")
-        ).alias("short_long_ratio")
+        log.info("MarginShort.stress: computing short pressure & leverage stress")
+        required = [
+            "short_sell_volume",
+            "margin_buy_amount",
+            "short_balance",
+            "total_margin_balance",
+        ]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            log.warning(f"Missing columns for stress: {missing}")
+            return df.select(*MarginShort.IDENT_COLS)
 
-        short_leverage_ratio = (
-            pl.col("short_balance") / pl.col("total_margin_balance")
-        ).alias("short_leverage_ratio")
-
-        return df.select(
-            MarginShort.IDENT_COLS,
-            [
-                short_long_ratio,
-                short_leverage_ratio,
-                (
-                    pl.col("short_sell_volume")
-                    > pl.col("short_sell_volume").rolling_mean(20) * 1.5
-                )
-                .cast(pl.Int8)
-                .alias("short_pressure_20d"),
-                (
-                    pl.col("short_sell_volume")
-                    > pl.col("short_sell_volume").rolling_mean(60) * 1.5
-                )
-                .cast(pl.Int8)
-                .alias("short_pressure_60d"),
-                (short_leverage_ratio > short_leverage_ratio.rolling_mean(60))
-                .cast(pl.Int8)
-                .alias("short_stress_60d"),
-            ],
+        df = (
+            df.sort("date")
+            .with_columns(
+                short_long_ratio=MarginShort._safe_ratio(
+                    "short_sell_volume",
+                    "margin_buy_amount",
+                    "short_long_ratio",
+                    clip_lower=0.0,
+                    clip_upper=10.0,
+                ),
+                short_leverage_ratio=MarginShort._safe_ratio(
+                    "short_balance",
+                    "total_margin_balance",
+                    "short_leverage_ratio",
+                    clip_lower=0.0,
+                    clip_upper=2.0,  # raised upper limit
+                ),
+                short_ma20=pl.col("short_sell_volume").rolling_mean(20, min_samples=5),
+                short_ma60=pl.col("short_sell_volume").rolling_mean(60, min_samples=15),
+            )
+            .with_columns(
+                short_pressure_20d=(
+                    pl.col("short_sell_volume") > pl.col("short_ma20") * 1.5
+                ).cast(pl.Int8),
+                short_pressure_60d=(
+                    pl.col("short_sell_volume") > pl.col("short_ma60") * 1.5
+                ).cast(pl.Int8),
+                short_stress_60d=(
+                    pl.col("short_leverage_ratio")
+                    > pl.col("short_leverage_ratio").rolling_mean(60, min_samples=15)
+                ).cast(pl.Int8),
+            )
         )
+
+        pressure_cols = cs.starts_with("short_pressure_")
+        stress_cols = cs.starts_with("short_stress_")
+
+        if not df.select(pressure_cols.append(stress_cols)).columns:
+            log.warning("No stress/pressure indicators created → short_stress_any = 0")
+            df = df.with_columns(pl.lit(0).cast(pl.Int8).alias("short_stress_any"))
+        else:
+            df = df.with_columns(
+                short_stress_any=pl.any_horizontal(pressure_cols, stress_cols).cast(
+                    pl.Int8
+                )
+            )
+
+        return df.select(*MarginShort.IDENT_COLS, cs.starts_with("short_", "margin_"))
+
+    @staticmethod
+    def metrics(df: pl.DataFrame) -> pl.DataFrame:
+        log.info("MarginShort.metrics: computing full margin/short feature suite")
+
+        if df.is_empty() or "date" not in df.columns:
+            log.warning("Input empty or missing 'date' → returning minimal schema")
+            return pl.DataFrame(schema={"date": pl.Date})
+
+        df = df.sort("date")
+
+        lev = MarginShort.level(df)
+        imp = MarginShort.impulse(df)
+        str_ = MarginShort.stress(df)
+
+        combined = lev.join(
+            imp, on=MarginShort.IDENT_COLS, how="full", coalesce=True
+        ).join(str_, on=MarginShort.IDENT_COLS, how="full", coalesce=True)
+
+        return combined.with_columns(
+            overall_leverage_stress=pl.any_horizontal(
+                cs.contains("leverage_dev").gt(0.5), cs.starts_with("short_stress_")
+            ).cast(pl.Int8),
+            margin_flow_pressure=pl.any_horizontal(
+                cs.contains("margin_impulse").gt(0), cs.starts_with("short_pressure_")
+            ).cast(pl.Int8),
+        ).sort("date")
 
 
 class Shibor:
     """
-    Feature extractor for SHIBOR funding rates.
-
-    Accepted columns:
-    - date
-    - ON_rate, 1W_rate, 1M_rate, 3M_rate, 1Y_rate
-
-    Focus:
-    - funding shock
-    - term structure compression
-    - liquidity stress
+    SHIBOR funding rate feature extractor.
+    Focuses on liquidity shocks, curve shape, and stress signals.
+    Input columns (from ak.macro_china_shibor_all):
+        date, ON_rate, 1W_rate, 1M_rate, 3M_rate, 1Y_rate (and optional change columns)
+    All features are null-safe and robust to partial/missing tenors.
     """
 
     IDENT_COLS = ["date"]
 
     @staticmethod
-    def funding_shock(df: pl.DataFrame) -> pl.DataFrame:
-        # df = Shibor._resample(df, freq)
+    def _safe_zscore(
+        col: str,
+        win: int = 60,
+        min_samples: int | None = None,
+    ) -> pl.Expr:
+        """Rolling z-score with safe std and clipping."""
+        m_periods = min_samples or max(5, win // 4)
+        mean = pl.col(col).rolling_mean(win, min_samples=m_periods)
+        std = pl.col(col).rolling_std(win, min_samples=m_periods).clip(lower_bound=1e-8)
+        return ((pl.col(col) - mean) / std).clip(-10, 10)
 
-        on_change = pl.col("ON_rate").diff()
-        shock = on_change - on_change.rolling_mean(20)
+    @staticmethod
+    def shock(df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Liquidity shock & funding pressure signals (focus on overnight).
+        """
+        log.info("Shibor.shock: computing funding shock & liquidity pressure")
+
+        if "ON_rate" not in df.columns:
+            log.warning("No 'ON_rate' column → returning empty shock features")
+            return df.select(*Shibor.IDENT_COLS)
+
+        df = df.sort("date")
+
+        df = df.with_columns(
+            on_change=pl.col("ON_rate").diff(),
+        )
+        df = df.with_columns(
+            on_change_ma20=pl.col("on_change").rolling_mean(20, min_samples=5),
+            on_change_ma60=pl.col("on_change").rolling_mean(60, min_samples=15),
+        )
+        df = df.with_columns(
+            shibor_on_shock_short=pl.col("on_change") - pl.col("on_change_ma20"),
+            shibor_on_shock_long=pl.col("on_change") - pl.col("on_change_ma60"),
+        )
+        df = df.with_columns(
+            shibor_on_shock_z_short=Shibor._safe_zscore(
+                "shibor_on_shock_short", win=60, min_samples=15
+            ),
+            shibor_on_shock_z_long=Shibor._safe_zscore(
+                "shibor_on_shock_long", win=120, min_samples=30
+            ),
+        )
+        df = df.with_columns(
+            shibor_liquidity_tighten=(pl.col("shibor_on_shock_z_short") > 1.5).cast(
+                pl.Int8
+            ),
+            shibor_funding_stress=(pl.col("shibor_on_shock_z_short") > 2.0).cast(
+                pl.Int8
+            ),
+        )
 
         return df.select(
-            Shibor.IDENT_COLS,
-            [
-                shock.alias("shibor_on_shock"),
-                (shock > 0).cast(pl.Int8).alias("shibor_liquidity_tighten"),
-            ],
+            *Shibor.IDENT_COLS,
+            cs.starts_with("shibor_on_shock", "shibor_liquidity_", "shibor_funding_"),
         )
 
     @staticmethod
-    def curve_structure(df: pl.DataFrame) -> pl.DataFrame:
-        curve_std = pl.concat_list(
-            [
-                pl.col("ON_rate"),
-                pl.col("1W_rate"),
-                pl.col("1M_rate"),
-                pl.col("3M_rate"),
-                pl.col("1Y_rate"),
-            ]
-        ).list.std()
+    def curve(df: pl.DataFrame) -> pl.DataFrame:
+        log.info("Shibor.curve: computing yield curve structure & slope signals")
 
-        return df.select(
-            Shibor.IDENT_COLS,
-            [
-                (pl.col("3M_rate") - pl.col("ON_rate")).alias("shibor_term_spread"),
-                curve_std.alias("shibor_curve_dispersion"),
-            ],
+        tenors = ["ON_rate", "1W_rate", "1M_rate", "3M_rate", "1Y_rate"]
+        available = [t for t in tenors if t in df.columns]
+
+        if len(available) < 2:
+            log.warning(f"Too few tenors ({available}) → empty curve features")
+            return df.select(*Shibor.IDENT_COLS)
+
+        df = df.sort("date")
+        exprs = []
+
+        if "ON_rate" in available:
+            for t in ["3M_rate", "1Y_rate"]:
+                if t in available:
+                    exprs.append(
+                        (pl.col(t) - pl.col("ON_rate"))
+                        .clip(-5, 5)
+                        .alias(f"shibor_spread_{t.split('_')[0].lower()}_on")
+                    )
+
+        if "1Y_rate" in available and "1M_rate" in available:
+            exprs.append(
+                (pl.col("1Y_rate") - pl.col("1M_rate"))
+                .clip(-5, 5)
+                .alias("shibor_slope_long_short")
+            )
+
+        if "ON_rate" in available and "3M_rate" in available:
+            exprs.append(
+                (pl.col("ON_rate") > pl.col("3M_rate"))
+                .cast(pl.Int8)
+                .alias("shibor_inverted_short")
+            )
+
+            # momentum (no derived-column dependency)
+            exprs.append(
+                (pl.col("3M_rate") - pl.col("ON_rate"))
+                .diff()
+                .rolling_mean(5, min_samples=3)
+                .clip(-2, 2)
+                .alias("shibor_spread_3m_mom")
+            )
+
+        if len(available) >= 3:
+            exprs.append(
+                pl.concat_list([pl.col(t) for t in available])
+                .list.std()
+                .clip(0, 10)
+                .alias("shibor_curve_dispersion")
+            )
+
+        return df.with_columns(exprs).select(
+            *Shibor.IDENT_COLS,
+            cs.starts_with(
+                "shibor_spread_",
+                "shibor_slope_",
+                "shibor_inverted",
+                "shibor_curve_",
+            ),
         )
+
+    @staticmethod
+    def metrics(df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Combine all SHIBOR feature groups.
+        Uses full outer join + coalesce=True for clean keys and maximum coverage.
+        """
+        log.info("Shibor.metrics: computing full SHIBOR feature suite")
+
+        if df.is_empty() or "date" not in df.columns:
+            log.warning("Input empty or missing 'date' → returning minimal schema")
+            return pl.DataFrame(schema={"date": pl.Date})
+
+        df = df.sort("date")
+
+        shock_df = Shibor.shock(df)
+        curve_df = Shibor.curve(df)
+
+        combined = shock_df.join(
+            curve_df, on=Shibor.IDENT_COLS, how="full", coalesce=True
+        )
+        return combined.with_columns(
+            shibor_stress_any=pl.any_horizontal(
+                cs.contains("shibor_funding_stress"), cs.contains("shibor_inverted")
+            ).cast(pl.Int8),
+            shibor_pressure=pl.mean_horizontal(
+                cs.contains("shibor_on_shock_z"), cs.contains("shibor_spread_")
+            )
+            .clip(-5, 5)
+            .alias("shibor_pressure"),
+        ).sort("date")
 
 
 class CrossSection:
     """
-    Cross-Sectional Operations (Peer/Market context).
-    Strictly uses 'group_by' (context).
+    Cross-sectional operations: winsorization, standardization, neutralization.
+    All ops use window functions grouped by 'by' keys (usually date or date+sector).
     """
 
     @staticmethod
     def winsorize(
-        col: pl.Expr | str,
-        by: list[str] = ["date"],
+        col: str | pl.Expr,
+        by: str | list[str],
         limits: tuple[float, float] = (0.01, 0.99),
+        name: str | None = None,
     ) -> pl.Expr:
         """
-        Clips outliers based on peer distribution at that specific moment.
+        Cross-sectional winsorization: clip to group quantiles.
+
+        Args:
+            col: column name or Expr
+            by: group-by key(s) — e.g. "date" or ["date", "sw_l1_code"]
+            limits: (lower, upper) quantile bounds
+            name: output column name (default: original or col + "_win")
+
+        Returns:
+            clipped Expr
         """
         c = pl.col(col) if isinstance(col, str) else col
+        out_name = name or (c.meta.output_name() or "value") + "_win"
 
-        llimit, ulimit = limits
-        lower = c.quantile(llimit).over(by)
-        upper = c.quantile(ulimit).over(by)
+        lower_bound = c.quantile(limits[0]).over(by)
+        upper_bound = c.quantile(limits[1]).over(by)
 
-        return c.clip(lower, upper).alias(c.meta.output_name())
+        return c.clip(lower_bound, upper_bound).alias(out_name)
 
     @staticmethod
-    def standardize(col: pl.Expr | str, by: list[str]) -> pl.Expr:
+    def standardize(
+        col: str | pl.Expr,
+        by: str | list[str],
+        min_std: float = 1e-8,
+        ddof: int = 1,
+        name: str | None = None,
+    ) -> pl.Expr:
         """
-        Z-Score Normalization relative to peers/groups.
-        (Value - GroupMean) / GroupStd
+        Cross-sectional z-score: (x - group_mean) / group_std
+
+        Args:
+            col: column or Expr
+            by: group-by key(s)
+            min_std: floor for std to avoid div-by-zero
+            ddof: delta degrees of freedom (1 = sample std)
+            name: output name (default: col + "_z")
+
+        Returns:
+            z-score Expr
         """
         c = pl.col(col) if isinstance(col, str) else col
+        out_name = name or (c.meta.output_name() or "value") + "_z"
 
         mu = c.mean().over(by)
-        sigma = c.std().over(by)
+        sigma = c.std(ddof=ddof).over(by).clip(lower_bound=min_std)
 
-        return ((c - mu) / (sigma + 1e-9)).alias(c.meta.output_name())
+        return ((c - mu) / sigma).alias(out_name)
+
+    @staticmethod
+    def neutralize(
+        col: str | pl.Expr,
+        by: str | list[str],
+        winsor_limits: tuple[float, float] | None = (0.01, 0.99),
+        std_suffix: str = "_z",
+        skip_winsor: bool = False,
+    ) -> list[pl.Expr]:
+        """
+        Combined pipeline: optional winsorize → standardize.
+        Returns list of Exprs for use in with_columns().
+        """
+        exprs: list[pl.Expr] = []
+
+        if not skip_winsor and winsor_limits is not None:
+            win_expr = CrossSection.winsorize(
+                col,
+                by=by,
+                limits=winsor_limits,
+                name=f"{col}_win" if isinstance(col, str) else None,
+            )
+            exprs.append(win_expr)
+            # Use winsorized as input to standardize
+            std_input = win_expr.meta.output_name()
+        else:
+            std_input = col
+
+        std_expr = CrossSection.standardize(
+            std_input,
+            by=by,
+            name=f"{col}{std_suffix}" if isinstance(col, str) else None,
+        )
+        exprs.append(std_expr)
+
+        return exprs
 
 
 class SectorGroup:
     """
-    Orchestrates the normalization of Industry-Neutral Fundamental Factors.
+    Applies cross-sectional normalization (winsor + z-score) per group.
+    Usually grouped by date or date + industry/sector.
+    Handles small groups and missing factors gracefully.
     """
 
     @staticmethod
     def normalize(
         df: pl.DataFrame,
         factors: list[str],
-        by: list[str],
-        limits: tuple[float, float] = (0.02, 0.98),
+        by: str | list[str] = "date",
+        winsor_limits: tuple[float, float] | None = (0.01, 0.99),
+        std_suffix: str = "_z",
+        min_group_size: int = 5,
+        skip_winsor: bool = False,
     ) -> pl.DataFrame:
-        ops: list[pl.Expr] = []
-        for col in factors:
-            if col not in df.columns:
-                continue
-            ops.append(CrossSection.winsorize(col, by=by, limits=limits))
-            ops.append(CrossSection.standardize(col, by=by).alias(f"{col}_z"))
+        """
+        Cross-sectional normalization of multiple factors.
 
-        return df.with_columns(ops)
+        Args:
+            df: input DataFrame
+            factors: list of numeric columns to normalize
+            by: group-by key(s) — e.g. "date" or ["date", "sw_l1_code"]
+            winsor_limits: quantile clip; None or skip_winsor=True to disable
+            std_suffix: suffix for z-score columns
+            min_group_size: skip groups smaller than this (avoid noise)
+            skip_winsor: if True, skip winsorization step
+
+        Returns:
+            DataFrame with original columns + {factor}_win (optional) + {factor}_z
+        """
+        if not isinstance(by, list):
+            by = [by]
+
+        # Validate group keys exist
+        missing_keys = [k for k in by if k not in df.columns]
+        if missing_keys:
+            log.warning(
+                f"Group-by keys missing: {missing_keys} → skipping normalization"
+            )
+            return df
+
+        # Filter valid factors
+        valid_factors = [f for f in factors if f in df.columns]
+        if len(valid_factors) < len(factors):
+            log.warning(
+                f"Skipping missing factors: {set(factors) - set(valid_factors)}"
+            )
+        if not valid_factors:
+            log.info("No valid factors to normalize")
+            return df
+
+        log.info(f"Normalizing {len(valid_factors)} factors | group by: {by}")
+
+        # Optional: filter tiny groups
+        if min_group_size > 1:
+            group_sizes = df.group_by(by).agg(pl.len().alias("_size"))
+            df = df.join(group_sizes, on=by, how="left")
+            small_groups = df.filter(pl.col("_size") < min_group_size)
+            if not small_groups.is_empty():
+                log.debug(
+                    f"Skipping {len(small_groups)} rows in small groups (< {min_group_size})"
+                )
+            df = df.filter(pl.col("_size") >= min_group_size).drop("_size")
+
+        # Build all expressions
+        all_exprs: list[pl.Expr] = []
+        for factor in valid_factors:
+            exprs = CrossSection.neutralize(
+                factor,
+                by=by,
+                winsor_limits=winsor_limits,
+                std_suffix=std_suffix,
+                skip_winsor=skip_winsor,
+            )
+            all_exprs.extend(exprs)
+
+        # Apply
+        return df.with_columns(all_exprs).sort(by)
+
+    @staticmethod
+    def rank(
+        df: pl.DataFrame,
+        factors: list[str],
+        by: str | list[str] = "date",
+        ascending: bool | list[bool] = False,
+        name_suffix: str = "_rank",
+        pct: bool = False,
+    ) -> pl.DataFrame:
+        """
+        Cross-sectional ranking (optional percentile rank).
+        Useful before neutralization or portfolio sorting.
+        """
+        if not isinstance(by, list):
+            by = [by]
+
+        if not isinstance(ascending, Sequence):
+            ascending = [ascending] * len(factors)
+
+        exprs = []
+        for factor, asc in zip(factors, ascending):
+            if factor not in df.columns:
+                log.warning(f"Skipping missing factor for rank: {factor}")
+                continue
+
+            rank_expr = pl.col(factor).rank("dense", descending=not asc).over(by)
+
+            if pct:
+                rank_expr = rank_expr / pl.col(factor).count().over(by)
+
+            exprs.append(rank_expr.alias(f"{factor}{name_suffix}"))
+
+        return df.with_columns(exprs)

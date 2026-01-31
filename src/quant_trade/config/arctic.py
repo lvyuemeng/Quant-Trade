@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any
 
+from quant_trade.config.logger import log
 import arcticdb as adb
 import narwhals as nw
 import pandas as pd
@@ -8,70 +9,73 @@ import polars as pl
 import pyarrow as pa
 import yaml
 
-from quant_trade.config.logger import log
-
 type DB = adb.Arctic
 type Lib = adb.library.Library
 
 
 class ArcticDB:
-    """ArcticDB state management"""
+    """ArcticDB connection & library manager (lazy, cache-safe)."""
 
-    def __init__(self, config_path: str = "config.yaml"):
-        log.info(f"loading from config: {config_path}")
-        self._load_config(config_path)
-        self._base_path: str | None = None
+    def __init__(
+        self,
+        uri: str,
+        *,
+        output_format=adb.OutputFormat.POLARS,
+    ):
+        self._uri = uri
+        self._output_format = output_format
         self._conn: adb.Arctic | None = None
         self._libs: dict[str, adb.library.Library] = {}
 
-    def _load_config(self, config_path: str):
+    @classmethod
+    def from_config(cls, config_path: str = "config.yaml") -> "ArcticDB":
         with open(config_path) as f:
-            db_conf = yaml.safe_load(f)["database"]
-            self._base_path: str | None = db_conf["base_path"]
-            self.conf: dict[str, Any] = db_conf["arctic"]
+            conf = yaml.safe_load(f)["database"]
 
-    def _load_uri(self) -> str:
-        """Convert relative path to absolute path for local storage."""
-        if (uri := self.conf.get("uri")) is not None and str(uri).strip():
-            base_uri = str(uri).strip()
+        uri = cls._build_uri(conf)
+        return cls(uri)
+
+    @staticmethod
+    def _build_uri(conf: dict) -> str:
+        base_path = conf.get("base_path")
+        arctic = conf["arctic"]
+
+        if uri := arctic.get("uri"):
+            base_uri = uri.strip()
         else:
-            path: str | None = self.conf.get("path")
-            if not path:
-                path = "db/"
-            path = str(path).strip()
-            if Path(path).is_absolute():
-                return path
-
-            if self._base_path:
-                root = Path(self._base_path)
-            else:
-                root = Path.cwd()
+            raw_path = arctic.get("path", "db/")
+            path = raw_path.strip() if raw_path and raw_path.strip() else "db/"
+            root = Path(base_path) if base_path else Path.cwd()
             base_uri = f"lmdb://{(root / path).resolve().as_posix()}"
+        log.info(f"Loading from {base_uri}")
 
-        log.info(f"loading base uri: {base_uri}")
-        if (map_size := self.conf.get("map_size")) is not None:
-            log.info(f"loading map size: {map_size}")
+        if map_size := arctic.get("map_size"):
+            log.info(f"Loading with {map_size}")
             return f"{base_uri}?map_size={map_size}"
-        else:
-            return f"{base_uri}"
+        return base_uri
 
     @property
-    def conn(self) -> DB:
+    def conn(self) -> adb.Arctic:
         if self._conn is None:
             self._conn = adb.Arctic(
-                self._load_uri(), output_format=adb.OutputFormat.POLARS
+                self._uri,
+                output_format=self._output_format,
             )
         return self._conn
 
-    def get_lib(self, lib: str) -> Lib:
-        if lib in self._libs:
-            return self._libs[lib]
-        elif lib in self.conn.list_libraries():
-            self._libs[lib] = self.conn[lib]
-            return self._libs[lib]
+    def get_lib(self, name: str, *, create: bool = True):
+        if name in self._libs:
+            return self._libs[name]
+
+        if name in self.conn.list_libraries():
+            lib = self.conn[name]
+        elif create:
+            lib = self.conn.create_library(name)
         else:
-            self._libs[lib] = self.conn.create_library(lib)
-            return self._libs[lib]
+            raise KeyError(f"Library '{name}' does not exist")
+
+        self._libs[name] = lib
+        return lib
 
 
 class ArcticAdapter:
@@ -88,39 +92,43 @@ class ArcticAdapter:
     """
 
     @staticmethod
-    def input(data: Any) -> pd.DataFrame:
-        """Convert any input type → pandas DataFrame (ready for ArcticDB.write)"""
+    def to_write(data: Any) -> pd.DataFrame:
+        """
+        Convert input → ArcticDB-friendly format (pandas DataFrame).
+        Priority: Polars > Arrow > Pandas > dict
+        """
+        if isinstance(data, pl.DataFrame):
+            return data.to_pandas()
+        
+        if isinstance(data, pa.Table):
+            return data.to_pandas()
+        
+        if isinstance(data, nw.DataFrame):
+            return data.to_pandas()
+        
         if isinstance(data, pd.DataFrame):
             return data
-        elif isinstance(data, dict):
+        
+        if isinstance(data, dict):
             return pd.DataFrame(data)
-        elif isinstance(data, (pa.Table, pl.DataFrame)):
-            return nw.from_native(data).to_pandas()
-        elif isinstance(data, nw.DataFrame):
-            return data.to_pandas()
-        raise ValueError(
-            f"ArcticAdapter.input cannot handle type '{type(data).__name__}'.\n"
-            "Supported: pd.DataFrame, dict, pa.Table, pl.DataFrame, nw.DataFrame"
-        )
+        
+        raise TypeError(f"Unsupported write type: {type(data)}")
 
     @staticmethod
-    def output(data: Any) -> nw.DataFrame:
-        """Normalize ANY ArcticDB output → Narwhals DataFrame"""
-        # Handle lazy evaluation
-        if hasattr(data, "collect"):  # LazyDataFrame
+    def from_read(data: Any) -> nw.DataFrame:
+        """
+        Normalize ArcticDB output → Narwhals DataFrame
+        """
+        if hasattr(data, "collect"):
             data = data.collect()
 
-        # Handle VersionedItem wrapper
-        if hasattr(data, "data"):  # VersionedItem
+        if hasattr(data, "data"):
             data = data.data
+
+        if isinstance(data, (pa.Table,pl.DataFrame, pd.DataFrame)):
+            return nw.from_native(data)
 
         if isinstance(data, dict):
             return nw.from_native(pl.DataFrame(data))
-        if isinstance(data, (pa.Table, pd.DataFrame, pl.DataFrame)):
-            return nw.from_native(data)
 
-        raise ValueError(
-            f"ArcticAdapter.output cannot handle type '{type(data).__name__}'.\n"
-            "Common ArcticDB outputs: VersionedItem, LazyDataFrame, pa.Table, "
-            "pd.DataFrame, pl.DataFrame, dict"
-        )
+        raise TypeError(f"Unsupported read type: {type(data)}")

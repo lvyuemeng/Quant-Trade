@@ -1,174 +1,215 @@
-import re
 from datetime import date, datetime
 from typing import Literal
 
 import polars as pl
 
-type DateLike = str | date
+type DateLike = str | date | datetime
 type Period = Literal["daily", "weekly", "monthly"]
 type Quarter = Literal[1, 2, 3, 4]
 type AdjustCN = Literal["hfq", "qfq"]
 
 
-def normal_stock_code(raw_code: str, length: int = 6) -> str:
-    """
-    Normalize A-share stock codes by handling prefixes/suffixes and padding.
+# ────────────────────────────────────────────────
+#           Date conversion helpers
+# ────────────────────────────────────────────────
+def to_date(d: DateLike) -> date:
+    """Convert to date — no None allowed, raise on failure"""
+    if isinstance(d, (date, datetime)):
+        return d.date() if isinstance(d, datetime) else d
 
-    Args:
-        raw_code: Raw stock code (e.g., '600313.SH', 'SZ000001', '000002.SZ')
-        expect_length: Expected length after normalization (default: 6 for A-shares)
+    if isinstance(d, str):
+        d = d.strip()
+        # Common formats in financial data
+        for fmt in (
+            "%Y%m%d",
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            "%Y.%m.%d",
+        ):
+            try:
+                return datetime.strptime(d, fmt).date()
+            except ValueError:
+                continue
 
-    Returns:
-        Normalized numeric stock code (e.g., '600313', '000001', '000002')
-
-    Raises:
-        ValueError: If no numeric portion found or code can't be normalized
-    """
-    match = re.search(r"(\d+)", raw_code)
-    if not match:
-        raise ValueError(f"No numeric portion found in code: '{raw_code}'")
-
-    matched = match.group(1).zfill(length)
-
-    # Truncate if longer than expected (unusual cases)
-    if len(matched) > length:
-        matched = matched[-length:]
-
-    return matched
+    raise ValueError(f"Cannot convert to date: {d!r}")
 
 
-def _normal_expr_stock_code(
-    code_col: str | pl.Expr, length: int = 6, alias: str | None = None
+def to_ymd_str(d: DateLike, sep: str = "") -> str:
+    """Convert to YYYYMMDD (default) or YYYY-MM-DD"""
+    dt = to_date(d)
+    if sep:
+        return dt.strftime(f"%Y{sep}%m{sep}%d")
+    return dt.strftime("%Y%m%d")
+
+
+# ────────────────────────────────────────────────
+#         Stock code normalization (suffix control)
+# ────────────────────────────────────────────────
+#
+
+
+def normalize_ts_code(
+    code: str | pl.Expr,
+    *,
+    length: int = 6,
+    output: str | None = None,
+    add_suffix: bool = False,  # ← Default: NO suffix
+    exchange: Literal["SH", "SZ", "BJ"] | None = None,  # only used if add_suffix=True
 ) -> pl.Expr:
     """
-    Vectorized stock code normalization using Polars expressions.
+    Normalize stock code to:
+    - 6-digit string (default)    e.g. "600519"
+    - or full ts_code with suffix e.g. "600519.SH" (when add_suffix=True)
 
     Args:
-        code_col: Column name or expression containing stock codes
-        expect_length: Expected length after normalization (default: 6 for A-shares)
-        output_col: Optional output column name (default: replaces input column)
-
-    Returns:
-        Polars expression for use in with_columns()
+        code: str or Expr
+        length: usually 6
+        output: alias name (optional)
+        add_suffix: whether to append .SH/.SZ/.BJ
+        exchange: explicit exchange suffix (only used if add_suffix=True)
+                 if None and add_suffix=True, will try to guess from digits
     """
-    match code_col:
-        case str():
-            expr = pl.col(code_col)
-        case _:  # expr
-            expr = code_col
+    if isinstance(code, str):
+        expr = pl.col(code)
+    else:
+        expr = code
 
-    matched = (
-        expr.str.extract(r"(\d+)", 1).str.pad_start(length, "0").str.slice(-length)
-    )
+    digits = expr.str.extract(r"(\d+)", 1).str.pad_start(length, "0").str.slice(-length)
 
-    # Return with optional alias
-    if alias:
-        return matched.alias(alias)
-    return matched
+    if not add_suffix:
+        out = digits
+    else:
+        # Determine suffix
+        if exchange is not None:
+            suffix = exchange
+        else:
+            # Guess logic
+            first_digit = digits.str.slice(0, 1)
 
+            suffix = (
+                pl.when(first_digit == "6")
+                .then(pl.lit("SH"))
+                .when(first_digit.is_in(["0", "3"]))
+                .then(pl.lit("SZ"))
+                .when(first_digit.is_in(["4", "8"]))
+                .then(pl.lit("BJ"))
+                .otherwise(pl.lit("UNKNOWN"))
+            )
 
-def normal_df_stock_code(
-    df: pl.DataFrame, col: str = "ts_code", length: int = 6, inplace: bool = True
-) -> pl.DataFrame:
-    """
-    Batch normalize stock codes in a DataFrame.
+        out = digits + "." + suffix
 
-    Args:
-        df: Input DataFrame
-        code_col: Column name containing stock codes
-        expect_length: Expected length after normalization
-        inplace: If True, replaces original column; if False, adds new column
-
-    Returns:
-        DataFrame with normalized codes
-    """
-    output_col = col if inplace else f"{col}_normalized"
-
-    return df.with_columns(_normal_expr_stock_code(col, length, output_col))
+    return out.alias(output) if output else out
 
 
-def normal_df_time(
+def normalize_stock_codes(
     df: pl.DataFrame,
-    date_col: str | None = None,  # Column to normalize
-    date_format: str | None = None,  # Optional format string
+    col: str = "ts_code",
+    *,
+    new_col: str | None = None,
+    add_suffix: bool = False,
+    exchange: Literal["SH", "SZ", "BJ"] | None = None,
+) -> pl.DataFrame:
+    """Apply normalize_ts_code to a DataFrame column"""
+    expr = normalize_ts_code(
+        col,
+        output=new_col,
+        add_suffix=add_suffix,
+        exchange=exchange,
+    )
+    return df.with_columns(expr)
+
+
+# ────────────────────────────────────────────────
+#               Date column normalization
+# ────────────────────────────────────────────────
+
+
+def normalize_date_column(
+    df: pl.DataFrame,
+    date_col: str,
+    *,
+    target_type: Literal["date", "datetime"] = "date",
+    strict: bool = False,
+    null_threshold: float = 0.7,  # fraction of non-null required
 ) -> pl.DataFrame:
     """
-    Internal helper to normalize date of a stock DataFrame.
+    Normalize a specific date column — column must exist.
 
     Args:
-        df: Raw Polars DataFrame from akshare
-        date_col: Name of the column containing date strings
-        date_format: Optional format string for parsing (e.g., "%Y/%m/%d")
+        df: DataFrame
+        date_col: MUST exist in df
+        target_type: "date" or "datetime"
+        strict: if True, raise on parsing failure
     """
-    if date_col is None or date_col not in df.columns:
-        return df
+    if date_col not in df.columns:
+        raise ValueError(f"Column '{date_col}' not found in DataFrame")
 
-    match df.schema[date_col]:
-        case pl.Date:
-            return df
-        case pl.Datetime:
-            # Convert datetime to date
-            date_expr = pl.col(date_col).dt.date()
-            df = df.with_columns(date_expr)
-            return df
-        case pl.Utf8:
-            # Parse string to date
-            if date_format:
-                date_expr = pl.col(date_col).str.strptime(
-                    pl.Date, date_format, strict=False
-                )
-            else:
-                date_expr = pl.col(date_col).str.to_date(strict=False)
-            df = df.with_columns(date_expr)
-            return df
-        case _:
-            # Try to cast other types to date
-            date_expr = pl.col(date_col).cast(pl.Date, strict=False)
-            df = df.with_columns(date_expr)
-            return df
+    expr = pl.col(date_col)
 
+    # Already correct type?
+    if df.schema[date_col] in (pl.Date, pl.Datetime):
+        if target_type == "date" and df.schema[date_col] == pl.Datetime:
+            expr = expr.dt.date()
+        elif target_type == "datetime" and df.schema[date_col] == pl.Date:
+            expr = expr.cast(pl.Datetime)
+        return df.with_columns(expr.alias(date_col))
 
-def fallback_col(columns: list[str], candidates: list[str], label: str) -> str:
-    """
-    Find the first column that exists in the list of candidates.
+    # String → date parsing
+    if df.schema[date_col] != pl.Utf8:
+        return df.with_columns(expr.cast(pl.Date, strict=strict).alias(date_col))
 
-    Args:
-        columns: List of available column names
-        candidates: List of possible column names to look for
-        label: Label for error message
+    n_rows = len(df)
+    threshold = int(n_rows * null_threshold)  # non-null required
+    best_expr = expr.str.to_date(strict=strict)  # fallback
+    best_non_null = 0
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y%m%d",
+        "%Y/%m/%d",
+        "%Y.%m.%d",
+        "%Y年%m月%d日",
+    ):
+        candidate = expr.str.strptime(pl.Date, fmt, strict=False)
+        # Evaluate only the null count (cheap)
+        non_null = n_rows - df.select(candidate.null_count()).item()
+        if non_null > best_non_null:
+            best_non_null = non_null
+            best_expr = candidate
+        if non_null >= threshold:
+            break
 
-    Returns:
-        First existing column name
+    df = df.with_columns(best_expr.alias(date_col))
+    if target_type == "datetime":
+        df = df.with_columns(pl.col(date_col).cast(pl.Datetime, strict=strict))
 
-    Raises:
-        KeyError: If none of the candidates exist
-    """
-    for candidate in candidates:
-        if candidate in columns:
-            return candidate
-
-    msg = f"Unable to find {label} column. Tried: {candidates}. Available columns: {columns}"
-    raise KeyError(msg)
+    return df
 
 
-def date_f_datelike(date: DateLike) -> date:
-    match date:
-        case str():
-            return datetime.strptime(date, "%Y%m%d").date()
-        case _:  # date
-            return date
+# ────────────────────────────────────────────────
+#                   Quarter utilities
+# ────────────────────────────────────────────────
 
 
-def str_f_datelike(date: DateLike) -> str:
-    match date:
-        case str():
-            return date
-        case _:  # date
-            return date.strftime("%Y%m%d")
+def quarter_end(year: int, quarter: Quarter, as_ymd: bool = True) -> str:
+    """Explicit year + quarter → YYYYMMDD or YYYY-MM-DD"""
+    ends = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}
+    s = f"{year}{ends[quarter]}"
+    if not as_ymd:
+        return f"{year}-{ends[quarter][:2]}-{ends[quarter][2:]}"
+    return s
 
 
-def str_f_quater(year: int | None, quarter: Quarter) -> str:
-    year_now = datetime.now().year
-    year = year if year and year <= year_now else year_now
-    quarter_ends = ["0331", "0630", "0930", "1231"]
-    return f"{year}{quarter_ends[quarter - 1]}"
+def current_quarter_end(as_ymd: bool = True) -> str:
+    """Most recent completed quarter end (explicit — no None handling)"""
+    today = datetime.now().date()
+    year = today.year
+    month = today.month
+
+    if month <= 3:
+        return quarter_end(year - 1, 4, as_ymd)
+    elif month <= 6:
+        return quarter_end(year, 1, as_ymd)
+    elif month <= 9:
+        return quarter_end(year, 2, as_ymd)
+    else:
+        return quarter_end(year, 3, as_ymd)

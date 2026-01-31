@@ -5,7 +5,7 @@ import yaml
 from loguru import logger
 
 
-def setup_logger(config_path: str = "config/backtest.yaml"):
+def setup_logger(config_path: str = "config.yaml"):
     """
     Configure logger based on the configuration file
     """
@@ -39,5 +39,4 @@ def setup_logger(config_path: str = "config/backtest.yaml"):
     return logger
 
 
-# Initialize default logger
 log = setup_logger()
