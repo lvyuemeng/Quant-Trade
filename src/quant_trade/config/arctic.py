@@ -1,13 +1,14 @@
 from pathlib import Path
 from typing import Any
 
-from quant_trade.config.logger import log
 import arcticdb as adb
 import narwhals as nw
 import pandas as pd
 import polars as pl
 import pyarrow as pa
 import yaml
+
+from quant_trade.config.logger import log
 
 type DB = adb.Arctic
 type Lib = adb.library.Library
@@ -99,23 +100,23 @@ class ArcticAdapter:
         """
         if isinstance(data, pl.DataFrame):
             return data.to_pandas()
-        
+
         if isinstance(data, pa.Table):
             return data.to_pandas()
-        
+
         if isinstance(data, nw.DataFrame):
             return data.to_pandas()
-        
+
         if isinstance(data, pd.DataFrame):
             return data
-        
+
         if isinstance(data, dict):
             return pd.DataFrame(data)
-        
+
         raise TypeError(f"Unsupported write type: {type(data)}")
 
     @staticmethod
-    def from_read(data: Any) -> nw.DataFrame:
+    def from_read(data: Any) -> pl.DataFrame:
         """
         Normalize ArcticDB output → Narwhals DataFrame
         """
@@ -125,10 +126,13 @@ class ArcticAdapter:
         if hasattr(data, "data"):
             data = data.data
 
-        if isinstance(data, (pa.Table,pl.DataFrame, pd.DataFrame)):
-            return nw.from_native(data)
+        if isinstance(data, pl.DataFrame):
+            return data
+
+        if isinstance(data, (pa.Table, pd.DataFrame)):
+            return nw.from_native(data).to_polars()
 
         if isinstance(data, dict):
-            return nw.from_native(pl.DataFrame(data))
+            return nw.from_native(pl.DataFrame(data)).to_polars()
 
         raise TypeError(f"Unsupported read type: {type(data)}")

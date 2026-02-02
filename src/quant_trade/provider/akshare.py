@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
+from functools import cache
 from pathlib import Path
 
 import akshare as ak
@@ -54,6 +55,7 @@ def _fetch_and_clean_whole(
         )
 
 
+@cache
 def stock_code_sh_whole() -> pl.DataFrame:
     return _fetch_and_clean_whole(
         lambda: ak.stock_info_sh_name_code(symbol="主板A股"),
@@ -65,6 +67,7 @@ def stock_code_sh_whole() -> pl.DataFrame:
     )
 
 
+@cache
 def stock_code_sz_whole() -> pl.DataFrame:
     return _fetch_and_clean_whole(
         lambda: ak.stock_info_sz_name_code(symbol="A股列表"),
@@ -76,6 +79,7 @@ def stock_code_sz_whole() -> pl.DataFrame:
     )
 
 
+@cache
 def stock_code_bj_whole() -> pl.DataFrame:
     return _fetch_and_clean_whole(
         ak.stock_info_bj_name_code,
@@ -87,6 +91,7 @@ def stock_code_bj_whole() -> pl.DataFrame:
     )
 
 
+@cache
 def stock_code_delist_sh() -> pl.DataFrame:
     df = _fetch_and_clean_whole(
         lambda: ak.stock_info_sh_delist(symbol="全部"),
@@ -100,6 +105,7 @@ def stock_code_delist_sh() -> pl.DataFrame:
     return df.filter(pl.col("off_date").is_not_null())
 
 
+@cache
 def stock_code_delist_sz() -> pl.DataFrame:
     df = _fetch_and_clean_whole(
         lambda: ak.stock_info_sz_delist(symbol="终止上市公司"),
@@ -113,6 +119,7 @@ def stock_code_delist_sz() -> pl.DataFrame:
     return df.filter(pl.col("off_date").is_not_null())
 
 
+@cache
 def stock_code_delist() -> pl.DataFrame:
     sh = stock_code_delist_sh()
     sz = stock_code_delist_sz()
@@ -123,6 +130,7 @@ def stock_code_delist() -> pl.DataFrame:
     return pl.concat([sh, sz], how="vertical_relaxed").unique("ts_code", keep="last")
 
 
+@cache
 def stock_code_whole() -> pl.DataFrame:
     sh = stock_code_sh_whole()
     sz = stock_code_sz_whole()
@@ -137,6 +145,7 @@ def stock_code_whole() -> pl.DataFrame:
     )
 
 
+@cache
 def stock_code_sus(date: DateLike) -> pl.DataFrame:
     ymd = to_ymd_str(date)
     try:
@@ -213,6 +222,7 @@ class AkShareMicro:
 
         return q.sort("ts_code").select(["ts_code", "name"]).collect()
 
+    @cache
     def market_ohlcv(
         self,
         symbol: str,
@@ -284,6 +294,7 @@ class AkShareMicro:
             log.error(f"{log_name} fetch failed for {date_str}: {e}")
             return pl.DataFrame()
 
+    @cache
     def quarterly_income_statement(
         self, year: int | None, quarter: Quarter
     ) -> pl.DataFrame:
@@ -308,6 +319,7 @@ class AkShareMicro:
             ak.stock_lrb_em, date_str, rename_map, "income statement"
         )
 
+    @cache
     def quarterly_balance_sheet(
         self, year: int | None, quarter: Quarter
     ) -> pl.DataFrame:
@@ -344,6 +356,7 @@ class AkShareMicro:
             ak.stock_zcfz_em, date_str, rename_map, "balance sheet"
         )
 
+    @cache
     def quarterly_cashflow_statement(
         self, year: int | None, quarter: Quarter
     ) -> pl.DataFrame:
@@ -390,9 +403,7 @@ class AkShareMicro:
             return pl.DataFrame()
 
         keys = ["ts_code", "name", "announcement_date"]
-        df = inc.join(bal, on=keys, how="full", coalesce=True).join(
-            cf, on=keys, how="full", coalesce=True
-        )
+        df = inc.join(bal, on=keys, how="inner").join(cf, on=keys, how="inner")
         return df
 
 
@@ -419,6 +430,7 @@ class AkShareMacro:
             & (pl.col(date_col) <= pl.lit(end_date))
         ).sort(date_col)
 
+    @cache
     def northbound_flow(
         self,
         start_date: DateLike | None = None,
@@ -478,6 +490,7 @@ class AkShareMacro:
             log.error(f"northbound_flow failed: {e}")
             return pl.DataFrame()
 
+    @cache
     def market_margin_short(
         self,
         start_date: DateLike | None = None,
@@ -534,6 +547,7 @@ class AkShareMacro:
             log.error(f"market_margin_short failed: {e}")
             return pl.DataFrame()
 
+    @cache
     def shibor(
         self,
         start_date: DateLike | None = None,
@@ -580,6 +594,7 @@ class AkShareMacro:
             log.error(f"shibor fetch failed: {e}")
             return pl.DataFrame()
 
+    @cache
     def csi1000_daily_ohlcv(
         self,
         start_date: DateLike | None = None,
@@ -607,6 +622,7 @@ class AkShareMacro:
             log.error(f"csi1000_daily_ohlcv failed: {e}")
             return pl.DataFrame()
 
+    @cache
     def csi1000qvix_daily_ohlc(
         self,
         start_date: DateLike | None = None,
@@ -645,6 +661,7 @@ class SWIndustryCls:
 
     CACHE_DIR = Path("~/.cache/quant").expanduser()
     CACHE_FILE = CACHE_DIR / "sw_industry_cls.parquet"
+    CACHE_MAP_FILE = CACHE_DIR / "sw_level_maps.parquet"
 
     def __init__(self, use_cache: bool = True, rebuild_cache: bool = False):
         self.use_cache = use_cache
@@ -652,19 +669,20 @@ class SWIndustryCls:
         self._full_cls: pl.DataFrame | None = None
         self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    def load_or_build(self, force_rebuild: bool = False) -> pl.DataFrame:
+    def load_or_build(self, fresh: bool = False) -> pl.DataFrame:
         """
         Load from cache if available and valid, otherwise build and save.
         """
         if (
-            not force_rebuild
+            not fresh
             and not self.rebuild_cache
             and self.use_cache
             and self.CACHE_FILE.exists()
         ):
             try:
                 df = pl.read_parquet(self.CACHE_FILE)
-                if "ts_code" in df and "sw_l1_code" in df and "join_date" in df:
+                required = {"ts_code", "sw_l1_code", "join_date"}
+                if required.issubset(set(df.columns)):
                     log.info(
                         f"Loaded Shenwan industry classification from cache ({len(df)} rows)"
                     )
@@ -685,40 +703,167 @@ class SWIndustryCls:
         self._full_cls = df
         return df
 
+    def _load_or_build_level_maps(self, fresh: bool = False) -> pl.DataFrame:
+        """
+        Build or load a flat L3 → L2 → L1 mapping table.
+
+        Returned schema (one row per L3 industry):
+            sw_l3_code | sw_l2_code | sw_l2_name | sw_l1_code | sw_l1_name
+
+        Build logic:
+            L1 info  →  {l1_name → l1_code}
+            L2 info  →  {l2_name → l2_code},  {l2_code → l1_code} (via l2.sw_l1_name)
+            L3 info  →  {l3_code → l2_code}   (via l3.sw_l2_name)
+            Final table: join the three maps on l3_code
+        """
+        if not fresh and self.use_cache and self.CACHE_MAP_FILE.exists():
+            try:
+                df = pl.read_parquet(self.CACHE_MAP_FILE)
+                required = {"sw_l3_code", "sw_l2_code", "sw_l1_code"}
+                if required.issubset(set(df.columns)):
+                    log.info(f"Loaded level maps from cache ({df.height} rows)")
+                    return df
+            except Exception as e:
+                log.warning(f"Level maps cache load failed: {e}. Will rebuild.")
+
+        log.info("Building Shenwan level maps...")
+
+        l1 = self.sw_l1_info()
+        l2 = self.sw_l2_info()
+        l3 = self.sw_l3_info()
+
+        if l1.is_empty() or l2.is_empty() or l3.is_empty():
+            raise ValueError("One or more level info fetches returned empty data")
+
+        l1_name_to_code: dict[str, str] = dict(
+            zip(l1["sw_l1_name"].to_list(), l1["sw_l1_code"].to_list())
+        )
+
+        l2_enriched = l2.with_columns(
+            pl.col("sw_l1_name").replace(l1_name_to_code).alias("sw_l1_code")
+        )
+
+        missing_l1 = l2_enriched.filter(pl.col("sw_l1_code").is_null())
+        if missing_l1.height > 0:
+            log.warning(
+                f"Could not resolve L1 code for {missing_l1.height} L2 industries: "
+                f"{missing_l1['sw_l2_name'].to_list()}"
+            )
+
+        l2_name_to_code: dict[str, str] = dict(
+            zip(
+                l2_enriched["sw_l2_name"].to_list(), l2_enriched["sw_l2_code"].to_list()
+            )
+        )
+
+        l3_enriched = l3.with_columns(
+            pl.col("sw_l2_name").replace(l2_name_to_code).alias("sw_l2_code")
+        )
+
+        missing_l2 = l3_enriched.filter(pl.col("sw_l2_code").is_null())
+        if missing_l2.height > 0:
+            log.warning(
+                f"Could not resolve L2 code for {missing_l2.height} L3 industries: "
+                f"{missing_l2['sw_l3_name'].to_list()}"
+            )
+
+        l2_code_to_l1_code: dict[str, str] = dict(
+            zip(
+                l2_enriched["sw_l2_code"].to_list(),
+                l2_enriched["sw_l1_code"].to_list(),
+            )
+        )
+        l2_code_to_l2_name: dict[str, str] = dict(
+            zip(
+                l2_enriched["sw_l2_code"].to_list(),
+                l2_enriched["sw_l2_name"].to_list(),
+            )
+        )
+
+        maps_df = (
+            l3_enriched.select(["sw_l3_code", "sw_l2_code"])
+            .with_columns(
+                pl.col("sw_l2_code").replace(l2_code_to_l2_name).alias("sw_l2_name"),
+                pl.col("sw_l2_code").replace(l2_code_to_l1_code).alias("sw_l1_code"),
+            )
+            .with_columns(
+                pl.col("sw_l1_code")
+                .replace(
+                    dict(
+                        zip(
+                            l1["sw_l1_code"].to_list(),
+                            l1["sw_l1_name"].to_list(),
+                        )
+                    )
+                )
+                .alias("sw_l1_name")
+            )
+            .select(
+                [
+                    "sw_l3_code",
+                    "sw_l2_code",
+                    "sw_l2_name",
+                    "sw_l1_code",
+                    "sw_l1_name",
+                ]
+            )
+        )
+
+        log.info(
+            f"Level maps built: {maps_df.height} L3 entries, "
+            f"{maps_df['sw_l2_code'].n_unique()} L2, "
+            f"{maps_df['sw_l1_code'].n_unique()} L1"
+        )
+
+        maps_df.write_parquet(self.CACHE_MAP_FILE, compression="zstd")
+        log.info(f"Saved level maps cache: {self.CACHE_MAP_FILE}")
+
+        return maps_df
+
     def _build_full_classification(self) -> pl.DataFrame:
-        """Core slow build logic — loop over all L3 industries"""
         try:
-            info = self.sw_l3_info()
-            if info.is_empty():
+            maps_df = self._load_or_build_level_maps()
+            self._level_maps = maps_df
+
+            l3_info = self.sw_l3_info()
+            if l3_info.is_empty():
                 raise ValueError("No L3 industry metadata fetched")
 
-            all_cons = []
-            total = len(info)
+            all_cons: list[pl.DataFrame] = []
+            total = l3_info.height
 
-            for idx, row in enumerate(info.iter_rows(named=True), 1):
-                code = row["sw_l3_code"]
-                name = row.get("sw_l3_name", code)
+            for idx, row in enumerate(l3_info.iter_rows(named=True), 1):
+                l3_code: str = row["sw_l3_code"]
+                l3_name: str = row.get("sw_l3_name", l3_code)
 
                 if idx % 30 == 0 or idx == total:
-                    log.info(f"[{idx}/{total}] Processing {code} ({name})")
+                    log.info(f"[{idx}/{total}] Processing {l3_code} ({l3_name})")
 
                 try:
-                    cons = self.sw_l3_constituents(code)
+                    cons = self.sw_l3_constituents(l3_code)
                     if cons.is_empty():
                         continue
 
-                    l1, l2, _ = self.derive_sw_levels(code)
+                    map_row = maps_df.filter(pl.col("sw_l3_code") == l3_code)
+                    if map_row.is_empty():
+                        log.warning(f"No level-map entry for {l3_code}, skipping")
+                        continue
+
+                    map_row = map_row.row(0, named=True)
 
                     cons = cons.with_columns(
-                        pl.lit(l1).alias("sw_l1_code"),
-                        pl.lit(l2).alias("sw_l2_code"),
-                        pl.lit(code).alias("sw_l3_code"),
-                        pl.lit(name).alias("sw_l3_name"),
+                        pl.lit(map_row["sw_l1_code"]).alias("sw_l1_code"),
+                        pl.lit(map_row["sw_l1_name"]).alias("sw_l1_name"),
+                        pl.lit(map_row["sw_l2_code"]).alias("sw_l2_code"),
+                        pl.lit(map_row["sw_l2_name"]).alias("sw_l2_name"),
+                        pl.lit(l3_code).alias("sw_l3_code"),
+                        pl.lit(l3_name).alias("sw_l3_name"),
                     )
 
                     all_cons.append(cons)
+
                 except Exception as e:
-                    log.warning(f"Failed to process {code} ({name}): {e}")
+                    log.warning(f"Failed to process {l3_code} ({l3_name}): {e}")
                     continue
 
             if not all_cons:
@@ -732,18 +877,64 @@ class SWIndustryCls:
                     )
                 )
                 .drop("ts_code_suffix")
-                .unique(
-                    subset=["ts_code"], keep="last"
-                )  # most recent classification wins
-                .sort(["ts_code", "join_date"])
+                .unique(subset=["ts_code"], keep="last")
+                .sort(["sw_l1_code", "sw_l2_code", "sw_l3_code", "ts_code"])
             )
 
-            combined = normalize_date_column(combined, "join_date")
+            log.info(
+                f"Classification built: {combined.height} stocks, "
+                f"{combined['sw_l1_code'].n_unique()} L1, "
+                f"{combined['sw_l2_code'].n_unique()} L2, "
+                f"{combined['sw_l3_code'].n_unique()} L3"
+            )
 
             return combined
 
         except Exception as e:
             log.error(f"Failed to build full industry classification: {e}")
+            return pl.DataFrame()
+
+    def sw_l1_info(self) -> pl.DataFrame:
+        """Fetch Shenwan L1 industry metadata."""
+        log.info("Fetching Shenwan L1 industry metadata...")
+        try:
+            raw = ak.sw_index_first_info()
+            if raw.empty:
+                log.warning("Empty L1 info response")
+                return pl.DataFrame()
+            df = pl.from_pandas(raw).rename(
+                {
+                    "行业代码": "sw_l1_code",
+                    "行业名称": "sw_l1_name",
+                    # Add other relevant columns if available
+                }
+            )
+            log.info(f"Fetched {df.height} L1 industries")
+            return df
+        except Exception as e:
+            log.error(f"L1 info fetch failed: {e}")
+            return pl.DataFrame()
+
+    def sw_l2_info(self) -> pl.DataFrame:
+        """Fetch Shenwan L2 industry metadata."""
+        log.info("Fetching Shenwan L2 industry metadata...")
+        try:
+            raw = ak.sw_index_second_info()
+            if raw.empty:
+                log.warning("Empty L2 info response")
+                return pl.DataFrame()
+            df = pl.from_pandas(raw).rename(
+                {
+                    "行业代码": "sw_l2_code",
+                    "行业名称": "sw_l2_name",
+                    "上级行业": "sw_l1_name",
+                    # Add other relevant columns if available
+                }
+            )
+            log.info(f"Fetched {df.height} L2 industries")
+            return df
+        except Exception as e:
+            log.error(f"L2 info fetch failed: {e}")
             return pl.DataFrame()
 
     def sw_l3_info(self) -> pl.DataFrame:
@@ -813,33 +1004,35 @@ class SWIndustryCls:
             log.warning(f"Constituents fetch failed for {sw_l3_code}: {e}")
             return pl.DataFrame()
 
-    @staticmethod
-    def derive_sw_levels(l3_code: str) -> tuple[str, str, str]:
-        """Derive L1 and L2 codes from L3 code (Shenwan format)"""
-        base = l3_code.replace(".SI", "").strip()
-        if len(base) != 6 or not base.isdigit():
-            raise ValueError(f"Invalid Shenwan L3 code format: {l3_code}")
+    # @staticmethod
+    # def derive_sw_levels(l3_code: str) -> tuple[str, str, str]:
+    #     """Derive L1 and L2 codes from L3 code (Shenwan format)"""
+    #     base = l3_code.replace(".SI", "").strip()
+    #     if len(base) != 6 or not base.isdigit():
+    #         raise ValueError(f"Invalid Shenwan L3 code format: {l3_code}")
 
-        l1 = f"{base[:2]}0000.SI"
-        l2 = f"{base[:4]}00.SI"
-        return l1, l2, l3_code
+    #     l1 = f"{base[:2]}0000.SI"
+    #     l2 = f"{base[:4]}00.SI"
+    #     return l1, l2, l3_code
 
-    def get_full_classification(self) -> pl.DataFrame:
+    def get_full_classification(self, fresh: bool = False) -> pl.DataFrame:
         """Get or build the master table (ts_code → industry codes + join_date)"""
         if self._full_cls is None:
-            self._full_cls = self.load_or_build()
+            log.info(f"Get full classification in force: {fresh}")
+            self._full_cls = self.load_or_build(fresh=fresh)
         return self._full_cls
 
     def stock_l1_industry_cls(
         self,
         as_of_date: DateLike | None = None,
         include_names: bool = False,
+        fresh: bool = False,
     ) -> pl.DataFrame:
         """
         Simplified L1 mapping: ts_code → sw_l1_code (optionally with names)
         Can be point-in-time if as_of_date is given.
         """
-        df = self.get_full_classification()
+        df = self.get_full_classification(fresh=fresh)
         if df.is_empty():
             return pl.DataFrame(schema={"ts_code": pl.Utf8, "sw_l1_code": pl.Utf8})
 

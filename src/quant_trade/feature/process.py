@@ -5,7 +5,6 @@ including quality metrics, leverage ratios, growth metrics, valuation ratios,
 behavioral indicators, and macro context features.
 """
 
-from collections.abc import Sequence
 from typing import Literal, Protocol
 
 import numpy as np
@@ -55,13 +54,15 @@ class Fundamental:
         n = pl.col(num) if isinstance(num, str) else num
         d = pl.col(den) if isinstance(den, str) else den
 
+        neg_mask = d <= 0
+
         d_adj = d.abs() if handle_neg_den == "abs" else d
         d_safe = d_adj.clip(lower_bound=min_den)
 
         ratio = n / d_safe
 
         if handle_neg_den == "null":
-            ratio = pl.when(d <= 0).then(None).otherwise(ratio)
+            ratio = pl.when(neg_mask).then(None).otherwise(ratio)
 
         if fill_null is not None:
             ratio = ratio.fill_null(fill_null)
@@ -118,7 +119,18 @@ class Fundamental:
                 + pl.col("advance_receipts"),
             )
             .with_columns(
-                Fundamental._safe_div("total_debts", "total_equity", "debt_to_equity"),
+                Fundamental._safe_div(
+                    "total_debts",
+                    "total_assets",
+                    "debt_to_assets",
+                    handle_neg_den="null",
+                ),
+                Fundamental._safe_div(
+                    "total_debts",
+                    "total_equity",
+                    "debt_to_equity",
+                    handle_neg_den="null",
+                ),
                 Fundamental._safe_div(
                     "current_assets",
                     "current_liabilities",
@@ -137,11 +149,11 @@ class Fundamental:
             )
             .select(
                 *Fundamental.IDENT_COLS,
+                "debt_to_assets",
                 "debt_to_equity",
                 "current_ratio",
                 "quick_ratio",
                 "interest_coverage",
-                "debt_to_assets",
             )
         )
 
@@ -149,23 +161,29 @@ class Fundamental:
     def growth(df: pl.DataFrame) -> pl.DataFrame:
         """YoY growth rates and quality signals"""
         log.info("Computing growth metrics")
-        return (
-            df.with_columns(
-                revenue_growth_yoy=pl.col("total_revenue_yoy"),
-                net_profit_growth_yoy=pl.col("net_profit_yoy"),
-                assets_growth_yoy=pl.col("total_assets_yoy"),
-                debt_growth_yoy=pl.col("total_debts_yoy"),
-                profit_growth_premium=pl.col("net_profit_yoy")
-                - pl.col("total_revenue_yoy"),
+        return df.with_columns(
+            revenue_growth_yoy=pl.col("total_revenue_yoy") / 100.0,
+            net_profit_growth_yoy=pl.col("net_profit_yoy") / 100.0,
+            assets_growth_yoy=pl.col("total_assets_yoy") / 100.0,
+            debt_growth_yoy=pl.col("total_debts_yoy") / 100.0,
+            profit_growth_premium=(
+                pl.col("net_profit_yoy") - pl.col("total_revenue_yoy")
             )
-            .with_columns(
-                roe_last=Fundamental._safe_div(
-                    "net_profit", "total_equity", "roe_last", handle_neg_den="null"
-                ).fill_null(0),
+            / 100.0,
+            roe_last=pl.when(pl.col("total_equity").shift(1).over("ts_code") > 0)
+            .then(
+                pl.col("net_profit").shift(1).over("ts_code")
+                / pl.col("total_equity").shift(1).over("ts_code")
             )
-            .select(
-                *Fundamental.IDENT_COLS, cs.ends_with("_yoy", "_premium", "roe_last")
-            )
+            .otherwise(pl.lit(0.0)),
+        ).select(
+            *Fundamental.IDENT_COLS,
+            "revenue_growth_yoy",
+            "net_profit_growth_yoy",
+            "assets_growth_yoy",
+            "debt_growth_yoy",
+            "profit_growth_premium",
+            "roe_last",
         )
 
     @staticmethod
@@ -192,7 +210,6 @@ class Fundamental:
                 "cfo_to_profit",
                 "fcf_to_profit",
                 "cfo_yield",
-                "cfo_share",
                 "accrual",
                 "accrual_ratio",
             )
@@ -210,16 +227,23 @@ class Fundamental:
         if "announcement_date" not in df.columns:
             raise ValueError("announcement_date column missing — cannot compute TTM")
 
-        # Ensure sorted
+        if "report_period" in df.columns:
+            df = df.sort(["ts_code", "report_period", "announcement_date"]).unique(
+                subset=["ts_code", "report_period"], keep="last"
+            )
+        else:
+            df = df.sort(["ts_code", "announcement_date"]).unique(
+                subset=["ts_code", "announcement_date"], keep="last"
+            )
+
         df = df.sort(["ts_code", "announcement_date"])
 
-        # Use group_by_dynamic with fixed 4-quarter window
-        return (
+        ttm_agg = (
             df.group_by_dynamic(
                 index_column="announcement_date",
                 every="1q",
                 period="4q",
-                offset="-3q",  # shift back 3 quarters to make current + prior 3
+                offset="-3q",
                 group_by="ts_code",
                 closed="left",
                 label="left",
@@ -229,33 +253,37 @@ class Fundamental:
                 ttm_net_profit=pl.col("net_profit").sum(),
                 ttm_cfo=pl.col("cfo").sum(),
                 ttm_fcf=(pl.col("cfo") + pl.col("cfi")).sum(),
+                latest_equity=pl.col("total_equity").last(),
+                latest_assets=pl.col("total_assets").last(),
                 count=pl.len(),
             )
             .filter(pl.col("count") >= min_periods)
-            .with_columns(
-                # Momentum: latest quarter vs previous TTM
-                profit_momentum=(
-                    pl.col("ttm_net_profit").last() / pl.col("ttm_net_profit").shift(1)
-                    - 1
-                )
-                .fill_null(0)
-                .over("ts_code"),
-                # Latest equity & assets (approximate for TTM ratios)
-                latest_equity=pl.col("total_equity").last().over("ts_code"),
-                latest_assets=pl.col("total_assets").last().over("ts_code"),
-            )
-            .with_columns(
-                Fundamental._safe_div(
-                    "ttm_net_profit", "latest_equity", "ttm_roe", handle_neg_den="null"
-                ),
-                Fundamental._safe_div("ttm_cfo", "latest_assets", "ttm_cfo_yield"),
-            )
-            .select(
-                "ts_code",
-                pl.col("announcement_date").alias("report_date"),
-                cs.starts_with("ttm_"),
-                "profit_momentum",
-            )
+            .sort(["ts_code", "announcement_date"])
+        )
+
+        ttm_agg = ttm_agg.with_columns(
+            profit_momentum=(
+                ttm_agg["ttm_net_profit"] / ttm_agg["ttm_net_profit"].shift(1) - 1
+            ).fill_null(0.0)
+        )
+
+        ttm_agg = ttm_agg.with_columns(
+            Fundamental._safe_div(
+                "ttm_net_profit", "latest_equity", "ttm_roe", handle_neg_den="null"
+            ),
+            Fundamental._safe_div("ttm_cfo", "latest_assets", "ttm_cfo_yield"),
+        )
+
+        return ttm_agg.select(
+            "ts_code",
+            pl.col("announcement_date").alias("report_date"),
+            "ttm_revenue",
+            "ttm_net_profit",
+            "ttm_cfo",
+            "ttm_fcf",
+            "ttm_roe",
+            "ttm_cfo_yield",
+            "profit_momentum",
         )
 
     @staticmethod
@@ -264,49 +292,49 @@ class Fundamental:
         log.info("Computing full fundamental feature set")
 
         # Base selection — only needed columns
-        base = df.select(
-            Fundamental.IDENT_COLS
-            + [
-                "net_profit",
-                "total_revenue",
-                "operating_profit",
-                "operating_cost",
-                "total_assets",
-                "total_equity",
-                "total_debts",
-                "cash",
-                "accounts_receivable",
-                "inventory",
-                "accounts_payable",
-                "advance_receipts",
-                "finance_cost",
-                "cfo",
-                "cfi",
-                "net_profit_yoy",
-                "total_revenue_yoy",
-                "total_assets_yoy",
-                "total_debts_yoy",
-                "cfo_share",
-                "debt_to_assets",
-            ]
-        )
+        needed_raw = Fundamental.IDENT_COLS + [
+            "net_profit",
+            "total_revenue",
+            "operating_profit",
+            "operating_cost",
+            "total_assets",
+            "total_equity",
+            "total_debts",
+            "cash",
+            "accounts_receivable",
+            "inventory",
+            "accounts_payable",
+            "advance_receipts",
+            "finance_cost",
+            "cfo",
+            "cfi",
+            "net_profit_yoy",
+            "total_revenue_yoy",
+            "total_assets_yoy",
+            "total_debts_yoy",
+        ]
+
+        available = [c for c in needed_raw if c in df.columns]
+        missing = set(needed_raw) - set(available)
+        if missing:
+            log.warning(f"Missing raw columns (will produce nulls): {missing}")
+
+        base = df.select(available)
 
         q = Fundamental.quality(base)
         lev = Fundamental.leverage(base)
         g = Fundamental.growth(base)
         cf = Fundamental.cashflow(base)
 
-        # Outer joins to preserve all rows
         combined = (
-            q.join(lev, on=Fundamental.IDENT_COLS, how="full", coalesce=True)
-            .join(g, on=Fundamental.IDENT_COLS, how="full", coalesce=True)
-            .join(cf, on=Fundamental.IDENT_COLS, how="full", coalesce=True)
+            q.join(lev, on=Fundamental.IDENT_COLS, how="inner")
+            .join(g, on=Fundamental.IDENT_COLS, how="inner")
+            .join(cf, on=Fundamental.IDENT_COLS, how="inner")
         )
 
-        # Add rolling TTM if enough history (heuristic)
-        if df.height > 2000 and "announcement_date" in df.columns:
+        if base.height > 2000 and "announcement_date" in base.columns:
             try:
-                ttm = Fundamental.rolling_ttm(df, min_periods=3)
+                ttm = Fundamental.rolling_ttm(base, min_periods=3)
                 combined = combined.join(
                     ttm.rename({"report_date": "announcement_date"}),
                     on=["ts_code", "announcement_date"],
@@ -362,6 +390,9 @@ class Behavioral:
                 ret_1=pl.col("close").pct_change(1),
                 ret_4=pl.col("close").pct_change(4),
                 ret_12=pl.col("close").pct_change(12),
+                ret_1m=pl.col("close").pct_change(22),
+                ret_1q=pl.col("close").pct_change(65),
+                ret_1y=pl.col("close").pct_change(261),
                 ma_4=pl.col("close").rolling_mean(4, min_samples=2),
                 ma_12=pl.col("close").rolling_mean(12, min_samples=4),
                 ma_24=pl.col("close").rolling_mean(24, min_samples=8),
@@ -589,7 +620,6 @@ class Behavioral:
     def metrics(df: pl.DataFrame) -> pl.DataFrame:
         """
         Combine all behavioral feature groups.
-        Uses full outer joins + coalesce=True for clean keys.
         """
         log.info("Behavioral.metrics: computing full behavioral feature suite")
 
@@ -603,9 +633,9 @@ class Behavioral:
         vol = Behavioral.volume(df)
         stru = Behavioral.structure(df)
         combined = (
-            mom.join(vola, on=Behavioral.IDENT_COLS, how="full", coalesce=True)
-            .join(vol, on=Behavioral.IDENT_COLS, how="full", coalesce=True)
-            .join(stru, on=Behavioral.IDENT_COLS, how="full", coalesce=True)
+            mom.join(vola, on=Behavioral.IDENT_COLS, how="inner")
+            .join(vol, on=Behavioral.IDENT_COLS, how="inner")
+            .join(stru, on=Behavioral.IDENT_COLS, how="inner")
         )
 
         return combined.sort("date")
@@ -767,7 +797,6 @@ class Northbound:
     def metrics(df: pl.DataFrame) -> pl.DataFrame:
         """
         Combine all Northbound feature groups.
-        Uses full outer join + coalesce=True for clean keys and union semantics.
         """
         log.info("Northbound.metrics: computing full northbound feature suite")
 
@@ -781,8 +810,8 @@ class Northbound:
         p = Northbound.persistence(df)
         a = Northbound.accel(df)
 
-        combined = f.join(p, on=Northbound.IDENT_COLS, how="full", coalesce=True).join(
-            a, on=Northbound.IDENT_COLS, how="full", coalesce=True
+        combined = f.join(p, on=Northbound.IDENT_COLS, how="inner").join(
+            a, on=Northbound.IDENT_COLS, how="inner", coalesce=True
         )
         return combined.with_columns(
             # Overall shock: ANY shock from flow or accel windows
@@ -979,9 +1008,9 @@ class MarginShort:
         imp = MarginShort.impulse(df)
         str_ = MarginShort.stress(df)
 
-        combined = lev.join(
-            imp, on=MarginShort.IDENT_COLS, how="full", coalesce=True
-        ).join(str_, on=MarginShort.IDENT_COLS, how="full", coalesce=True)
+        combined = lev.join(imp, on=MarginShort.IDENT_COLS, how="inner").join(
+            str_, on=MarginShort.IDENT_COLS, how="inner"
+        )
 
         return combined.with_columns(
             overall_leverage_stress=pl.any_horizontal(
@@ -1130,7 +1159,6 @@ class Shibor:
     def metrics(df: pl.DataFrame) -> pl.DataFrame:
         """
         Combine all SHIBOR feature groups.
-        Uses full outer join + coalesce=True for clean keys and maximum coverage.
         """
         log.info("Shibor.metrics: computing full SHIBOR feature suite")
 
@@ -1143,9 +1171,7 @@ class Shibor:
         shock_df = Shibor.shock(df)
         curve_df = Shibor.curve(df)
 
-        combined = shock_df.join(
-            curve_df, on=Shibor.IDENT_COLS, how="full", coalesce=True
-        )
+        combined = shock_df.join(curve_df, on=Shibor.IDENT_COLS, how="inner")
         return combined.with_columns(
             shibor_stress_any=pl.any_horizontal(
                 cs.contains("shibor_funding_stress"), cs.contains("shibor_inverted")
@@ -1219,6 +1245,26 @@ class CrossSection:
         sigma = c.std(ddof=ddof).over(by).clip(lower_bound=min_std)
 
         return ((c - mu) / sigma).alias(out_name)
+
+    @staticmethod
+    def rank(
+        factor: str | pl.Expr,
+        by: str | list[str],
+        ascending: bool = False,
+        name: str | None = None,
+    ) -> pl.Expr:
+        """
+        Cross-sectional ranking (optional percentile rank).
+        Useful before neutralization or portfolio sorting.
+        """
+        if isinstance(by, str):
+            by = [by]
+        c = pl.col(factor) if isinstance(factor, str) else factor
+        name_suffix = name or (c.meta.output_name() or "value") + "_rank"
+        rank_expr = (
+            c.rank("average", descending=not ascending).over(by).alias(name_suffix)
+        )
+        return rank_expr
 
     @staticmethod
     def neutralize(
@@ -1337,37 +1383,3 @@ class SectorGroup:
 
         # Apply
         return df.with_columns(all_exprs).sort(by)
-
-    @staticmethod
-    def rank(
-        df: pl.DataFrame,
-        factors: list[str],
-        by: str | list[str] = "date",
-        ascending: bool | list[bool] = False,
-        name_suffix: str = "_rank",
-        pct: bool = False,
-    ) -> pl.DataFrame:
-        """
-        Cross-sectional ranking (optional percentile rank).
-        Useful before neutralization or portfolio sorting.
-        """
-        if not isinstance(by, list):
-            by = [by]
-
-        if not isinstance(ascending, Sequence):
-            ascending = [ascending] * len(factors)
-
-        exprs = []
-        for factor, asc in zip(factors, ascending):
-            if factor not in df.columns:
-                log.warning(f"Skipping missing factor for rank: {factor}")
-                continue
-
-            rank_expr = pl.col(factor).rank("dense", descending=not asc).over(by)
-
-            if pct:
-                rank_expr = rank_expr / pl.col(factor).count().over(by)
-
-            exprs.append(rank_expr.alias(f"{factor}{name_suffix}"))
-
-        return df.with_columns(exprs)

@@ -18,7 +18,9 @@ dependencies = [
     # data visualization
     "plotly>=5.20",
     "seaborn>=0.13",
-    # "scipy>=1.14",
+    # ML
+    "scipy>=1.17.0",
+    "lightgbm>=4.6.0",
     # "backtrader>=1.9.78.123",
     # logging
     "loguru>=0.7.3",
@@ -26,6 +28,7 @@ dependencies = [
     # "pyyaml>=6.0.3",
     # database
     "arcticdb>=6.8.0",
+    "optuna>=4.7.0",
 ]
 
 [dependency-groups]
