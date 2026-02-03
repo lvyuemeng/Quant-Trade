@@ -10,6 +10,7 @@ dependencies = [
     "marimo>=0.19.4",
     # data source
     "akshare>=1.0",
+    "baostock>=0.8.9",
     # data processing
     "numpy>=2.0",
     "narwhals>=1.0",
@@ -49,7 +50,7 @@ package = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-asyncio_mode = "auto"
+# asyncio_mode = "auto"
 addopts = "-v --tb=short"
 
 [tool.ruff.lint]

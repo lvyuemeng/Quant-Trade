@@ -107,8 +107,8 @@ class PurgedKFold:
     def __post_init__(self):
         if self.n_splits < 2:
             raise ValueError(f"n_splits must be >= 2, got {self.n_splits}")
-        if self.horizon_days < 1:
-            raise ValueError(f"horizon_days must be >= 1, got {self.horizon_days}")
+        if self.horizon_days < 0:
+            raise ValueError(f"horizon_days must be >= 0, got {self.horizon_days}")
         if self.embargo_days < 0:
             raise ValueError(f"embargo_days must be >= 0, got {self.embargo_days}")
 
@@ -417,8 +417,8 @@ class LGBDataset:
     ) -> tuple[lgb.Dataset, list[str]]:
         df = self.label_builder.label(df)
         avail_feats = [f for f in self.features if f in df.columns]
-        X = df.select(avail_feats).to_numpy()
-        y = df.select(self.label_builder.label_name).to_series().to_numpy()
+        X = df.select(avail_feats).drop_nulls().to_numpy()
+        y = df.select(self.label_builder.label_name).drop_nulls().to_series().to_numpy()
         group_name = self.label_builder.rank_over_name
 
         groups = df.group_by(group_name).len().sort(group_name)["len"].to_numpy()
@@ -440,7 +440,7 @@ class LGBModelResult:
 
     model: lgb.Booster
     feature_names: list[str]
-    # val_ndcg: float
+    metric_val: float
     params: dict[str, Any]
     importance: dict[str, float]
 
@@ -563,12 +563,39 @@ class LGBTrainer:
             ],
         )
 
+        metric_val = model.best_score["valid_0"][self.config.metric]
         importance = dict(zip(features, model.feature_importance()))
-
         return LGBModelResult(
             model=model,
             feature_names=features,
-            # val_ndcg=val_ndcg,
+            metric_val=metric_val,
             params=params,
             importance=importance,
         )
+
+    def train_batchwise(
+        self,
+        batch_iter: Generator[tuple[pl.DataFrame, pl.DataFrame]],
+        optimize: bool = False,
+    ) -> LGBModelResult:
+        """
+        Train a **single model** using batches for memory efficiency,
+        while optionally performing purged CV for validation.
+        """
+        # Accumulate all training batches
+        train_batches = []
+        val_batches = []
+
+        for train_df, val_df in batch_iter:
+            train_batches.append(train_df)
+            val_batches.append(val_df)
+
+        # Concatenate all batches
+        full_train = pl.concat(train_batches)
+        full_val = pl.concat(val_batches)
+
+        log.info(f"Total accumulated: Train={len(full_train):,}, Val={len(full_val):,}")
+
+        # Train single model
+        result = self.train(train_df=full_train, val_df=full_val, optimize=optimize)
+        return result

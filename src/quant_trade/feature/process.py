@@ -5,6 +5,7 @@ including quality metrics, leverage ratios, growth metrics, valuation ratios,
 behavioral indicators, and macro context features.
 """
 
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 import numpy as np
@@ -12,19 +13,6 @@ import polars as pl
 import polars.selectors as cs
 
 from quant_trade.config.logger import log
-
-# type Freq = Literal["daily", "weekly", "quarterly", "yearly"]
-
-
-# def _resample(df: pl.DataFrame, rules: dict[str, pl.Expr], freq: Freq) -> pl.DataFrame:
-#     if freq == "daily":
-#         return df
-#     aggs = [rules[c].alias(c) for c in rules.keys() if c in df.columns]
-#     freq_map = {"W": "1w", "M": "1mo", "Q": "3mo", "Y": "1y"}
-#     if (date_range := freq_map.get(freq)) is None:
-#         raise ValueError(freq)
-
-#     return df.group_by_dynamic("date", every=date_range).agg(aggs).sort("date")
 
 
 class Metric(Protocol):
@@ -197,18 +185,18 @@ class Fundamental:
             )
             .with_columns(
                 Fundamental._safe_div(
-                    "cfo", "net_profit", "cfo_to_profit", fill_null=0
+                    "cfo", "net_profit", "cfo_to_net_profit", fill_null=0
                 ),
                 Fundamental._safe_div(
-                    "fcf_proxy", "net_profit", "fcf_to_profit", fill_null=0
+                    "fcf_proxy", "net_profit", "fcf_to_net_profit", fill_null=0
                 ),
                 Fundamental._safe_div("cfo", "total_assets", "cfo_yield"),
                 Fundamental._safe_div("accrual", "total_assets", "accrual_ratio"),
             )
             .select(
                 *Fundamental.IDENT_COLS,
-                "cfo_to_profit",
-                "fcf_to_profit",
+                "cfo_to_net_profit",
+                "fcf_to_net_profit",
                 "cfo_yield",
                 "accrual",
                 "accrual_ratio",
@@ -1303,6 +1291,7 @@ class CrossSection:
         return exprs
 
 
+@dataclass
 class SectorGroup:
     """
     Applies cross-sectional normalization (winsor + z-score) per group.
@@ -1310,15 +1299,16 @@ class SectorGroup:
     Handles small groups and missing factors gracefully.
     """
 
-    @staticmethod
+    by: list[str]
+    factors: list[str]
+    std_suffix: str = field(default="_z")
+    min_group_size: int = field(default=5)
+    skip_winsor: bool = field(default=False)
+    winsor_limits: tuple[float, float] = field(default=(0.01, 0.99))
+
     def normalize(
+        self,
         df: pl.DataFrame,
-        factors: list[str],
-        by: str | list[str] = "date",
-        winsor_limits: tuple[float, float] | None = (0.01, 0.99),
-        std_suffix: str = "_z",
-        min_group_size: int = 5,
-        skip_winsor: bool = False,
     ) -> pl.DataFrame:
         """
         Cross-sectional normalization of multiple factors.
@@ -1335,9 +1325,9 @@ class SectorGroup:
         Returns:
             DataFrame with original columns + {factor}_win (optional) + {factor}_z
         """
-        if not isinstance(by, list):
-            by = [by]
-
+        by = self.by
+        factors = self.factors
+        min_group_size = self.min_group_size
         # Validate group keys exist
         missing_keys = [k for k in by if k not in df.columns]
         if missing_keys:
@@ -1375,11 +1365,10 @@ class SectorGroup:
             exprs = CrossSection.neutralize(
                 factor,
                 by=by,
-                winsor_limits=winsor_limits,
-                std_suffix=std_suffix,
-                skip_winsor=skip_winsor,
+                winsor_limits=self.winsor_limits,
+                std_suffix=self.std_suffix,
+                skip_winsor=self.skip_winsor,
             )
             all_exprs.extend(exprs)
 
-        # Apply
         return df.with_columns(all_exprs).sort(by)

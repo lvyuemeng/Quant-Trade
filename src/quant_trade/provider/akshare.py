@@ -17,6 +17,7 @@ from quant_trade.provider.utils import (
     current_quarter_end,
     normalize_date_column,
     normalize_ts_code,
+    normalize_ts_code_str,
     quarter_end,
     to_date,
     to_ymd_str,
@@ -53,6 +54,160 @@ def _fetch_and_clean_whole(
         return pl.DataFrame(
             schema={code_col: pl.Utf8, name_col: pl.Utf8, date_col: pl.Date}
         )
+
+
+def _fetch_ohlcv(
+    fetcher: Callable,
+    symbol: str,
+    period: Period,
+    start_str: str,
+    end_str: str,
+    adjust: str,
+    column_map: dict,
+    daily_only: bool = False,
+    prefix: bool = False,
+) -> pl.DataFrame | None:
+    """Unified OHLCV fetcher for multiple sources."""
+    try:
+        # Check if daily-only data requested
+        if daily_only and period != "daily":
+            log.warning(
+                f"{fetcher.__name__} only supports daily data, requested {period}"
+            )
+            return None
+
+        if prefix:
+            symbol = normalize_ts_code_str(
+                symbol, add_exchange=True, position="prefix", sep="", case="lower"
+            )
+
+        df_raw = fetcher(symbol, start_str, end_str, adjust or "")
+        if df_raw.empty:
+            return None
+        df = pl.from_pandas(df_raw).rename(column_map)
+
+        required_cols = [
+            "date",
+            "ts_code",
+            "open",
+            "close",
+            "high",
+            "low",
+            "volume",
+            "amount",
+            "amplitude",
+            "pct_chg",
+            "change",
+            "turnover_rate",
+        ]
+        for col in required_cols:
+            if col not in df.columns:
+                df = df.with_columns(pl.lit(None).alias(col))
+
+        # Add ts_code if missing
+        if "ts_code" not in df.columns:
+            df = df.with_columns(pl.lit(symbol).alias("ts_code"))
+
+        df = df.select(required_cols)
+        return normalize_date_column(df, "date")
+
+    except Exception as e:
+        log.warning(f"{fetcher.__name__} fetch failed: {e}")
+        return None
+
+
+def fetch_ohlcv_eastmoney(
+    symbol: str, period: Period, start_str: str, end_str: str, adjust: str = ""
+) -> pl.DataFrame | None:
+    EASTMONEY_COLS = {
+        "日期": "date",
+        "股票代码": "ts_code",
+        "开盘": "open",
+        "收盘": "close",
+        "最高": "high",
+        "最低": "low",
+        "成交量": "volume",
+        "成交额": "amount",
+        "振幅": "amplitude",
+        "涨跌幅": "pct_chg",
+        "涨跌额": "change",
+        "换手率": "turnover_rate",
+    }
+    return _fetch_ohlcv(
+        fetcher=lambda s, start, end, adj: ak.stock_zh_a_hist(
+            symbol=s,
+            period=period,
+            start_date=start,
+            end_date=end,
+            adjust=adj,
+            timeout=60,
+        ),
+        symbol=symbol,
+        period=period,
+        start_str=start_str,
+        end_str=end_str,
+        adjust=adjust,
+        column_map=EASTMONEY_COLS,
+    )
+
+
+def fetch_ohlcv_sina(
+    symbol: str, period: Period, start_str: str, end_str: str, adjust: str = ""
+) -> pl.DataFrame | None:
+    SINA_COLS = {
+        "date": "date",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "volume": "volume",
+        "amount": "amount",
+        "turnover": "turnover_rate",
+    }
+    return _fetch_ohlcv(
+        fetcher=lambda s, start, end, adj: ak.stock_zh_a_daily(
+            symbol=s, start_date=start, end_date=end, adjust=adj
+        ),
+        symbol=symbol,
+        period=period,
+        start_str=start_str,
+        end_str=end_str,
+        adjust=adjust,
+        column_map=SINA_COLS,
+        daily_only=True,
+        prefix=True,
+    )
+
+
+def fetch_ohlcv_tencent(
+    symbol: str, period: Period, start_str: str, end_str: str, adjust: str = ""
+) -> pl.DataFrame | None:
+    TENCENT_COLS = {
+        "date": "date",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "amount": "volume",  # special handling
+    }
+    df = _fetch_ohlcv(
+        fetcher=lambda s, start, end, adj: ak.stock_zh_a_hist_tx(
+            symbol=s, start_date=start, end_date=end, adjust=adj
+        ),
+        symbol=symbol,
+        period=period,
+        start_str=start_str,
+        end_str=end_str,
+        adjust=adjust,
+        column_map=TENCENT_COLS,
+        daily_only=True,
+        prefix=True,
+    )
+    if df is not None:
+        df.with_columns((pl.col("volume") * 100).alias("volume"))
+        return df
+    else:
+        return None
 
 
 @cache
@@ -165,490 +320,6 @@ def stock_code_sus(date: DateLike) -> pl.DataFrame:
     except Exception as e:
         log.error(f"Failed to fetch stock_tfp_em for {ymd}: {e}")
         return pl.DataFrame(schema={"ts_code": pl.Utf8, "name": pl.Utf8})
-
-
-# ────────────────────────────────────────────────
-#   AkShareMicro class
-# ────────────────────────────────────────────────
-
-
-class AkShareMicro:
-    """AkShare implementation of the micro data interface."""
-
-    def __init__(self):
-        log.info("Initialized AkShareMicro.")
-
-    def stock_whole(self) -> pl.DataFrame:
-        """
-        Fetch A-Share stock universe in general.
-        """
-        df = stock_code_whole()
-        return df
-
-    def stock_slice(
-        self,
-        trade_date: DateLike | None = None,
-        min_listed_days: int = 365,
-        remove_st: bool = True,
-    ) -> pl.DataFrame:
-        trade_date = to_date(trade_date) if trade_date else date.today()
-        log.info(f"Building tradable universe for {trade_date}")
-
-        universe = self.stock_whole()
-        if universe.is_empty():
-            return pl.DataFrame(schema={"ts_code": pl.Utf8, "name": pl.Utf8})
-
-        delist = stock_code_delist()
-
-        q = (
-            universe.lazy()
-            .filter(pl.col("publish_date") <= pl.lit(trade_date))
-            .filter(
-                pl.col("publish_date")
-                <= pl.lit(trade_date - timedelta(days=min_listed_days))
-            )
-        )
-
-        if remove_st:
-            q = q.filter(~pl.col("name").str.contains(r"(?i)ST|\*ST"))
-
-        if not delist.is_empty():
-            delisted = (
-                delist.filter(pl.col("off_date") <= pl.lit(trade_date))
-                .select("ts_code")
-                .lazy()  # Convert to LazyFrame
-            )
-            q = q.join(delisted, on="ts_code", how="anti")
-
-        return q.sort("ts_code").select(["ts_code", "name"]).collect()
-
-    @cache
-    def market_ohlcv(
-        self,
-        symbol: str,
-        period: Period,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
-        adjust: AdjustCN | None = "hfq",
-    ) -> pl.DataFrame:
-        start_str = to_ymd_str(start_date) if start_date else "19910403"
-        end_str = (
-            to_ymd_str(end_date) if end_date else datetime.now().strftime("%Y%m%d")
-        )
-
-        log.info(
-            f"Fetching {symbol} {period} OHLCV {start_str} → {end_str} (adj={adjust})"
-        )
-
-        try:
-            df_raw = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period=period,
-                start_date=start_str,
-                end_date=end_str,
-                adjust=adjust or "",
-                timeout=60,
-            )
-            if df_raw.empty:
-                return pl.DataFrame()
-
-            df = pl.from_pandas(df_raw).rename(
-                {
-                    "日期": "date",
-                    "股票代码": "ts_code",
-                    "开盘": "open",
-                    "收盘": "close",
-                    "最高": "high",
-                    "最低": "low",
-                    "成交量": "volume",
-                    "成交额": "amount",
-                    "振幅": "amplitude",
-                    "涨跌幅": "pct_chg",
-                    "涨跌额": "change",
-                    "换手率": "turnover_rate",
-                }
-            )
-
-            df = normalize_date_column(df, "date")
-            return df
-        except Exception as e:
-            log.error(f"market_ohlcv failed for {symbol}: {e}")
-            return pl.DataFrame()
-
-    def _fetch_quarterly_em(
-        self,
-        func: Callable,
-        date_str: str,
-        rename_map: dict,
-        log_name: str,
-    ) -> pl.DataFrame:
-        log.info(f"Fetching {log_name} for {date_str}")
-        try:
-            raw = func(date=date_str)
-            if raw.empty:
-                return pl.DataFrame()
-            df = pl.from_pandas(raw).rename(rename_map).drop("序号", strict=False)
-            df = normalize_date_column(df, "announcement_date")
-            return df
-        except Exception as e:
-            log.error(f"{log_name} fetch failed for {date_str}: {e}")
-            return pl.DataFrame()
-
-    @cache
-    def quarterly_income_statement(
-        self, year: int | None, quarter: Quarter
-    ) -> pl.DataFrame:
-        date_str = quarter_end(year, quarter) if year else current_quarter_end()
-        rename_map = {
-            "股票代码": "ts_code",
-            "股票简称": "name",
-            "公告日期": "announcement_date",
-            "净利润": "net_profit",
-            "营业利润": "operating_profit",
-            "利润总额": "total_profit",
-            "营业总收入": "total_revenue",
-            "净利润同比": "net_profit_yoy",
-            "营业总收入同比": "total_revenue_yoy",
-            "营业总支出-营业支出": "operating_cost",
-            "营业总支出-销售费用": "selling_cost",
-            "营业总支出-管理费用": "admin_cost",
-            "营业总支出-财务费用": "finance_cost",
-            "营业总支出-营业总支出": "total_cost",
-        }
-        return self._fetch_quarterly_em(
-            ak.stock_lrb_em, date_str, rename_map, "income statement"
-        )
-
-    @cache
-    def quarterly_balance_sheet(
-        self, year: int | None, quarter: Quarter
-    ) -> pl.DataFrame:
-        """Fetch quarterly balance sheet snapshot for all A-shares.
-
-        Uses Eastmoney batch API:
-          - ak.stock_zcfz_em(date="YYYY0331|YYYY0630|YYYY0930|YYYY1231")
-
-        Returns a per-stock table keyed by (ts_code, announcement_date).
-        """
-        date_str = quarter_end(year, quarter) if year else current_quarter_end()
-        rename_map = {
-            # identifiers
-            "股票代码": "ts_code",
-            "股票简称": "name",
-            # dates
-            "公告日期": "announcement_date",
-            # assets (unit：yuan)
-            "资产-货币资金": "cash",
-            "资产-应收账款": "accounts_receivable",
-            "资产-存货": "inventory",
-            "资产-总资产": "total_assets",
-            "资产-总资产同比": "total_assets_yoy",  # unit：%
-            # liabilities (unit：yuan)
-            "负债-应付账款": "accounts_payable",
-            "负债-预收账款": "advance_receipts",
-            "负债-总负债": "total_debts",
-            "负债-总负债同比": "total_debts_yoy",  # unit：%
-            # ratios / equity
-            "资产负债率": "debt_to_assets",  # unit：%
-            "股东权益合计": "total_equity",  # unit：yuan
-        }
-        return self._fetch_quarterly_em(
-            ak.stock_zcfz_em, date_str, rename_map, "balance sheet"
-        )
-
-    @cache
-    def quarterly_cashflow_statement(
-        self, year: int | None, quarter: Quarter
-    ) -> pl.DataFrame:
-        """Fetch quarterly cashflow statement snapshot for all A-shares.
-
-        Uses Eastmoney batch API:
-          - ak.stock_xjll_em(date="YYYY0331|YYYY0630|YYYY0930|YYYY1231")
-
-        Returns a per-stock table keyed by (ts_code, announcement_date).
-        """
-        date_str = quarter_end(year, quarter) if year else current_quarter_end()
-        rename_map = {
-            # identifiers
-            "股票代码": "ts_code",
-            "股票简称": "name",
-            # date
-            "公告日期": "announcement_date",
-            # total net cashflow
-            "净现金流-净现金流": "net_cashflow",  # (unit: yuan)
-            "净现金流-同比增长": "net_cashflow_yoy",
-            # operating cashflow
-            "经营性现金流-现金流量净额": "cfo",  # (unit: yuan)
-            "经营性现金流-净现金流占比": "cfo_share",
-            # investing cashflow
-            "投资性现金流-现金流量净额": "cfi",  # (unit: yuan)
-            "投资性现金流-净现金流占比": "cfi_share",  # %
-            # financing cashflow
-            "融资性现金流-现金流量净额": "cff",  # (unit: yuan)
-            "融资性现金流-净现金流占比": "cff_share",  # %
-        }
-
-        return self._fetch_quarterly_em(
-            ak.stock_xjll_em, date_str, rename_map, "cashflow statement"
-        )
-
-    def quarterly_fundamentals(
-        self, year: int | None, quarter: Quarter
-    ) -> pl.DataFrame:
-        inc = self.quarterly_income_statement(year, quarter)
-        bal = self.quarterly_balance_sheet(year, quarter)
-        cf = self.quarterly_cashflow_statement(year, quarter)
-
-        if all(df.is_empty() for df in (inc, bal, cf)):
-            return pl.DataFrame()
-
-        keys = ["ts_code", "name", "announcement_date"]
-        df = inc.join(bal, on=keys, how="inner").join(cf, on=keys, how="inner")
-        return df
-
-
-class AkShareMacro:
-    """AkShare implementation of the macro data interface."""
-
-    def __init__(self):
-        log.info("Initialized AkShareMacro.")
-
-    def _fetch_and_filter_date_range(
-        self,
-        df: pl.DataFrame,
-        start_date: date,
-        end_date: date,
-        date_col: str = "date",
-    ) -> pl.DataFrame:
-        """Common final step: normalize date + filter range"""
-        if df.is_empty():
-            return pl.DataFrame(schema={date_col: pl.Date})
-
-        df = normalize_date_column(df, date_col)
-        return df.filter(
-            (pl.col(date_col) >= pl.lit(start_date))
-            & (pl.col(date_col) <= pl.lit(end_date))
-        ).sort(date_col)
-
-    @cache
-    def northbound_flow(
-        self,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
-    ) -> pl.DataFrame:
-        """
-        Fetch combined northbound (沪港通 + 深港通) net buy flow.
-        Columns: date, net_buy, fund_inflow, cum_net_buy
-        """
-        start_dt = to_date(start_date) if start_date else date(2014, 11, 17)
-        end_dt = to_date(end_date) if end_date else date.today()
-
-        log.info(f"Fetching northbound flow {start_dt} → {end_dt}")
-
-        try:
-            # SH
-            sh_raw = ak.stock_hsgt_hist_em(symbol="港股通沪")
-            sh = (
-                pl.from_pandas(sh_raw)
-                .rename(
-                    {
-                        "日期": "date",
-                        "当日成交净买额": "net_buy",
-                        "当日资金流入": "fund_inflow",
-                        "历史累计净买额": "cum_net_buy",
-                    }
-                )
-                .select(["date", "net_buy", "fund_inflow", "cum_net_buy"])
-            )
-
-            # SZ
-            sz_raw = ak.stock_hsgt_hist_em(symbol="港股通深")
-            sz = (
-                pl.from_pandas(sz_raw)
-                .rename(
-                    {
-                        "日期": "date",
-                        "当日成交净买额": "net_buy",
-                        "当日资金流入": "fund_inflow",
-                        "历史累计净买额": "cum_net_buy",
-                    }
-                )
-                .select(["date", "net_buy", "fund_inflow", "cum_net_buy"])
-            )
-
-            if sh.is_empty() and sz.is_empty():
-                log.warning("No northbound data fetched from either exchange")
-                return pl.DataFrame()
-
-            combined = (
-                pl.concat([sh, sz], how="vertical").group_by("date").sum().sort("date")
-            )
-
-            return self._fetch_and_filter_date_range(combined, start_dt, end_dt)
-
-        except Exception as e:
-            log.error(f"northbound_flow failed: {e}")
-            return pl.DataFrame()
-
-    @cache
-    def market_margin_short(
-        self,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
-    ) -> pl.DataFrame:
-        """
-        Combined SH+SZ margin & short-selling balance (daily).
-        Main column of interest: total_margin_balance
-        """
-        start_dt = to_date(start_date) if start_date else date(2010, 3, 31)
-        end_dt = to_date(end_date) if end_date else date.today()
-
-        log.info(f"Fetching market margin/short data {start_dt} → {end_dt}")
-
-        try:
-            sz_raw = ak.macro_china_market_margin_sz()
-            sz = pl.from_pandas(sz_raw)
-
-            sh_raw = ak.macro_china_market_margin_sh()
-            sh = pl.from_pandas(sh_raw)
-
-            def _process(df: pl.DataFrame) -> pl.DataFrame:
-                return (
-                    df.rename(
-                        {
-                            "日期": "date",
-                            "融资买入额": "margin_buy_amount",
-                            "融资余额": "margin_balance",
-                            "融券卖出量": "short_sell_volume",
-                            "融券余额": "short_balance",
-                            "融资融券余额": "total_margin_balance",
-                        }
-                    )
-                    .drop("融券余量", strict=False)
-                    .with_columns(pl.exclude("date").cast(pl.Float64))
-                )
-
-            sz_proc = _process(sz)
-            sh_proc = _process(sh)
-
-            if sz_proc.is_empty() and sh_proc.is_empty():
-                return pl.DataFrame()
-
-            combined = (
-                pl.concat([sz_proc, sh_proc], how="vertical")
-                .group_by("date")
-                .sum()
-                .sort("date")
-            )
-
-            return self._fetch_and_filter_date_range(combined, start_dt, end_dt)
-
-        except Exception as e:
-            log.error(f"market_margin_short failed: {e}")
-            return pl.DataFrame()
-
-    @cache
-    def shibor(
-        self,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
-    ) -> pl.DataFrame:
-        """
-        Full SHIBOR rates history (all tenors).
-        """
-        start_dt = to_date(start_date) if start_date else date(2017, 3, 17)
-        end_dt = to_date(end_date) if end_date else date.today()
-
-        log.info(f"Fetching SHIBOR rates {start_dt} → {end_dt}")
-
-        try:
-            raw = ak.macro_china_shibor_all()
-            if raw.empty:
-                return pl.DataFrame()
-
-            df = pl.from_pandas(raw).rename(
-                {
-                    "日期": "date",
-                    "O/N-定价": "ON_rate",
-                    "O/N-涨跌幅": "ON_change",
-                    "1W-定价": "1W_rate",
-                    "1W-涨跌幅": "1W_change",
-                    "2W-定价": "2W_rate",
-                    "2W-涨跌幅": "2W_change",
-                    "1M-定价": "1M_rate",
-                    "1M-涨跌幅": "1M_change",
-                    "3M-定价": "3M_rate",
-                    "3M-涨跌幅": "3M_change",
-                    "6M-定价": "6M_rate",
-                    "6M-涨跌幅": "6M_change",
-                    "9M-定价": "9M_rate",
-                    "9M-涨跌幅": "9M_change",
-                    "1Y-定价": "1Y_rate",
-                    "1Y-涨跌幅": "1Y_change",
-                }
-            )
-
-            return self._fetch_and_filter_date_range(df, start_dt, end_dt)
-
-        except Exception as e:
-            log.error(f"shibor fetch failed: {e}")
-            return pl.DataFrame()
-
-    @cache
-    def csi1000_daily_ohlcv(
-        self,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
-    ) -> pl.DataFrame:
-        """
-        CSI 1000 Index daily OHLCV (akshare uses em interface).
-        """
-        start_dt = to_date(start_date) if start_date else date(2005, 1, 5)
-        end_dt = to_date(end_date) if end_date else date.today()
-
-        log.info(f"Fetching CSI1000 daily OHLCV {start_dt} → {end_dt}")
-
-        try:
-            raw = ak.stock_zh_index_daily_em()
-            if raw.empty:
-                return pl.DataFrame()
-
-            df = pl.from_pandas(raw).drop("amount", strict=False)
-            df = normalize_date_column(df, "date")  # usually already has 'date'
-
-            return self._fetch_and_filter_date_range(df, start_dt, end_dt)
-
-        except Exception as e:
-            log.error(f"csi1000_daily_ohlcv failed: {e}")
-            return pl.DataFrame()
-
-    @cache
-    def csi1000qvix_daily_ohlc(
-        self,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
-    ) -> pl.DataFrame:
-        """
-        CSI 1000 Volatility Index (QVIX) daily data.
-        """
-        start_dt = to_date(start_date) if start_date else date(2005, 2, 9)
-        end_dt = to_date(end_date) if end_date else date.today()
-
-        log.info(f"Fetching CSI1000 QVIX {start_dt} → {end_dt}")
-
-        try:
-            raw = ak.index_option_1000index_qvix()
-            if raw.empty:
-                return pl.DataFrame()
-
-            df = pl.from_pandas(raw).drop_nulls()
-            df = normalize_date_column(df, "date")
-
-            return self._fetch_and_filter_date_range(df, start_dt, end_dt)
-
-        except Exception as e:
-            log.error(f"csi1000qvix_daily_ohlc failed: {e}")
-            return pl.DataFrame()
 
 
 class SWIndustryCls:
@@ -872,7 +543,7 @@ class SWIndustryCls:
             combined = (
                 pl.concat(all_cons, how="vertical_relaxed")
                 .with_columns(
-                    normalize_ts_code("ts_code_suffix", add_suffix=False).alias(
+                    normalize_ts_code("ts_code_suffix", add_exchange=False).alias(
                         "ts_code"
                     )
                 )
@@ -1098,3 +769,467 @@ class SWIndustryCls:
             log.warning(f"Unrecognized suffix in {code}, returning prefix anyway")
 
         return prefix
+
+
+class AkShareUniverse:
+    @staticmethod
+    def stock_whole() -> pl.DataFrame:
+        """
+        Fetch A-Share stock universe in general.
+        """
+        df = stock_code_whole()
+        return df
+
+    @staticmethod
+    def stock_slice(
+        trade_date: DateLike | None = None,
+        min_listed_days: int = 365,
+        remove_st: bool = True,
+    ) -> pl.DataFrame:
+        trade_date = to_date(trade_date) if trade_date else date.today()
+        log.info(f"Building tradable universe for {trade_date}")
+
+        universe = AkShareUniverse().stock_whole()
+        if universe.is_empty():
+            return pl.DataFrame(schema={"ts_code": pl.Utf8, "name": pl.Utf8})
+
+        delist = stock_code_delist()
+
+        q = (
+            universe.lazy()
+            .filter(pl.col("publish_date") <= pl.lit(trade_date))
+            .filter(
+                pl.col("publish_date")
+                <= pl.lit(trade_date - timedelta(days=min_listed_days))
+            )
+        )
+
+        if remove_st:
+            q = q.filter(~pl.col("name").str.contains(r"(?i)ST|\*ST"))
+
+        if not delist.is_empty():
+            delisted = (
+                delist.filter(pl.col("off_date") <= pl.lit(trade_date))
+                .select("ts_code")
+                .lazy()  # Convert to LazyFrame
+            )
+            q = q.join(delisted, on="ts_code", how="anti")
+
+        return q.sort("ts_code").select(["ts_code", "name"]).collect()
+
+
+class AkShareMicro:
+    @staticmethod
+    def market_ohlcv(
+        symbol: str,
+        period: Period,
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+        adjust: AdjustCN | None = "hfq",
+    ) -> pl.DataFrame:
+        start_str = to_ymd_str(start_date) if start_date else "19910403"
+        end_str = (
+            to_ymd_str(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        )
+
+        log.info(
+            f"Fetching {symbol} {period} OHLCV {start_str} → {end_str} (adj={adjust})"
+        )
+
+        # 尝试多个数据源，直到成功获取数据
+        data_sources = [
+            ("eastmoney", fetch_ohlcv_eastmoney),
+            ("sina", fetch_ohlcv_sina),
+            ("tencent", fetch_ohlcv_tencent),
+        ]
+
+        for source_name, fetch_func in data_sources:
+            try:
+                log.info(f"Trying {source_name} source for {symbol}")
+                df = fetch_func(
+                    symbol,
+                    period,
+                    start_str,
+                    end_str,
+                    adjust=adjust if adjust is not None else "",
+                )
+                if df is not None and not df.is_empty():
+                    log.info(
+                        f"Successfully fetched data from {source_name} for {symbol}"
+                    )
+                    return df
+                elif df is not None:
+                    log.warning(f"Got empty DataFrame from {source_name} for {symbol}")
+            except Exception as e:
+                log.warning(f"Failed to fetch from {source_name} for {symbol}: {e}")
+
+        log.error(f"All data sources failed for {symbol}")
+        return pl.DataFrame()
+
+    @staticmethod
+    def _fetch_quarterly_em(
+        func: Callable,
+        date_str: str,
+        rename_map: dict,
+        log_name: str,
+    ) -> pl.DataFrame:
+        log.info(f"Fetching {log_name} for {date_str}")
+        try:
+            raw = func(date=date_str)
+            if raw.empty:
+                return pl.DataFrame()
+            df = pl.from_pandas(raw).rename(rename_map).drop("序号", strict=False)
+            df = normalize_date_column(df, "announcement_date")
+            return df
+        except Exception as e:
+            log.error(f"{log_name} fetch failed for {date_str}: {e}")
+            return pl.DataFrame()
+
+    @staticmethod
+    @cache
+    def quarterly_income(year: int | None, quarter: Quarter) -> pl.DataFrame:
+        date_str = quarter_end(year, quarter) if year else current_quarter_end()
+        rename_map = {
+            "股票代码": "ts_code",
+            "股票简称": "name",
+            "公告日期": "announcement_date",
+            "净利润": "net_profit",
+            "营业利润": "operating_profit",
+            "利润总额": "total_profit",
+            "营业总收入": "total_revenue",
+            "净利润同比": "net_profit_yoy",
+            "营业总收入同比": "total_revenue_yoy",
+            "营业总支出-营业支出": "operating_cost",
+            "营业总支出-销售费用": "selling_cost",
+            "营业总支出-管理费用": "admin_cost",
+            "营业总支出-财务费用": "finance_cost",
+            "营业总支出-营业总支出": "total_cost",
+        }
+        return AkShareMicro._fetch_quarterly_em(
+            ak.stock_lrb_em, date_str, rename_map, "income statement"
+        )
+
+    @staticmethod
+    @cache
+    def quarterly_balance(year: int | None, quarter: Quarter) -> pl.DataFrame:
+        """Fetch quarterly balance sheet snapshot for all A-shares.
+
+        Uses Eastmoney batch API:
+          - ak.stock_zcfz_em(date="YYYY0331|YYYY0630|YYYY0930|YYYY1231")
+
+        Returns a per-stock table keyed by (ts_code, announcement_date).
+        """
+        date_str = quarter_end(year, quarter) if year else current_quarter_end()
+        rename_map = {
+            # identifiers
+            "股票代码": "ts_code",
+            "股票简称": "name",
+            # dates
+            "公告日期": "announcement_date",
+            # assets (unit：yuan)
+            "资产-货币资金": "cash",
+            "资产-应收账款": "accounts_receivable",
+            "资产-存货": "inventory",
+            "资产-总资产": "total_assets",
+            "资产-总资产同比": "total_assets_yoy",  # unit：%
+            # liabilities (unit：yuan)
+            "负债-应付账款": "accounts_payable",
+            "负债-预收账款": "advance_receipts",
+            "负债-总负债": "total_debts",
+            "负债-总负债同比": "total_debts_yoy",  # unit：%
+            # ratios / equity
+            "资产负债率": "debt_to_assets",  # unit：%
+            "股东权益合计": "total_equity",  # unit：yuan
+        }
+        return AkShareMicro._fetch_quarterly_em(
+            ak.stock_zcfz_em, date_str, rename_map, "balance sheet"
+        )
+
+    @staticmethod
+    @cache
+    def quarterly_cashflow(year: int | None, quarter: Quarter) -> pl.DataFrame:
+        """Fetch quarterly cashflow statement snapshot for all A-shares.
+
+        Uses Eastmoney batch API:
+          - ak.stock_xjll_em(date="YYYY0331|YYYY0630|YYYY0930|YYYY1231")
+
+        Returns a per-stock table keyed by (ts_code, announcement_date).
+        """
+        date_str = quarter_end(year, quarter) if year else current_quarter_end()
+        rename_map = {
+            # identifiers
+            "股票代码": "ts_code",
+            "股票简称": "name",
+            # date
+            "公告日期": "announcement_date",
+            # total net cashflow
+            "净现金流-净现金流": "net_cashflow",  # (unit: yuan)
+            "净现金流-同比增长": "net_cashflow_yoy",
+            # operating cashflow
+            "经营性现金流-现金流量净额": "cfo",  # (unit: yuan)
+            "经营性现金流-净现金流占比": "cfo_share",
+            # investing cashflow
+            "投资性现金流-现金流量净额": "cfi",  # (unit: yuan)
+            "投资性现金流-净现金流占比": "cfi_share",  # %
+            # financing cashflow
+            "融资性现金流-现金流量净额": "cff",  # (unit: yuan)
+            "融资性现金流-净现金流占比": "cff_share",  # %
+        }
+
+        return AkShareMicro._fetch_quarterly_em(
+            ak.stock_xjll_em, date_str, rename_map, "cashflow statement"
+        )
+
+    @staticmethod
+    def quarterly_fundamentals(year: int | None, quarter: Quarter) -> pl.DataFrame:
+        inc = AkShareMicro().quarterly_income(year, quarter)
+        bal = AkShareMicro().quarterly_balance(year, quarter)
+        cf = AkShareMicro().quarterly_cashflow(year, quarter)
+
+        if all(df.is_empty() for df in (inc, bal, cf)):
+            return pl.DataFrame()
+
+        keys = ["ts_code", "name", "announcement_date"]
+        df = inc.join(bal, on=keys, how="inner").join(cf, on=keys, how="inner")
+        return df
+
+
+class AkShareMacro:
+    """AkShare implementation of the macro data interface."""
+
+    @staticmethod
+    def _fetch_and_filter_date_range(
+        df: pl.DataFrame,
+        start_date: date,
+        end_date: date,
+        date_col: str = "date",
+    ) -> pl.DataFrame:
+        """Common final step: normalize date + filter range"""
+        if df.is_empty():
+            return pl.DataFrame(schema={date_col: pl.Date})
+
+        df = normalize_date_column(df, date_col)
+        return df.filter(
+            (pl.col(date_col) >= pl.lit(start_date))
+            & (pl.col(date_col) <= pl.lit(end_date))
+        ).sort(date_col)
+
+    @staticmethod
+    @cache
+    def northbound_flow(
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+    ) -> pl.DataFrame:
+        """
+        Fetch combined northbound (沪港通 + 深港通) net buy flow.
+        Columns: date, net_buy, fund_inflow, cum_net_buy
+        """
+        start_dt = to_date(start_date) if start_date else date(2014, 11, 17)
+        end_dt = to_date(end_date) if end_date else date.today()
+
+        log.info(f"Fetching northbound flow {start_dt} → {end_dt}")
+
+        try:
+            # SH
+            sh_raw = ak.stock_hsgt_hist_em(symbol="港股通沪")
+            sh = (
+                pl.from_pandas(sh_raw)
+                .rename(
+                    {
+                        "日期": "date",
+                        "当日成交净买额": "net_buy",
+                        "当日资金流入": "fund_inflow",
+                        "历史累计净买额": "cum_net_buy",
+                    }
+                )
+                .select(["date", "net_buy", "fund_inflow", "cum_net_buy"])
+            )
+
+            # SZ
+            sz_raw = ak.stock_hsgt_hist_em(symbol="港股通深")
+            sz = (
+                pl.from_pandas(sz_raw)
+                .rename(
+                    {
+                        "日期": "date",
+                        "当日成交净买额": "net_buy",
+                        "当日资金流入": "fund_inflow",
+                        "历史累计净买额": "cum_net_buy",
+                    }
+                )
+                .select(["date", "net_buy", "fund_inflow", "cum_net_buy"])
+            )
+
+            if sh.is_empty() and sz.is_empty():
+                log.warning("No northbound data fetched from either exchange")
+                return pl.DataFrame()
+
+            combined = (
+                pl.concat([sh, sz], how="vertical").group_by("date").sum().sort("date")
+            )
+
+            return AkShareMacro._fetch_and_filter_date_range(combined, start_dt, end_dt)
+
+        except Exception as e:
+            log.error(f"northbound_flow failed: {e}")
+            return pl.DataFrame()
+
+    @staticmethod
+    @cache
+    def market_margin_short(
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+    ) -> pl.DataFrame:
+        """
+        Combined SH+SZ margin & short-selling balance (daily).
+        Main column of interest: total_margin_balance
+        """
+        start_dt = to_date(start_date) if start_date else date(2010, 3, 31)
+        end_dt = to_date(end_date) if end_date else date.today()
+
+        log.info(f"Fetching market margin/short data {start_dt} → {end_dt}")
+
+        try:
+            sz_raw = ak.macro_china_market_margin_sz()
+            sz = pl.from_pandas(sz_raw)
+
+            sh_raw = ak.macro_china_market_margin_sh()
+            sh = pl.from_pandas(sh_raw)
+
+            def _process(df: pl.DataFrame) -> pl.DataFrame:
+                return (
+                    df.rename(
+                        {
+                            "日期": "date",
+                            "融资买入额": "margin_buy_amount",
+                            "融资余额": "margin_balance",
+                            "融券卖出量": "short_sell_volume",
+                            "融券余额": "short_balance",
+                            "融资融券余额": "total_margin_balance",
+                        }
+                    )
+                    .drop("融券余量", strict=False)
+                    .with_columns(pl.exclude("date").cast(pl.Float64))
+                )
+
+            sz_proc = _process(sz)
+            sh_proc = _process(sh)
+
+            if sz_proc.is_empty() and sh_proc.is_empty():
+                return pl.DataFrame()
+
+            combined = (
+                pl.concat([sz_proc, sh_proc], how="vertical")
+                .group_by("date")
+                .sum()
+                .sort("date")
+            )
+
+            return AkShareMacro._fetch_and_filter_date_range(combined, start_dt, end_dt)
+
+        except Exception as e:
+            log.error(f"market_margin_short failed: {e}")
+            return pl.DataFrame()
+
+    @staticmethod
+    @cache
+    def shibor(
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+    ) -> pl.DataFrame:
+        """
+        Full SHIBOR rates history (all tenors).
+        """
+        start_dt = to_date(start_date) if start_date else date(2017, 3, 17)
+        end_dt = to_date(end_date) if end_date else date.today()
+
+        log.info(f"Fetching SHIBOR rates {start_dt} → {end_dt}")
+
+        try:
+            raw = ak.macro_china_shibor_all()
+            if raw.empty:
+                return pl.DataFrame()
+
+            df = pl.from_pandas(raw).rename(
+                {
+                    "日期": "date",
+                    "O/N-定价": "ON_rate",
+                    "O/N-涨跌幅": "ON_change",
+                    "1W-定价": "1W_rate",
+                    "1W-涨跌幅": "1W_change",
+                    "2W-定价": "2W_rate",
+                    "2W-涨跌幅": "2W_change",
+                    "1M-定价": "1M_rate",
+                    "1M-涨跌幅": "1M_change",
+                    "3M-定价": "3M_rate",
+                    "3M-涨跌幅": "3M_change",
+                    "6M-定价": "6M_rate",
+                    "6M-涨跌幅": "6M_change",
+                    "9M-定价": "9M_rate",
+                    "9M-涨跌幅": "9M_change",
+                    "1Y-定价": "1Y_rate",
+                    "1Y-涨跌幅": "1Y_change",
+                }
+            )
+
+            return AkShareMacro._fetch_and_filter_date_range(df, start_dt, end_dt)
+
+        except Exception as e:
+            log.error(f"shibor fetch failed: {e}")
+            return pl.DataFrame()
+
+    @staticmethod
+    @cache
+    def csi1000_daily_ohlcv(
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+    ) -> pl.DataFrame:
+        """
+        CSI 1000 Index daily OHLCV (akshare uses em interface).
+        """
+        start_dt = to_date(start_date) if start_date else date(2005, 1, 5)
+        end_dt = to_date(end_date) if end_date else date.today()
+
+        log.info(f"Fetching CSI1000 daily OHLCV {start_dt} → {end_dt}")
+
+        try:
+            raw = ak.stock_zh_index_daily_em()
+            if raw.empty:
+                return pl.DataFrame()
+
+            df = pl.from_pandas(raw).drop("amount", strict=False)
+            df = normalize_date_column(df, "date")  # usually already has 'date'
+
+            return AkShareMacro._fetch_and_filter_date_range(df, start_dt, end_dt)
+
+        except Exception as e:
+            log.error(f"csi1000_daily_ohlcv failed: {e}")
+            return pl.DataFrame()
+
+    @staticmethod
+    @cache
+    def csi1000qvix_daily_ohlc(
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+    ) -> pl.DataFrame:
+        """
+        CSI 1000 Volatility Index (QVIX) daily data.
+        """
+        start_dt = to_date(start_date) if start_date else date(2005, 2, 9)
+        end_dt = to_date(end_date) if end_date else date.today()
+
+        log.info(f"Fetching CSI1000 QVIX {start_dt} → {end_dt}")
+
+        try:
+            raw = ak.index_option_1000index_qvix()
+            if raw.empty:
+                return pl.DataFrame()
+
+            df = pl.from_pandas(raw).drop_nulls()
+            df = normalize_date_column(df, "date")
+
+            return AkShareMacro._fetch_and_filter_date_range(df, start_dt, end_dt)
+
+        except Exception as e:
+            log.error(f"csi1000qvix_daily_ohlc failed: {e}")
+            return pl.DataFrame()

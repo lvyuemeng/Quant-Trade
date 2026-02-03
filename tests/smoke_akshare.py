@@ -12,11 +12,10 @@ from quant_trade.feature.process import (
     Shibor,
 )
 from quant_trade.feature.store import (
-    CNFeatures,
     CNFundamental,
     CNMacro,
     CNMarket,
-    CNStockMap,
+    CNStockPool,
 )
 
 INDEX_CODE = "000001"
@@ -32,7 +31,7 @@ def test_stock_daily(m: ak.AkShareMicro):
 
 
 def test_quarter_income(m: ak.AkShareMicro):
-    df = m.quarterly_income_statement(year=SHEET_YEAR, quarter=SHEET_QUATER)
+    df = m.quarterly_income(year=SHEET_YEAR, quarter=SHEET_QUATER)
     filter_df = df.filter(
         pl.col("net_profit").is_not_nan() & pl.col("net_profit").gt(0)
     )
@@ -40,7 +39,7 @@ def test_quarter_income(m: ak.AkShareMicro):
 
 
 def test_quarter_balance(m: ak.AkShareMicro):
-    df = m.quarterly_balance_sheet(year=SHEET_YEAR, quarter=SHEET_QUATER)
+    df = m.quarterly_balance(year=SHEET_YEAR, quarter=SHEET_QUATER)
     filter_df = df.filter(
         pl.col("total_equity").is_not_nan() & pl.col("total_equity").gt(0)
     )
@@ -48,7 +47,7 @@ def test_quarter_balance(m: ak.AkShareMicro):
 
 
 def test_quarter_cashflow(m: ak.AkShareMicro):
-    df = m.quarterly_cashflow_statement(year=SHEET_YEAR, quarter=SHEET_QUATER)
+    df = m.quarterly_cashflow(year=SHEET_YEAR, quarter=SHEET_QUATER)
     print(f"quarter cashflow: {df.columns} \n {df}")
 
 
@@ -206,7 +205,7 @@ def test_shiborf(m: ak.AkShareMacro):
 
 
 def test_db_stock(db: ArcticDB):
-    stock_lib = CNStockMap(db)
+    stock_lib = CNStockPool(db)
     stock_codes = stock_lib.read("stock_code")
     print(f"stock code: {stock_codes}")
     indus_codes = stock_lib.read("industry_code")
@@ -240,7 +239,7 @@ def test_db_macro(db: ArcticDB):
 
 def test_db_features(db: ArcticDB):
     lib = CNFeatures(db)
-    feat = lib.load_range(date(2024, 1, 1), date(2025, 1, 1), "301391")
+    feat = lib.load_range(date(2024, 1, 1), date(2025, 1, 1), ["301391"])
     print(f"feature: {feat.columns} \n {feat}")
 
 

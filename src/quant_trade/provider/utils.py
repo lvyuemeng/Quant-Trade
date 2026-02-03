@@ -46,6 +46,66 @@ def to_ymd_str(d: DateLike, sep: str = "") -> str:
 #         Stock code normalization (suffix control)
 # ────────────────────────────────────────────────
 #
+#
+def normalize_ts_code_str(
+    code: str,
+    *,
+    length: int = 6,
+    add_exchange: bool = False,
+    exchange: Literal["SH", "SZ", "BJ"] | None = None,
+    position: Literal["suffix", "prefix"] = "suffix",
+    sep: str = ".",
+    case: Literal["upper", "lower"] = "upper",
+) -> str:
+    """
+    Normalize a single stock code string.
+
+    Examples:
+        "600519"        -> "600519"
+        "600519.SH"     -> "600519"
+        "sh600519"      -> "600519"
+        add_exchange=True -> "600519.SH"
+    """
+
+    # ---- extract digits (fast path, no regex) ----
+    digits = "".join(c for c in code if c.isdigit())
+
+    if not digits:
+        raise ValueError("Code digit is empty")
+
+    # pad + truncate
+    if len(digits) < length:
+        digits = digits.zfill(length)
+    elif len(digits) > length:
+        digits = digits[-length:]
+
+    if not add_exchange:
+        return digits
+
+    # ---- determine exchange ----
+    if exchange is not None:
+        exch = exchange
+    else:
+        first = digits[0]
+        if first == "6":
+            exch = "SH"
+        elif first in ("0", "3"):
+            exch = "SZ"
+        elif first in ("4", "8"):
+            exch = "BJ"
+        else:
+            exch = "UNKNOWN"
+
+    if case == "lower":
+        exch = exch.lower()
+    else:
+        exch = exch.upper()
+
+    # ---- assemble ----
+    if position == "suffix":
+        return f"{digits}{sep}{exch}"
+    else:
+        return f"{exch}{sep}{digits}"
 
 
 def normalize_ts_code(
@@ -53,40 +113,41 @@ def normalize_ts_code(
     *,
     length: int = 6,
     output: str | None = None,
-    add_suffix: bool = False,  # ← Default: NO suffix
-    exchange: Literal["SH", "SZ", "BJ"] | None = None,  # only used if add_suffix=True
+    add_exchange: bool = False,  # whether to add SH/SZ/BJ at all
+    exchange: Literal["SH", "SZ", "BJ"] | None = None,
+    position: Literal["suffix", "prefix"] = "suffix",
+    sep: str = ".",  # ".", "" or others
+    case: Literal["upper", "lower"] = "upper",
 ) -> pl.Expr:
     """
     Normalize stock code to:
-    - 6-digit string (default)    e.g. "600519"
-    - or full ts_code with suffix e.g. "600519.SH" (when add_suffix=True)
+    - 6-digit string (default)            e.g. "600519"
+    - with exchange as suffix/prefix      e.g. "600519.SH", "sh600519", "600519SH"
 
     Args:
-        code: str or Expr
+        code: column name or Expr
         length: usually 6
-        output: alias name (optional)
-        add_suffix: whether to append .SH/.SZ/.BJ
-        exchange: explicit exchange suffix (only used if add_suffix=True)
-                 if None and add_suffix=True, will try to guess from digits
+        output: alias name
+        add_exchange: whether to attach exchange
+        exchange: explicit exchange (SH/SZ/BJ); if None, guessed
+        position: "suffix" or "prefix"
+        sep: separator between code and exchange (".", "", "_", etc.)
+        case: exchange letter case
     """
-    if isinstance(code, str):
-        expr = pl.col(code)
-    else:
-        expr = code
+    expr = pl.col(code) if isinstance(code, str) else code
 
+    # extract digits → zero-pad → keep last `length`
     digits = expr.str.extract(r"(\d+)", 1).str.pad_start(length, "0").str.slice(-length)
 
-    if not add_suffix:
+    if not add_exchange:
         out = digits
     else:
-        # Determine suffix
+        # --- exchange expr ---
         if exchange is not None:
-            suffix = exchange
+            exch = pl.lit(exchange)
         else:
-            # Guess logic
             first_digit = digits.str.slice(0, 1)
-
-            suffix = (
+            exch = (
                 pl.when(first_digit == "6")
                 .then(pl.lit("SH"))
                 .when(first_digit.is_in(["0", "3"]))
@@ -96,27 +157,16 @@ def normalize_ts_code(
                 .otherwise(pl.lit("UNKNOWN"))
             )
 
-        out = digits + "." + suffix
+        # case control
+        exch = exch.str.to_uppercase() if case == "upper" else exch.str.to_lowercase()
+
+        # combine
+        if position == "suffix":
+            out = digits + pl.lit(sep) + exch
+        else:  # prefix
+            out = exch + pl.lit(sep) + digits
 
     return out.alias(output) if output else out
-
-
-def normalize_stock_codes(
-    df: pl.DataFrame,
-    col: str = "ts_code",
-    *,
-    new_col: str | None = None,
-    add_suffix: bool = False,
-    exchange: Literal["SH", "SZ", "BJ"] | None = None,
-) -> pl.DataFrame:
-    """Apply normalize_ts_code to a DataFrame column"""
-    expr = normalize_ts_code(
-        col,
-        output=new_col,
-        add_suffix=add_suffix,
-        exchange=exchange,
-    )
-    return df.with_columns(expr)
 
 
 # ────────────────────────────────────────────────
