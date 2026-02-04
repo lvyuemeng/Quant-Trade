@@ -3,15 +3,16 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
-from functools import cache
+from functools import cache, partial
 from pathlib import Path
 
 import akshare as ak
 import polars as pl
 import tqdm
 
+import quant_trade.provider.concurrent as concur
 from quant_trade.config.logger import log
-from quant_trade.provider.utils import (
+from quant_trade.provider.transform import (
     AdjustCN,
     DateLike,
     Period,
@@ -20,11 +21,9 @@ from quant_trade.provider.utils import (
     normalize_date_column,
     normalize_ts_code,
     normalize_ts_code_str,
-    optimal_workers,
     quarter_end,
     to_date,
     to_ymd_str,
-    try_call,
 )
 
 
@@ -871,25 +870,6 @@ class AkShareMicro:
         return pl.DataFrame()
 
     @staticmethod
-    def _worker(
-        symbol: str,
-        period: Period,
-        start_date: DateLike | None,
-        end_date: DateLike | None,
-        adjust: AdjustCN | None,
-    ) -> pl.DataFrame:
-        return try_call(
-            AkShareMicro.market_ohlcv,
-            retry=3,
-            sleep=0.5,
-            symbol=symbol,
-            period=period,
-            start_date=start_date,
-            end_date=end_date,
-            adjust=adjust,
-        )
-
-    @staticmethod
     def batch_market_ohlcv(
         symbols: list[str],
         period: Period,
@@ -902,28 +882,10 @@ class AkShareMicro:
         Returns list of pl.DataFrame **in the same order** as input `codes`.
         Empty DataFrame = no data / filtered / failed.
         """
-        len_ = len(symbols)
-        results = [pl.DataFrame()] * len_
-        with ThreadPoolExecutor(max_workers=optimal_workers(len_)) as executor:
-            futures = {
-                executor.submit(
-                    AkShareMicro._worker, symbol, period, start_date, end_date, adjust
-                ): idx
-                for idx, symbol in enumerate(symbols)
-            }
-            for future in tqdm.tqdm(
-                as_completed(futures),
-                total=len_,
-                desc="Fetching OHLCV data",
-                position=0,
-            ):
-                idx = futures[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    log.error(f"Failed to fetch OHLCV for {symbols[idx]}: {e}")
-                    results[idx] = pl.DataFrame()
-        return results
+        worker = partial(concur.Try()(AkShareMicro.market_ohlcv), period=period,
+                         start_date=start_date, end_date=end_date, adjust=adjust)
+        config = concur.BatchConfig.thread()
+        return concur.batch_fetch(config=config,worker=worker,items=symbols)
 
     @staticmethod
     def _fetch_quarterly_em(

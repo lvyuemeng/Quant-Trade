@@ -101,7 +101,7 @@ if __name__ == "__main__":
     # market_df = market.read("601615", fresh=True)
     # print(f"market df: {market_df.columns} \n {market_df}")
     market_df = market.range_read(
-        ts_codes=cons["ts_code"].to_list(), start=start_date, end=end_date,fresh=True
+        ts_codes=cons["ts_code"].to_list(), start=start_date, end=end_date, fresh=True
     )
     print(f"market df: {market_df.columns} \n {market_df}")
 

@@ -7,7 +7,7 @@ from typing import Literal, Protocol
 
 import polars as pl
 
-from .utils import AdjustCN, DateLike, Period
+from .transform import AdjustCN, DateLike, Period
 
 type Source = Literal["akshare", "baostock"]
 

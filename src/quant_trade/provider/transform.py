@@ -12,41 +12,6 @@ type Quarter = Literal[1, 2, 3, 4]
 type AdjustCN = Literal["hfq", "qfq"]
 
 
-def try_call(
-    fetch: Callable[..., pl.DataFrame],
-    retry: int = 3,
-    sleep: float = 0.5,
-    *args: Any,
-    **kwargs: Any,
-) -> pl.DataFrame:
-    """Try calling a function that returns a DataFrame, return empty DataFrame on failure."""
-    for attempt in range(retry):
-        try:
-            df = fetch(*args, **kwargs)
-            return df
-        except Exception as e:
-            log.warning(f"Attempt {attempt + 1} failed for {args}: {e}")
-            if attempt == retry - 1:
-                log.error(f"All {retry} attempts failed for {args}.")
-                return pl.DataFrame()
-            import time
-
-            backoff = sleep * (2**attempt)
-            time.sleep(backoff)
-    return pl.DataFrame()
-
-
-def optimal_workers(n_tasks: int) -> int:
-    """Determine optimal number of workers for ThreadPoolExecutor."""
-    import os
-    
-    cpu_count = os.cpu_count() or 4
-
-    if n_tasks <= 0:
-        raise ValueError(f"n_tasks {n_tasks} must be > 0")
-    return min(cpu_count, n_tasks)
-
-
 # ────────────────────────────────────────────────
 #           Date conversion helpers
 # ────────────────────────────────────────────────

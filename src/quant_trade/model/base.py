@@ -10,7 +10,7 @@ from scipy import stats
 
 from quant_trade.config.logger import log
 from quant_trade.feature.process import CrossSection
-from quant_trade.provider.utils import DateLike, to_date
+from quant_trade.provider.transform import DateLike, to_date
 
 
 @dataclass
