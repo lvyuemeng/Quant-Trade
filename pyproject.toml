@@ -39,7 +39,6 @@ dev = [
     "pytest-cov>=5.0",
     "mypy>=1.19.1",
     "ruff>=0.14.13",
-    "taskipy>=1.14.1",
     # "types-PyYAML",
 ]
     
@@ -66,12 +65,3 @@ python_version = "3.13"
 warn_return_any = true
 warn_unused_ignores = true
 disallow_untyped_defs = true
-
-[tool.taskipy.tasks]
-test = "pytest tests/"
-test-coverage = "pytest tests/ --cov=notebooks/utils --cov-report=html"
-test-ci = "pytest tests/ --cov=notebooks/utils --cov-report=term-missing"
-lint = "ruff check notebooks/ tests/ src/"
-lint-fix = "ruff check --fix notebooks/ tests/ src/"
-format = "ruff format notebooks/ tests/ src/"
-typecheck = "mypy notebooks/ tests/ src/"

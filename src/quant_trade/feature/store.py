@@ -1,23 +1,89 @@
+from dataclasses import asdict, astuple, dataclass, fields, is_dataclass
 from datetime import date
 from functools import reduce
-from typing import Literal, cast
+from typing import Any, Final, Iterator, Literal, Protocol, Self, cast, final, runtime_checkable
 
 import polars as pl
 
 import quant_trade.provider.akshare as ak
 import quant_trade.provider.baostock as bs
-from quant_trade.feature.process import Northbound, MarginShort, Shibor
 from quant_trade.config.arctic import ArcticAdapter, ArcticDB, Lib
 from quant_trade.config.logger import log
+from quant_trade.feature.process import MarginShort, Northbound, Shibor
 from quant_trade.provider.utils import Quarter
+from quant_trade.provider.traits import Source
 
-from ..provider.traits import Source
 from .process import (
     Behavioral,
     Fundamental,
     SectorGroup,
 )
 
+def book_key[T](cls: type[T]) -> type[T]:
+    """
+    Class decorator that auto-generates BookKey implementation.
+    
+    Joins all fields with "_" to create storage key.
+    Nested BookKey objects are recursively converted.
+    """
+    if not is_dataclass(cls):
+        raise TypeError(f"{cls.__name__} must be a dataclass")
+    
+    original_repr = getattr(cls, '__repr__', None)
+    
+    def is_bookkey(obj: Any) -> bool:
+        return isinstance(obj, BookKey) if hasattr(obj, 'to_key') else False
+    
+    # Define methods
+    def to_key(self: Any) -> str:
+        parts = []
+        for field_name in self.__dataclass_fields__:
+            val = getattr(self, field_name)
+            if is_bookkey(val):
+                parts.append(val.to_key())
+            elif isinstance(val, date):
+                parts.append(val.isoformat())
+            else:
+                parts.append(str(val))
+        return "_".join(parts)
+    
+    def __iter__(self: Any) -> Iterator[Any]:
+        """Enable unpacking: year, q = book"""
+        yield from astuple(self)  
+    
+    @property  
+    def _fields(self: Any) -> tuple[str, ...]:
+        """Return field names."""
+        return tuple(f.name for f in fields(self))  
+    
+    def to_dict(self: Any) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)  
+    
+    cls.to_key = to_key  # type: ignore[attr-assign]
+    cls.__iter__ = __iter__  # type: ignore[method-assign]
+    cls._fields = _fields  # type: ignore[attr-defined]
+    cls.to_dict = to_dict  # type: ignore[attr-defined]
+    
+    return cls
+        
+@runtime_checkable
+class BookKey(Protocol):
+    """Structural trait: anything with to_key() is a valid book identifier."""
+    
+    def to_key(self) -> str: ...
+            
+
+@final
+@book_key
+@dataclass(frozen=True,slots=True)
+class QuarterBook:
+    """Year-quarter book identifier: '2024_Q1'"""
+    year: int
+    quarter: Quarter
+
+    def to_key(self) -> str:
+        return f"{self.year}_Q{self.quarter}"
 
 class AssetLib:
     """Base class for ArcticDB-backed asset data."""
@@ -42,8 +108,12 @@ class CNStockPool(AssetLib):
     REGION = "CN"
     SYMBOL = "stock"
 
-    type Book = Literal["stock_code", "industry_code", "csi500_code"]
-    type Universe = Literal["whole", "csi500"]
+    type Book = Literal["stock_code", "industry_code"]
+    type Universe = Literal["csi500"]
+
+    @staticmethod
+    def index_book(universe: Universe, date: date) -> str:
+        return f"{universe}_{date}"
 
     @staticmethod
     def _fetch_stock_code() -> pl.DataFrame:
@@ -57,44 +127,57 @@ class CNStockPool(AssetLib):
     def _fetch_csi500_code() -> pl.DataFrame:
         return bs.BaoMacro().csi500_cons()
 
-    def fresh(self, book: Book):
+    def fresh_codes(self, book: Book):
         """Ensure stock_code and industry_code exist in DB."""
         match book:
             case "stock_code":
                 df = self._fetch_stock_code()
             case "industry_code":
                 df = self._fetch_industry_code()
-            case "csi500_code":
+        log.info(f"Writing {len(df)} rows to {book}")
+        self._lib.write(book, ArcticAdapter.to_write(df))
+
+    def fresh_universe(self, date: date, universe: Universe):
+        """Fetch and store stock universe for a given date."""
+        book = self.index_book(universe, date)
+        match universe:
+            case "csi500":
                 df = self._fetch_csi500_code()
         log.info(f"Writing {len(df)} rows to {book}")
         self._lib.write(book, ArcticAdapter.to_write(df))
 
-    def read(self, book: Book, fresh: bool = False) -> pl.DataFrame:
+    def read_codes(self, book: Book, fresh: bool = False) -> pl.DataFrame:
         if fresh or not self._lib.has_symbol(book):
-            self.fresh(book)
+            self.fresh_codes(book)
         if self._lib.has_symbol(book):
             return ArcticAdapter.from_read(self._lib.read(book))
         raise KeyError(f"Symbol '{book}' not found in {self.lib_name()}")
 
-    def universe(
-        self, universe: Universe, industry_cls: bool = False, fresh: bool = False
+    def read_pool(
+        self,
+        universe: Universe,
+        date: date,
+        industry_cls: bool = False,
+        fresh: bool = False,
     ) -> pl.DataFrame:
-        match universe:
-            case "csi500":
-                df = self.read("csi500_code", fresh)
-            case "whole":
-                df = self.read("stock_code", fresh)
-        if industry_cls:
-            ind = self.read("industry_code", fresh)
-            df = df.join(ind, on="ts_code", how="inner")
-        return df
+        book = self.index_book(universe, date)
+        if fresh or not self._lib.has_symbol(book):
+            self.fresh_universe(date, universe)
+        if self._lib.has_symbol(book):
+            df = ArcticAdapter.from_read(self._lib.read(book))
+            if industry_cls:
+                ind = self.read_codes("industry_code", fresh=fresh)
+                df = df.join(ind, on="ts_code", how="inner")
+            return df
+        raise KeyError(f"Universe '{book}' not found in {self.lib_name()}")
 
 
 class CNMarket(AssetLib):
     REGION = "CN"
     SYMBOL = "market"
 
-    def __init__(self, source: Source = "baostock"):
+    def __init__(self, db: ArcticDB, source: Source = "baostock"):
+        super().__init__(db)
         self._source: Source = source
 
     def _fetch_raw(self, ts_code: str) -> pl.DataFrame:
@@ -103,6 +186,13 @@ class CNMarket(AssetLib):
                 return ak.AkShareMicro().market_ohlcv(ts_code, "daily")
             case "baostock":
                 return bs.BaoMicro().market_ohlcv(ts_code, "daily")
+
+    def _fetch_batch_raw(self, ts_codes: list[str]) -> list[pl.DataFrame]:
+        match self._source:
+            case "akshare":
+                return ak.AkShareMicro().batch_market_ohlcv(ts_codes, "daily")
+            case "baostock":
+                return bs.BaoMicro().batch_market_ohlcv(ts_codes, "daily")
 
     @staticmethod
     def _extract_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -125,6 +215,19 @@ class CNMarket(AssetLib):
         feat = self._normalize(feat)
         self._lib.write(ts_code, ArcticAdapter.to_write(feat))
 
+    def fresh_batch(self, ts_codes: list[str]) -> None:
+        log.info(
+            f"Fetching & processing market data for batch of {len(ts_codes)} stocks"
+        )
+        raw = self._fetch_batch_raw(ts_codes)
+        for code, df in zip(ts_codes, raw):
+            if df.is_empty():
+                log.warning(f"No market data for {code}")
+                continue
+            feat = self._extract_features(df)
+            feat = self._normalize(feat)
+            self._lib.write(code, ArcticAdapter.to_write(feat))
+
     def read(self, ts_code: str, fresh: bool = False) -> pl.DataFrame:
         if fresh or not self._lib.has_symbol(ts_code):
             self.fresh(ts_code)
@@ -134,15 +237,42 @@ class CNMarket(AssetLib):
 
     def batch_read(self, ts_codes: list[str], fresh: bool = False) -> pl.DataFrame:
         """Batch read multiple stocks (useful for panel construction)."""
-        frames = []
-        for ts in ts_codes:
+        to_fetch:list[str] = []
+        cached:dict[str,pl.DataFrame] = {}
+        for code in ts_codes:
+            if fresh or not self._lib.has_symbol(code):
+                to_fetch.append(code)
+                continue
             try:
-                frames.append(self.read(ts, fresh=fresh))
-            except KeyError:
-                log.warning(f"Skipping {ts} — data not available")
-        if not frames:
-            return pl.DataFrame()
-        return pl.concat(frames, how="vertical_relaxed")
+                df = ArcticAdapter.from_read(self._lib.read(code))
+                if not df.is_empty():
+                    cached[code] = df
+            except Exception as e:
+                log.warning(f"Cache read failed for {code}: {e}")
+                to_fetch.append(code)
+
+        fetched:dict[str,pl.DataFrame] = {}
+        if to_fetch:
+            frames = self._fetch_batch_raw(to_fetch)
+            for code, df in zip(to_fetch, frames):
+                if df.is_empty():
+                    continue
+                fetched[code] = df
+                try:
+                    self._lib.write(code, ArcticAdapter.to_write(df))
+                except Exception as e:
+                    log.error(f"Cache write failed for {code}: {e}")
+
+        dfs:list[pl.DataFrame] = []
+        for code in ts_codes:
+            df = fetched.get(code) or cached.get(code)
+            if df is not None:
+                dfs.append(df)
+        
+        return (
+            pl.concat(dfs, how="vertical_relaxed") if dfs else pl.DataFrame()
+        )
+
 
     def range_read(
         self, ts_codes: list[str], start: date, end: date, fresh: bool = False
@@ -293,7 +423,7 @@ class CNMacro(AssetLib):
 
 
 class CNIndustrySectorGroup(SectorGroup):
-    INDUS_COL: list[str] = ["sw_l1_code"]
+    INDUS_COL: Final[list[str]] = ["sw_l1_code"]
 
     @classmethod
     def default_fundamental_metric(cls) -> list[str]:
@@ -352,7 +482,7 @@ class CNIndustrySectorGroup(SectorGroup):
         )
 
     def __call__(self, df: pl.DataFrame, fresh: bool = False) -> pl.DataFrame:
-        self.industry_df = self.stock_pool.read("industry_code", fresh)
+        self.industry_df = self.stock_pool.read_codes("industry_code", fresh)
         required = ["ts_code"]
         missing = [c for c in required if c not in df.columns]
         if missing:

@@ -1,8 +1,10 @@
 from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Protocol
 
 import baostock as bs
 import polars as pl
+import tqdm
 
 from quant_trade.config.logger import log
 
@@ -14,7 +16,9 @@ from .utils import (
     normalize_date_column,
     normalize_ts_code,
     normalize_ts_code_str,
+    optimal_workers,
     to_ymd_str,
+    try_call,
 )
 
 
@@ -279,13 +283,16 @@ def market_ohlcv(
         )
         .rename(rename)
     )
-    has_suspended = df.select((pl.col("trade_status") == "0").any()).item()
     has_st = df.select((pl.col("is_st") == "1").any()).item()
-    if has_suspended or has_st:
+    if has_st:
         log.info(f"{code} filtered out (ST or suspended)")
         return pl.DataFrame()
+
+    ohlcv = ["open", "high", "low", "close", "volume", "turnover"]
     df = normalize_date_column(df, date_col="date").drop(["trade_status", "is_st"])
-    df = df.with_columns(normalize_ts_code("ts_code", exchange=None))
+    df = df.with_columns(normalize_ts_code("ts_code", exchange=None)).with_columns(
+        pl.col(ohlcv).replace("", None).cast(pl.Float64)
+    )
     return df
 
 
@@ -322,6 +329,61 @@ class BaoMicro:
         with BaoSession():
             df = market_ohlcv(symbol, period, start_date, end_date, adjust)
         return df
+
+    @staticmethod
+    def _worker(
+        symbol: str,
+        period: Period,
+        start_date: DateLike | None,
+        end_date: DateLike | None,
+        adjust: AdjustCN | None,
+    ) -> pl.DataFrame:
+        return try_call(
+            fetch=BaoMicro.market_ohlcv,
+            retry=3,
+            sleep=0.5,
+            symbol=symbol,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+        )
+
+    @staticmethod
+    def batch_market_ohlcv(
+        symbols: list[str],
+        period: Period,
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+        adjust: AdjustCN | None = "hfq",
+    ) -> list[pl.DataFrame]:
+        """
+        Parallel fetch OHLCV for many symbols.
+        Returns list of pl.DataFrame **in the same order** as input `codes`.
+        Empty DataFrame = no data / filtered / failed.
+        """
+        len_ = len(symbols)
+        results = [pl.DataFrame()] * len_
+        with ProcessPoolExecutor(max_workers=optimal_workers(len_)) as executor:
+            futures = {
+                executor.submit(
+                    BaoMicro._worker, symbol, period, start_date, end_date, adjust
+                ): idx
+                for idx, symbol in enumerate(symbols)
+            }
+            for future in tqdm.tqdm(
+                as_completed(futures),
+                total=len_,
+                desc="Fetching OHLCV data",
+                position=0,
+            ):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    log.error(f"Failed to fetch OHLCV for {symbols[idx]}: {e}")
+                    results[idx] = pl.DataFrame()
+        return results
 
 
 class BaoMacro:

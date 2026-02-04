@@ -42,3 +42,16 @@ marimo edit --watch notesbooks/*
 
 - `uv`
 - `git`
+- `just`
+
+# Caveat
+
+To use `BaoStock` source in batch reading, please use in **windows**:
+
+```python
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+	...
+```
+
+Due to the child processes re-importing and re-executing the entire module infinitely.
