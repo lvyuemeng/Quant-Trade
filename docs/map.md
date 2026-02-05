@@ -55,7 +55,7 @@ This specification constrains only the "target field semantics", not the naming 
   * 类型：date
   * 备注：交易日 / 统计日 / Trading day / Statistical day
 
-* **announcement_date**
+* **notice_date**
   * 含义：公告日期 / Announcement Date
   * 类型：date
   * 备注：财报或事件披露日 / Financial report or event disclosure date
@@ -86,7 +86,7 @@ This specification constrains only the "target field semantics", not the naming 
   * 含义：经营活动现金流量净额 / Net Cash Flow from Operating Activities
   * 单位：元 / CNY
 
-* **cfo_share**
+* **cfo_ratio**
   * 含义：经营性现金流占比 / Operating Cash Flow Share
   * 单位：%
   * 备注：占净现金流比例 / Proportion of net cash flow
@@ -97,7 +97,7 @@ This specification constrains only the "target field semantics", not the naming 
   * 含义：投资活动现金流量净额 / Net Cash Flow from Investing Activities
   * 单位：元 / CNY
 
-* **cfi_share**
+* **cfi_ratio**
   * 含义：投资性现金流占比 / Investing Cash Flow Share
   * 单位：%
 
@@ -107,7 +107,7 @@ This specification constrains only the "target field semantics", not the naming 
   * 含义：融资活动现金流量净额 / Net Cash Flow from Financing Activities
   * 单位：元 / CNY
 
-* **cff_share**
+* **cff_ratio**
   * 含义：融资性现金流占比 / Financing Cash Flow Share
   * 单位：%
 
@@ -471,11 +471,11 @@ Interest rate fields uniformly adopt the structure: `tenor_rate` / `tenor_change
   * 含义：营业收入 / Total Revenue
   * 单位：元 / CNY
 
-* **operating_profit**
+* **operate_profit**
   * 含义：营业利润 / Operating Profit
   * 单位：元 / CNY
 
-* **operating_cost**
+* **operate_cost**
   * 含义：营业成本 / Operating Cost
   * 单位：元 / CNY
 
@@ -483,11 +483,11 @@ Interest rate fields uniformly adopt the structure: `tenor_rate` / `tenor_change
   * 含义：净利润 / Net Profit
   * 单位：元 / CNY
 
-* **total_assets**
+* **total_asset**
   * 含义：总资产 / Total Assets
   * 单位：元 / CNY
 
-* **total_debts**
+* **total_debt**
   * 含义：总负债 / Total Debts
   * 单位：元 / CNY
 
@@ -507,11 +507,11 @@ Interest rate fields uniformly adopt the structure: `tenor_rate` / `tenor_change
   * 含义：应付账款 / Accounts Payable
   * 单位：元 / CNY
 
-* **advance_receipts**
+* **advance_receivable**
   * 含义：预收款项 / Advance Receipts
   * 单位：元 / CNY
 
-* **finance_cost**
+* **finance_expense**
   * 含义：财务费用 / Finance Cost
   * 单位：元 / CNY
 
@@ -530,10 +530,10 @@ Interest rate fields uniformly adopt the structure: `tenor_rate` / `tenor_change
   * 单位：%
   * 公式：gross_profit / total_revenue
 
-* **operating_margin**
+* **operate_margin**
   * 含义：营业利润率 / Operating Margin
   * 单位：%
-  * 公式：operating_profit / total_revenue
+  * 公式：operate_profit / total_revenue
 
 * **net_margin**
   * 含义：净利率 / Net Margin
@@ -558,11 +558,11 @@ Interest rate fields uniformly adopt the structure: `tenor_rate` / `tenor_change
   * 含义：营业收入同比增长 / Total Revenue YoY Growth
   * 单位：%
 
-* **total_assets_yoy**
+* **total_asset_yoy**
   * 含义：总资产同比增长 / Total Assets YoY Growth
   * 单位：%
 
-* **total_debts_yoy**
+* **total_debt_yoy**
   * 含义：总负债同比增长 / Total Debts YoY Growth
   * 单位：%
 
@@ -580,7 +580,7 @@ Interest rate fields uniformly adopt the structure: `tenor_rate` / `tenor_change
 * **roa**
   * 含义：总资产收益率 / Return on Assets
   * 单位：%
-  * 公式：net_profit / total_assets
+  * 公式：net_profit / total_asset
   * 备注：分母为负时返回null / Returns null when denominator is negative
 
 ## 账款周转 (Turnover)
@@ -610,24 +610,24 @@ Interest rate fields uniformly adopt the structure: `tenor_rate` / `tenor_change
   * 单位：次 / Times
   * 公式：营业总收入/[(期初流动资产+期末流动资产)/2]
 
-* **total_assets_turnover**
+* **total_asset_turnover**
   * 含义：资产周转率 / Asset Turnover
   * 单位：次 / Times
-  * 公式：total_revenue / total_assets
+  * 公式：total_revenue / total_asset
 
 ## Balance
 
-* **current_assets_to_total_assets**
+* **current_assets_to_total_asset**
   * 含义：流动资产占总资产比例 / Current Assets to Total Assets Ratio
   * 单位：比率 / Ratio
   * 公式：流动资产除以总资产
 
-* **non_current_assets_to_total_assets**
+* **non_current_assets_to_total_asset**
   * 含义：非流动资产占总资产比例 / Non-current Assets to Total Assets Ratio
   * 单位：比率 / Ratio
   * 公式：非流动资产除以总资产
 
-* **tangible_assets_to_total_assets**
+* **tangible_assets_to_total_asset**
   * 含义：有形资产占总资产比例 / Tangible Assets to Total Assets Ratio
   * 单位：比率 / Ratio
   * 公式：有形资产除以总资产
@@ -665,7 +665,7 @@ Interest rate fields uniformly adopt the structure: `tenor_rate` / `tenor_change
   * 单位：倍 / Times
   * 公式：平均总资产/平均归属于母公司的股东权益
 
-* **total_assets_turnover**
+* **total_asset_turnover**
   * 含义：总资产周转率（杜邦） / Asset Turnover (DuPont)
   * 单位：次 / Times
   * 公式：营业总收入/[(期初资产总额+期末资产总额)/2]

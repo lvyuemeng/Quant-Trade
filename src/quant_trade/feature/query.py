@@ -15,7 +15,7 @@ from typing import (
     runtime_checkable,
 )
 
-from ..provider.transform import Quarter
+from ..transform import Quarter
 
 
 def book_key[T](cls: type[T]) -> type[T]:

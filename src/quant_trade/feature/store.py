@@ -1,5 +1,5 @@
 import datetime
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from functools import reduce
 from typing import (
     ClassVar,
@@ -41,7 +41,7 @@ class BookFetcher[B: BookKey](Protocol):
 class BatchBookFetcher[B: BookKey](BookFetcher[B], Protocol):
     """Protocol for classes that can fetch data by BookKey in batch."""
 
-    def _fetch_batch_raw(self, books: Iterable[B]) -> list[pl.DataFrame]: ...
+    def _fetch_batch_raw(self, books: Sequence[B]) -> list[pl.DataFrame]: ...
 
 
 class AssetLib:
@@ -100,7 +100,7 @@ class BookLib[B: BookKey](BookFetcher[B], AssetLib):
 
 
 class BatchBookLib[B: BookKey](BatchBookFetcher[B], AssetLib):
-    def batch_fresh(self: Self, books: Iterable[B]) -> None:
+    def batch_fresh(self: Self, books: Sequence[B]) -> None:
         batch = self._fetch_batch_raw(books)
         for book, df in zip(books, batch):
             if df.is_empty():
@@ -113,39 +113,36 @@ class BatchBookLib[B: BookKey](BatchBookFetcher[B], AssetLib):
         self: Self, books: Iterable[B], *, fresh: bool = False
     ) -> list[pl.DataFrame]:
         books_list = list(books)
-        cached: dict[B, pl.DataFrame] = {}
+
+        data: dict[B, pl.DataFrame] = {}
         to_fetch: list[B] = []
 
-        for book in books_list:
-            if fresh:
-                to_fetch.append(book)
-                continue
+        # Phase 1: read cache
+        if not fresh:
+            for book in books_list:
+                df = self._try_read(book)
+                if df is not None and not df.is_empty():
+                    data[book] = df
+                else:
+                    to_fetch.append(book)
+        else:
+            to_fetch.extend(books_list)
 
-            df = self._try_read(book)
-            if df is None or df.is_empty():
-                to_fetch.append(book)
-                continue
-            else:
-                cached[book] = df
-
-        # Batch fetch missing data
-        fetched: dict[B, pl.DataFrame] = {}
+        # Phase 2: batch fetch missing
         if to_fetch:
-            frames = self._fetch_batch_raw(to_fetch)
-            for book, df in zip(to_fetch, frames):
-                if df.is_empty():
+            for book, raw in zip(to_fetch, self._fetch_batch_raw(to_fetch)):
+                if raw.is_empty():
                     continue
-                fetched[book] = df
+                df = self._process(book, raw)
+                data[book] = df
                 self._try_write(book, df)
 
-        # Merge preserving input order
-        results: list[pl.DataFrame] = []
-        for book in books_list:
-            df = fetched.get(book) or cached.get(book)
-            if df is not None and not df.is_empty():
-                results.append(df)
-
-        return results
+        # Phase 3: preserve order
+        return [
+            df
+            for book in books_list
+            if (df := data.get(book)) is not None and not df.is_empty()
+        ]
 
 
 class CNStockPool(BookLib[RecordBook]):
@@ -204,7 +201,7 @@ class CNMarket(BookLib[TickerBook], BatchBookLib[TickerBook]):
     REGION = "CN"
     SYMBOL = "market"
 
-    def __init__(self, db: ArcticDB, source: Source = "baostock"):
+    def __init__(self, db: ArcticDB, source: Source = "akshare"):
         super().__init__(db)
         self._source: Source = source
 
@@ -258,12 +255,23 @@ class CNMarket(BookLib[TickerBook], BatchBookLib[TickerBook]):
         return df
 
 
-class CNFundamental(BookLib[QuarterBook]):
+class CNFundamental(BookLib[QuarterBook], BatchBookLib[QuarterBook]):
     REGION = "CN"
     SYMBOL = "fundamental"
 
     def _fetch_raw(self, book: QuarterBook) -> pl.DataFrame:
         return ak.AkShareMicro().quarterly_fundamentals(book.year, book.literal_quarter)
+
+    def _fetch_batch_raw(self, books: Iterable[QuarterBook]) -> list[pl.DataFrame]:
+        books = list(books)
+        frames = ak.AkShareMicro().batch_quarterly_fundamentals(
+            yqs=[(book.year, book.literal_quarter) for book in books]
+        )
+        return frames
+
+    def range_fresh(self, start: datetime.date, end: datetime.date) -> None:
+        books = QuarterBook.date_range(start, end)
+        self.batch_fresh(books=list(books))
 
     @staticmethod
     def _extract_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -280,10 +288,12 @@ class CNFundamental(BookLib[QuarterBook]):
     def range_read(
         self, start: datetime.date, end: datetime.date, fresh: bool = False
     ) -> pl.DataFrame:
-        frames: list[pl.DataFrame] = []
-        for book in QuarterBook.date_range(start, end):
-            frames.append(self.read(book, fresh=fresh))
+        books = QuarterBook.date_range(start, end)
+        frames = self.batch_read(books=books, fresh=fresh)
+        if not frames:
+            return pl.DataFrame()
         return pl.concat(frames, how="vertical_relaxed")
+
 
 
 class CNMacro(BookLib[MacroBook]):
@@ -366,7 +376,7 @@ class CNIndustrySectorGroup(SectorGroup):
         return [
             # Profitability & margins (industry structure driven)
             "gross_margin",
-            "operating_margin",
+            "operate_margin",
             "net_margin",
             # Capital efficiency (very industry dependent)
             "roe",
@@ -374,7 +384,7 @@ class CNIndustrySectorGroup(SectorGroup):
             "asset_turnover",
             # Leverage & balance sheet structure
             "debt_to_equity",
-            "debt_to_assets",
+            "debt_asset_ratio",
             # Liquidity ratios (business-model specific)
             "current_ratio",
             "quick_ratio",
@@ -386,7 +396,7 @@ class CNIndustrySectorGroup(SectorGroup):
             # Growth rates (structural growth differences)
             "revenue_growth_yoy",
             "net_profit_growth_yoy",
-            "assets_growth_yoy",
+            "asset_growth_yoy",
             "debt_growth_yoy",
             # TTM profitability
             "ttm_roe",

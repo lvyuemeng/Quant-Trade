@@ -1,17 +1,13 @@
 from collections.abc import Callable
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from typing import Any, Protocol
 
 import baostock as bs
-import concurrent
 import polars as pl
-import tqdm
-
-from quant_trade.config.logger import log
 
 import quant_trade.provider.concurrent as concur
-from quant_trade.provider.transform import (
+from quant_trade.config.logger import log
+from quant_trade.transform import (
     AdjustCN,
     DateLike,
     Period,
@@ -165,7 +161,7 @@ def quarterly_operation(
         "INVTurnRatio": "inventory_turnover",  # 存货周转率
         "INVTurnDays": "inventory_turnover_days",  # 存货周转天数
         "CATurnRatio": "current_assets_turnover",  # 流动资产周转率
-        "AssetTurnRatio": "total_assets_turnover",  # 总资产周转率
+        "AssetTurnRatio": "total_asset_turnover",  # 总资产周转率
     }
     return _fetch_quarterly(
         code=code,
@@ -181,7 +177,7 @@ def quarterly_growth(
 ) -> pl.DataFrame:
     rename = {
         "YOYEquity": "equity_yoy",  # 净资产同比增长率
-        "YOYAsset": "total_assets_yoy",  # 总资产同比增长率
+        "YOYAsset": "total_asset_yoy",  # 总资产同比增长率
         "YOYNI": "net_profit_yoy",  # 净利润同比增长率
         "YOYEPSBasic": "eps_basic_yoy",  # 基本每股收益同比增长率
         "YOYPNI": "net_profit_parent_yoy",  # 归属母公司股东净利润同比增长率
@@ -198,7 +194,7 @@ def quarterly_balance(
         "currentRatio": "current_ratio",
         "quickRatio": "quick_ratio",
         "cashRatio": "cash_ratio",
-        "YOYLiability": "total_debts_yoy",
+        "YOYLiability": "total_debt_yoy",
         "liabilityToAsset": "debts_to_assets",
         "assetToEquity": "assets_to_equity",
     }
@@ -215,9 +211,9 @@ def quarterly_cashflow(
     code: str, year: int | None = None, quarter: Quarter | None = None
 ) -> pl.DataFrame:
     rename = {
-        "CAToAsset": "current_assets_to_total_assets",  # 流动资产占总资产比例
-        "NCAToAsset": "non_current_assets_to_total_assets",  # 非流动资产占总资产比例
-        "tangibleAssetToAsset": "tangible_assets_to_total_assets",  # 有形资产占总资产比例
+        "CAToAsset": "current_assets_to_total_asset",  # 流动资产占总资产比例
+        "NCAToAsset": "non_current_assets_to_total_asset",  # 非流动资产占总资产比例
+        "tangibleAssetToAsset": "tangible_assets_to_total_asset",  # 有形资产占总资产比例
         "ebitToInterest": "ebit_to_interest",  # 已获利息倍数
         "CFOToOR": "cfo_to_revenue",  # 经营活动现金流占营业收入比例
         "CFOToNP": "cfo_to_net_profit",  # 经营性现金净流量占净利润比例
@@ -239,7 +235,7 @@ def quarterly_dupont(
         # 杜邦分析指标（DuPont Analysis Metrics）
         "dupontROE": "roe",  # 净资产收益率（杜邦）
         "dupontAssetStoEquity": "assets_to_equity",  # 权益乘数
-        "dupontAssetTurn": "total_assets_turnover",  # 总资产周转率（杜邦）
+        "dupontAssetTurn": "total_asset_turnover",  # 总资产周转率（杜邦）
         "dupontPnitoni": "parent_profit_ratio",  # 归属母公司股东净利润占比
         "dupontNitogr": "net_margin",  # 净利率
         "dupontTaxBurden": "tax_burden",  # 税收负担率
@@ -344,7 +340,13 @@ class BaoMicro:
         Returns list of pl.DataFrame **in the same order** as input `codes`.
         Empty DataFrame = no data / filtered / failed.
         """
-        worker = partial(concur.Try()(BaoMicro.market_ohlcv),period=period, start_date=start_date, end_date=end_date, adjust=adjust)
+        worker = partial(
+            concur.Try()(BaoMicro.market_ohlcv),
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+        )
         config = concur.BatchConfig.process()
         return concur.batch_fetch(
             config=config,

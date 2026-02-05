@@ -1,10 +1,7 @@
-from collections.abc import Callable
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Literal
 
 import polars as pl
-
-from quant_trade.config.logger import log
 
 type DateLike = str | date | datetime
 type Period = Literal["daily", "weekly", "monthly"]
@@ -183,38 +180,37 @@ def normalize_date_column(
     *,
     target_type: Literal["date", "datetime"] = "date",
     strict: bool = False,
-    null_threshold: float = 0.7,  # fraction of non-null required
+    null_threshold: float = 0.7,
 ) -> pl.DataFrame:
-    """
-    Normalize a specific date column — column must exist.
-
-    Args:
-        df: DataFrame
-        date_col: MUST exist in df
-        target_type: "date" or "datetime"
-        strict: if True, raise on parsing failure
-    """
     if date_col not in df.columns:
-        raise ValueError(f"Column '{date_col}' not found in DataFrame")
+        raise ValueError(f"Column '{date_col}' not found")
 
     expr = pl.col(date_col)
+    dtype = df.schema[date_col]
 
-    # Already correct type?
-    if df.schema[date_col] in (pl.Date, pl.Datetime):
-        if target_type == "date" and df.schema[date_col] == pl.Datetime:
-            expr = expr.dt.date()
-        elif target_type == "datetime" and df.schema[date_col] == pl.Date:
-            expr = expr.cast(pl.Datetime)
-        return df.with_columns(expr.alias(date_col))
+    # ---- Fast path: already temporal ----
+    if dtype in (pl.Date, pl.Datetime):
+        out = expr
+        if target_type == "date" and dtype == pl.Datetime:
+            out = out.dt.date()
+        elif target_type == "datetime" and dtype == pl.Date:
+            out = out.cast(pl.Datetime)
+        return df.with_columns(out.alias(date_col))
 
-    # String → date parsing
-    if df.schema[date_col] != pl.Utf8:
+    # ---- Non-string: direct cast ----
+    if dtype != pl.Utf8:
         return df.with_columns(expr.cast(pl.Date, strict=strict).alias(date_col))
 
-    n_rows = len(df)
-    threshold = int(n_rows * null_threshold)  # non-null required
-    best_expr = expr.str.to_date(strict=strict)  # fallback
-    best_non_null = 0
+    n = len(df)
+    threshold = int(n * null_threshold)
+
+    def score(e: pl.Expr) -> int:
+        return n - df.select(e.null_count()).item()
+
+    # ---- Parse candidates (ordered, unified) ----
+    candidates: list[tuple[pl.Expr, type[pl.Date | pl.Datetime]]] = []
+
+    # Date formats
     for fmt in (
         "%Y-%m-%d",
         "%Y%m%d",
@@ -222,47 +218,43 @@ def normalize_date_column(
         "%Y.%m.%d",
         "%Y年%m月%d日",
     ):
-        candidate = expr.str.strptime(pl.Date, fmt, strict=False)
-        # Evaluate only the null count (cheap)
-        non_null = n_rows - df.select(candidate.null_count()).item()
-        if non_null > best_non_null:
-            best_non_null = non_null
-            best_expr = candidate
-        if non_null >= threshold:
+        candidates.append((expr.str.strptime(pl.Date, fmt, strict=False), pl.Date))
+
+    # Datetime formats
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ):
+        candidates.append(
+            (expr.str.strptime(pl.Datetime, fmt, strict=False), pl.Datetime)
+        )
+
+    # Last-resort auto datetime
+    candidates.append((expr.str.to_datetime(strict=False), pl.Datetime))
+
+    # ---- Select best candidate ----
+    best_expr = None
+    best_type = None
+    best_score = -1
+
+    for cand, cand_type in candidates:
+        s = score(cand)
+        if s > best_score:
+            best_expr, best_type, best_score = cand, cand_type, s
+        if s >= threshold:
             break
 
-    df = df.with_columns(best_expr.alias(date_col))
-    if target_type == "datetime":
-        df = df.with_columns(pl.col(date_col).cast(pl.Datetime, strict=strict))
+    if best_expr is None or best_score <= 0:
+        if strict:
+            raise ValueError(f"Failed to parse '{date_col}' as date/datetime")
+        return df
 
-    return df
+    # ---- Normalize output type ----
+    out = best_expr
+    if target_type == "date" and best_type == pl.Datetime:
+        out = out.dt.date()
+    elif target_type == "datetime" and best_type == pl.Date:
+        out = out.cast(pl.Datetime)
 
-
-# ────────────────────────────────────────────────
-#                   Quarter utilities
-# ────────────────────────────────────────────────
-
-
-def quarter_end(year: int, quarter: Quarter, as_ymd: bool = True) -> str:
-    """Explicit year + quarter → YYYYMMDD or YYYY-MM-DD"""
-    ends = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}
-    s = f"{year}{ends[quarter]}"
-    if not as_ymd:
-        return f"{year}-{ends[quarter][:2]}-{ends[quarter][2:]}"
-    return s
-
-
-def current_quarter_end(as_ymd: bool = True) -> str:
-    """Most recent completed quarter end (explicit — no None handling)"""
-    today = datetime.now().date()
-    year = today.year
-    month = today.month
-
-    if month <= 3:
-        return quarter_end(year - 1, 4, as_ymd)
-    elif month <= 6:
-        return quarter_end(year, 1, as_ymd)
-    elif month <= 9:
-        return quarter_end(year, 2, as_ymd)
-    else:
-        return quarter_end(year, 3, as_ymd)
+    return df.with_columns(out.alias(date_col))

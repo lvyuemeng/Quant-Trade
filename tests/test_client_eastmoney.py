@@ -1,4 +1,4 @@
-"""
+"""a
 Tests for East Money specific functionality.
 
 This file contains tests for:
@@ -13,6 +13,7 @@ This file contains tests for:
 - stock_zh_a_hist backward-compatible function
 """
 
+import datetime
 from unittest.mock import MagicMock, patch
 
 import polars as pl
@@ -29,7 +30,6 @@ from quant_trade.client.eastmoney import (
     _build_kline_params,
     _build_quarterly_date,
     _build_quarterly_params,
-    stock_zh_a_hist,
 )
 
 # =============================================================================
@@ -54,11 +54,7 @@ def sample_kline_response():
 @pytest.fixture
 def sample_kline_empty_response():
     """Sample empty kline API response."""
-    return {
-        "data": {
-            "klines": []
-        }
-    }
+    return {"data": {"klines": []}}
 
 
 @pytest.fixture
@@ -261,11 +257,15 @@ class TestReportPipe:
         assert result.height == 1
         assert "stock_code" in result.columns
 
-    def test_fetch_empty_response(self, mock_fetcher_report, sample_report_empty_response):
+    def test_fetch_empty_response(
+        self, mock_fetcher_report, sample_report_empty_response
+    ):
         """Test fetching report with empty response."""
         from quant_trade.client.eastmoney import FundemantalParser, IncomeBuilder
 
-        mock_fetcher_report.fetch_initial = MagicMock(return_value=sample_report_empty_response)
+        mock_fetcher_report.fetch_initial = MagicMock(
+            return_value=sample_report_empty_response
+        )
 
         config = ReportConfig(
             report_name="RPT_DMSK_FN_INCOME",
@@ -317,8 +317,8 @@ class TestKlinePipe:
         result = pipe.fetch(
             symbol="000001",
             period="daily",
-            start_date="20240101",
-            end_date="20240131",
+            start_date=datetime.date(2024,1,1),
+            end_date=datetime.date(2024,3,31),
         )
 
         assert isinstance(result, pl.DataFrame)
@@ -333,8 +333,8 @@ class TestKlinePipe:
         result = pipe.fetch(
             symbol="000001",
             period="weekly",
-            start_date="20240101",
-            end_date="20240331",
+            start_date=datetime.date(2024,1,1),
+            end_date=datetime.date(2024,3,31),
         )
 
         assert isinstance(result, pl.DataFrame)
@@ -346,8 +346,8 @@ class TestKlinePipe:
         result = pipe.fetch(
             symbol="000001",
             period="monthly",
-            start_date="20240101",
-            end_date="20241231",
+            start_date=datetime.date(2024,1,1),
+            end_date=datetime.date(2024,12,31),
         )
 
         assert isinstance(result, pl.DataFrame)
@@ -359,8 +359,8 @@ class TestKlinePipe:
         result = pipe.fetch(
             symbol="000001",
             period="daily",
-            start_date="20240101",
-            end_date="20240131",
+            start_date=datetime.date(2024,1,1),
+            end_date=datetime.date(2024,3,31),
             adjust="qfq",
         )
 
@@ -373,8 +373,8 @@ class TestKlinePipe:
         result = pipe.fetch(
             symbol="000001",
             period="daily",
-            start_date="20240101",
-            end_date="20240131",
+            start_date=datetime.date(2024,1,1),
+            end_date=datetime.date(2024,3,31),
             adjust="hfq",
         )
 
@@ -391,8 +391,8 @@ class TestKlinePipe:
         result = pipe.fetch(
             symbol="000001",
             period="daily",
-            start_date="20240101",
-            end_date="20240131",
+            start_date=datetime.date(2024,1,1),
+            end_date=datetime.date(2024,3,31),
         )
 
         assert isinstance(result, pl.DataFrame)
@@ -404,8 +404,8 @@ class TestKlinePipe:
         result = pipe.fetch(
             symbol="600000",
             period="daily",
-            start_date="20240101",
-            end_date="20240131",
+            start_date=datetime.date(2024,1,1),
+            end_date=datetime.date(2024,3,31),
         )
 
         assert isinstance(result, pl.DataFrame)
@@ -591,8 +591,8 @@ class TestEastMoneyStockHist:
             result = client.stock_hist(
                 symbol="000001",
                 period="daily",
-                start_date="20240101",
-                end_date="20240131",
+                start_date=datetime.date(2024,1,1),
+                end_date=datetime.date(2024,3,31),
             )
 
             assert isinstance(result, pl.DataFrame)
@@ -610,8 +610,8 @@ class TestEastMoneyStockHist:
             result = client.stock_hist(
                 symbol="000001",
                 period="weekly",
-                start_date="20240101",
-                end_date="20240331",
+                start_date=datetime.date(2024,1,1),
+                end_date=datetime.date(2024,3,31),
             )
 
             assert isinstance(result, pl.DataFrame)
@@ -626,8 +626,8 @@ class TestEastMoneyStockHist:
             result = client.stock_hist(
                 symbol="000001",
                 period="monthly",
-                start_date="20240101",
-                end_date="20241231",
+                start_date=datetime.date(2024,1,1),
+                end_date=datetime.date(2024,12,31),
             )
 
             assert isinstance(result, pl.DataFrame)
@@ -642,8 +642,8 @@ class TestEastMoneyStockHist:
             result = client.stock_hist(
                 symbol="000001",
                 period="daily",
-                start_date="20240101",
-                end_date="20240131",
+                start_date=datetime.date(2024,1,1),
+                end_date=datetime.date(2024,3,31),
                 adjust="qfq",
             )
 
@@ -659,8 +659,8 @@ class TestEastMoneyStockHist:
             result = client.stock_hist(
                 symbol="000001",
                 period="daily",
-                start_date="20240101",
-                end_date="20240131",
+                start_date=datetime.date(2024,1,1),
+                end_date=datetime.date(2024,3,31),
                 adjust="hfq",
             )
 
@@ -676,9 +676,9 @@ class TestEastMoneyStockHist:
             result = client.stock_hist(
                 symbol="000001",
                 period="daily",
-                start_date="20240101",
-                end_date="20240131",
-                adjust="",
+                start_date=datetime.date(2024,1,1),
+                end_date=datetime.date(2024,3,31),
+                adjust=None,
             )
 
             assert isinstance(result, pl.DataFrame)
@@ -693,8 +693,8 @@ class TestEastMoneyStockHist:
             result = client.stock_hist(
                 symbol="600000",
                 period="daily",
-                start_date="20240101",
-                end_date="20240131",
+                start_date=datetime.date(2024,1,1),
+                end_date=datetime.date(2024,3,31),
             )
 
             assert isinstance(result, pl.DataFrame)
@@ -709,8 +709,8 @@ class TestEastMoneyStockHist:
             result = client.stock_hist(
                 symbol="000001",
                 period="daily",
-                start_date="20240101",
-                end_date="20240131",
+                start_date=datetime.date(2024,1,1),
+                end_date=datetime.date(2024,3,31),
             )
 
             assert isinstance(result, pl.DataFrame)
@@ -729,8 +729,8 @@ class TestEastMoneyStockHist:
             result = client.stock_hist(
                 symbol="000001",
                 period="daily",
-                start_date="20240101",
-                end_date="20240131",
+                start_date=datetime.date(2024,1,1),
+                end_date=datetime.date(2024,3,31),
             )
 
             assert isinstance(result, pl.DataFrame)
@@ -775,7 +775,7 @@ class TestEastMoneyQuarterly:
             client = EastMoney()
             client._fetcher = mock_fetcher_report
 
-            result = client.quarterly_balance_sheet(2024, 1)
+            result = client.quarterly_balance(2024, 1)
 
             assert isinstance(result, pl.DataFrame)
             assert result.height == 1
@@ -793,9 +793,13 @@ class TestEastMoneyQuarterly:
             assert result.height == 1
             assert "stock_code" in result.columns
 
-    def test_quarterly_empty_response(self, mock_fetcher_report, sample_report_empty_response):
+    def test_quarterly_empty_response(
+        self, mock_fetcher_report, sample_report_empty_response
+    ):
         """Test fetching quarterly report with empty response."""
-        mock_fetcher_report.fetch_initial = MagicMock(return_value=sample_report_empty_response)
+        mock_fetcher_report.fetch_initial = MagicMock(
+            return_value=sample_report_empty_response
+        )
 
         with patch.object(EastMoneyFetch, "__init__", return_value=None):
             client = EastMoney()
@@ -812,100 +816,108 @@ class TestEastMoneyQuarterly:
 # =============================================================================
 
 
-class TestStockZhAHist:
-    """Tests for stock_zh_a_hist backward-compatible function."""
+# class TestStockZhAHist:
+#     """Tests for stock_zh_a_hist backward-compatible function."""
 
-    def test_signature(self):
-        """Test function has correct signature."""
-        import inspect
+#     def test_signature(self):
+#         """Test function has correct signature."""
+#         import inspect
 
-        sig = inspect.signature(stock_zh_a_hist)
+#         sig = inspect.signature(stock_zh_a_hist)
 
-        params = list(sig.parameters.keys())
-        assert "symbol" in params
-        assert "period" in params
-        assert "start_date" in params
-        assert "end_date" in params
-        assert "adjust" in params
-        assert "timeout" in params
-        assert "kwargs" in params
+#         params = list(sig.parameters.keys())
+#         assert "symbol" in params
+#         assert "period" in params
+#         assert "start_date" in params
+#         assert "end_date" in params
+#         assert "adjust" in params
+#         assert "timeout" in params
+#         assert "kwargs" in params
 
-    def test_default_params(self, mock_fetcher_kline):
-        """Test function with default parameters."""
-        with patch.object(EastMoneyFetch, "__init__", return_value=None):
-            with patch.object(EastMoney, "__init__", return_value=None):
-                client = MagicMock()
-                client.stock_hist = MagicMock(return_value=pl.DataFrame())
-                client.__enter__ = MagicMock(return_value=client)
-                client.__exit__ = MagicMock(return_value=None)
+#     def test_default_params(self, mock_fetcher_kline):
+#         """Test function with default parameters."""
+#         with patch.object(EastMoneyFetch, "__init__", return_value=None):
+#             with patch.object(EastMoney, "__init__", return_value=None):
+#                 client = MagicMock()
+#                 client.stock_hist = MagicMock(return_value=pl.DataFrame())
+#                 client.__enter__ = MagicMock(return_value=client)
+#                 client.__exit__ = MagicMock(return_value=None)
 
-                with patch("quant_trade.client.eastmoney.EastMoney", return_value=client):
-                    result = stock_zh_a_hist()
+#                 with patch(
+#                     "quant_trade.client.eastmoney.EastMoney", return_value=client
+#                 ):
+#                     result = stock_zh_a_hist()
 
-                    assert isinstance(result, pl.DataFrame)
+#                     assert isinstance(result, pl.DataFrame)
 
-    def test_with_custom_params(self, mock_fetcher_kline):
-        """Test function with custom parameters."""
-        with patch.object(EastMoneyFetch, "__init__", return_value=None):
-            with patch.object(EastMoney, "__init__", return_value=None):
-                client = MagicMock()
-                client.stock_hist = MagicMock(return_value=pl.DataFrame())
-                client.__enter__ = MagicMock(return_value=client)
-                client.__exit__ = MagicMock(return_value=None)
+#     def test_with_custom_params(self, mock_fetcher_kline):
+#         """Test function with custom parameters."""
+#         with patch.object(EastMoneyFetch, "__init__", return_value=None):
+#             with patch.object(EastMoney, "__init__", return_value=None):
+#                 client = MagicMock()
+#                 client.stock_hist = MagicMock(return_value=pl.DataFrame())
+#                 client.__enter__ = MagicMock(return_value=client)
+#                 client.__exit__ = MagicMock(return_value=None)
 
-                with patch("quant_trade.client.eastmoney.EastMoney", return_value=client):
-                    result = stock_zh_a_hist(
-                        symbol="600000",
-                        period="weekly",
-                        start_date="20240101",
-                        end_date="20240331",
-                        adjust="qfq",
-                    )
+#                 with patch(
+#                     "quant_trade.client.eastmoney.EastMoney", return_value=client
+#                 ):
+#                     result = stock_zh_a_hist(
+#                         symbol="600000",
+#                         period="weekly",
+#                         start_date=datetime.date(2024,1,1),
+#                         end_date=datetime.date(2024,3,31),
+#                         adjust="qfq",
+#                     )
 
-                    assert isinstance(result, pl.DataFrame)
-                    client.stock_hist.assert_called_once_with(
-                        symbol="600000",
-                        period="weekly",
-                        start_date="20240101",
-                        end_date="20240331",
-                        adjust="qfq",
-                    )
+#                     assert isinstance(result, pl.DataFrame)
+#                     client.stock_hist.assert_called_once_with(
+#                         symbol="600000",
+#                         period="weekly",
+#                         start_date=datetime.date(2024,1,1),
+#                         end_date=datetime.date(2024,3,31),
+#                         adjust="qfq",
+#                     )
 
-    def test_with_kwargs(self, mock_fetcher_kline):
-        """Test function with kwargs."""
-        with patch.object(EastMoneyFetch, "__init__", return_value=None):
-            with patch.object(EastMoney, "__init__", return_value=None):
-                client = MagicMock()
-                client.stock_hist = MagicMock(return_value=pl.DataFrame())
-                client.__enter__ = MagicMock(return_value=client)
-                client.__exit__ = MagicMock(return_value=None)
+#     def test_with_kwargs(self, mock_fetcher_kline):
+#         """Test function with kwargs."""
+#         with patch.object(EastMoneyFetch, "__init__", return_value=None):
+#             with patch.object(EastMoney, "__init__", return_value=None):
+#                 client = MagicMock()
+#                 client.stock_hist = MagicMock(return_value=pl.DataFrame())
+#                 client.__enter__ = MagicMock(return_value=client)
+#                 client.__exit__ = MagicMock(return_value=None)
 
-                with patch("quant_trade.client.eastmoney.EastMoney", return_value=client):
-                    result = stock_zh_a_hist(
-                        symbol="000001",
-                        max_workers=5,
-                        delay_range=(1.0, 2.0),
-                    )
+#                 with patch(
+#                     "quant_trade.client.eastmoney.EastMoney", return_value=client
+#                 ):
+#                     result = stock_zh_a_hist(
+#                         symbol="000001",
+#                         max_workers=5,
+#                         delay_range=(1.0, 2.0),
+#                     )
 
-                    assert isinstance(result, pl.DataFrame)
+#                     assert isinstance(result, pl.DataFrame)
 
-    def test_timeout_param_ignored(self, mock_fetcher_kline):
-        """Test that timeout parameter is accepted but not used."""
-        with patch.object(EastMoneyFetch, "__init__", return_value=None):
-            with patch.object(EastMoney, "__init__", return_value=None):
-                client = MagicMock()
-                client.stock_hist = MagicMock(return_value=pl.DataFrame())
-                client.__enter__ = MagicMock(return_value=client)
-                client.__exit__ = MagicMock(return_value=None)
+#     def test_timeout_param_ignored(self, mock_fetcher_kline):
+#         """Test that timeout parameter is accepted but not used."""
+#         with patch.object(EastMoneyFetch, "__init__", return_value=None):
+#             with patch.object(EastMoney, "__init__", return_value=None):
+#                 client = MagicMock()
+#                 client.stock_hist = MagicMock(return_value=pl.DataFrame())
+#                 client.__enter__ = MagicMock(return_value=client)
+#                 client.__exit__ = MagicMock(return_value=None)
 
-                with patch("quant_trade.client.eastmoney.EastMoney", return_value=client):
-                    result = stock_zh_a_hist(
-                        symbol="000001",
-                        timeout=30.0,
-                    )
+#                 with patch(
+#                     "quant_trade.client.eastmoney.EastMoney", return_value=client
+#                 ):
+#                     result = stock_zh_a_hist(
+#                         symbol="000001",
+#                         timeout=30.0,
+#                     )
 
-                    assert isinstance(result, pl.DataFrame)
-                    # timeout should not be passed to stock_hist
-                    client.stock_hist.assert_called_once()
-                    call_kwargs = client.stock_hist.call_args.kwargs
-                    assert "timeout" not in call_kwargs
+#                     assert isinstance(result, pl.DataFrame)
+#                     # timeout should not be passed to stock_hist
+#                     client.stock_hist.assert_called_once()
+#                     call_kwargs = client.stock_hist.call_args.kwargs
+#                     assert "timeout" not in call_kwargs

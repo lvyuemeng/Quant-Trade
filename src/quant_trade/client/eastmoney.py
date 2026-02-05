@@ -12,30 +12,28 @@ Architecture:
 Uses generic traits from trait.py for reusable patterns.
 """
 
-import random
-import time
+import datetime
 from dataclasses import dataclass
 from typing import Final
-import warnings
 
 import polars as pl
 
-warnings.filterwarnings(action="ignore", category=FutureWarning)
-
-# Import protocols and base classes from trait.py
-from .trait import (
+from quant_trade.client.traits import (
     BaseBuilder,
     BaseFetch,
     BaseParser,
     ColumnSpec,
 )
+from quant_trade.config.logger import log
+
+from ..transform import AdjustCN, Period
 
 # =============================================================================
 # Constants
 # =============================================================================
 
-EAST_MONEY_API_URL: Final[str] = "https://datacenter-web.eastmoney.com/api/data/v1/get"
-KLINE_API_URL: Final[str] = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+EASTMONEY_FINANCE_API: Final[str] = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+EASTMONEY_KLINE_API: Final[str] = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 
 # =============================================================================
 # Helper Functions
@@ -100,14 +98,10 @@ def _build_kline_params(
     Returns:
         Tuple of (secid, params_dict)
     """
-    # Determine market code
     market_code = 1 if symbol.startswith("6") else 0
-
-    # Build parameter mappings
     adjust_dict = {"qfq": "1", "hfq": "2", "": "0"}
     period_dict = {"daily": "101", "weekly": "102", "monthly": "103"}
 
-    # Build params
     params = {
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
@@ -139,7 +133,7 @@ class EastMoneyFetch(BaseFetch):
     """
 
     # User agents for rotation
-    USER_AGENTS = [
+    USER_AGENTS: list[str] = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/2010",
@@ -191,7 +185,9 @@ class FundemantalParser(BaseParser):
         if not data:
             return pl.DataFrame()
 
-        df = pl.DataFrame(data)
+        # Use infer_schema_length=None to scan all rows for proper type inference
+        # This prevents issues with large numeric values causing overflow
+        df = pl.DataFrame(data, infer_schema_length=None)
         return df
 
 
@@ -224,9 +220,17 @@ class KlineParser(BaseParser):
 
         # Parse comma-separated strings into dictionaries
         column_names = [
-            "date", "open", "close", "high", "low",
-            "volume", "amount", "amplitude", "change_pct",
-            "change_amt", "turnover"
+            "date",
+            "open",
+            "close",
+            "high",
+            "low",
+            "volume",
+            "amount",
+            "amplitude",
+            "change_pct",
+            "change_amt",
+            "turnover",
         ]
 
         data = []
@@ -250,38 +254,43 @@ class IncomeBuilder(BaseBuilder):
     """
 
     COLUMN_SPECS = [
-        ColumnSpec("SECURITY_CODE", "stock_code"),
-        ColumnSpec("SECURITY_NAME_ABBR", "stock_name"),
+        ColumnSpec("SECURITY_CODE", "ts_code"),
+        ColumnSpec("SECURITY_NAME_ABBR", "name"),
         ColumnSpec("NOTICE_DATE", "notice_date"),
-        ColumnSpec("NETPROFIT", "net_profit", pl.Float64),
-        ColumnSpec("TOTAL_OPERATE_INCOME", "total_operate_income", pl.Float64),
-        ColumnSpec("TOTAL_OPERATE_COST", "total_operate_cost", pl.Float64),
+        ColumnSpec("PARENT_NETPROFIT", "net_profit", pl.Float64),
+        ColumnSpec("PARENT_NETPROFIT_RATIO", "net_profit_yoy", pl.Float64),
+        ColumnSpec("TOTAL_OPERATE_INCOME", "total_revenue", pl.Float64),
+        ColumnSpec("TOI_RATIO", "total_revenue_yoy", pl.Float64),
+        ColumnSpec("TOTAL_OPERATE_COST", "total_cost", pl.Float64),
+        ColumnSpec("TOE_RATIO", "total_cost_yoy", pl.Float64),
         ColumnSpec("OPERATE_COST", "operate_cost", pl.Float64),
+        ColumnSpec("OPERATE_EXPENSE", "operate_expense", pl.Float64),
+        ColumnSpec("OPERATE_EXPENSE_RATIO", "operate_expense_ratio", pl.Float64),
         ColumnSpec("SALE_EXPENSE", "sale_expense", pl.Float64),
         ColumnSpec("MANAGE_EXPENSE", "manage_expense", pl.Float64),
         ColumnSpec("FINANCE_EXPENSE", "finance_expense", pl.Float64),
         ColumnSpec("OPERATE_PROFIT", "operate_profit", pl.Float64),
         ColumnSpec("TOTAL_PROFIT", "total_profit", pl.Float64),
-        ColumnSpec("TOTAL_OPERATE_INCOME_SQ", "total_operate_income_yoy", pl.Float64),
-        ColumnSpec("NETPROFIT_SQ", "net_profit_yoy", pl.Float64),
     ]
 
     OUTPUT_ORDER = [
-        "seq",
-        "stock_code",
-        "stock_name",
+        "ts_code",
+        "name",
+        "notice_date",
+        "total_profit",
         "net_profit",
         "net_profit_yoy",
-        "total_operate_income",
-        "total_operate_income_yoy",
+        "operate_profit",
+        "total_revenue",
+        "total_revenue_yoy",
+        "total_cost",
+        "total_cost_yoy",
         "operate_cost",
+        "operate_expense",
+        "operate_expense_ratio",
         "sale_expense",
         "manage_expense",
         "finance_expense",
-        "total_operate_cost",
-        "operate_profit",
-        "total_profit",
-        "notice_date",
     ]
 
     DATE_COL = "notice_date"
@@ -295,36 +304,37 @@ class BalanceSheetBuilder(BaseBuilder):
     """
 
     COLUMN_SPECS = [
-        ColumnSpec("SECURITY_CODE", "stock_code"),
-        ColumnSpec("SECURITY_NAME_ABBR", "stock_name"),
+        ColumnSpec("SECURITY_CODE", "ts_code"),
+        ColumnSpec("SECURITY_NAME_ABBR", "name"),
         ColumnSpec("NOTICE_DATE", "notice_date"),
-        ColumnSpec("TOTAL_ASSETS", "total_assets", pl.Float64),
-        ColumnSpec("MONETARY_CAPITAL", "monetary_capital", pl.Float64),
-        ColumnSpec("ACCOUNTS_RECEIVABLE", "accounts_receivable", pl.Float64),
+        ColumnSpec("TOTAL_ASSETS", "total_asset", pl.Float64),
+        ColumnSpec("TOTAL_ASSETS_RATIO", "total_asset_yoy", pl.Float64),
+        ColumnSpec("MONETARYFUNDS", "cash", pl.Float64),
+        ColumnSpec("ACCOUNTS_RECE", "accounts_receivable", pl.Float64),
         ColumnSpec("INVENTORY", "inventory", pl.Float64),
-        ColumnSpec("TOTAL_LIABILITIES", "total_liabilities", pl.Float64),
+        ColumnSpec("TOTAL_LIABILITIES", "total_debt", pl.Float64),
+        ColumnSpec("TOTAL_LIAB_RATIO", "total_debt_yoy", pl.Float64),
         ColumnSpec("ACCOUNTS_PAYABLE", "accounts_payable", pl.Float64),
-        ColumnSpec("ADVANCE_RECEIPTS", "advance_receipts", pl.Float64),
+        ColumnSpec("ADVANCE_RECEIVABLES", "advance_receivable", pl.Float64),
         ColumnSpec("TOTAL_EQUITY", "total_equity", pl.Float64),
-        ColumnSpec("TOTAL_ASSETS_YOY", "total_assets_yoy", pl.Float64),
-        ColumnSpec("TOTAL_LIABILITIES_YOY", "total_liabilities_yoy", pl.Float64),
         ColumnSpec("DEBT_ASSET_RATIO", "debt_asset_ratio", pl.Float64),
+        ColumnSpec("CURRENT_RATIO", "current_ratio", pl.Float64),
     ]
 
     OUTPUT_ORDER = [
-        "seq",
-        "stock_code",
-        "stock_name",
-        "total_assets",
-        "total_assets_yoy",
-        "monetary_capital",
+        "ts_code",
+        "name",
+        "total_asset",
+        "total_asset_yoy",
+        "cash",
         "accounts_receivable",
         "inventory",
-        "total_liabilities",
-        "total_liabilities_yoy",
+        "total_debt",
+        "total_debt_yoy",
         "accounts_payable",
-        "advance_receipts",
+        "advance_receivable",
         "debt_asset_ratio",
+        "current_ratio",
         "total_equity",
         "notice_date",
     ]
@@ -340,31 +350,30 @@ class CashFlowBuilder(BaseBuilder):
     """
 
     COLUMN_SPECS = [
-        ColumnSpec("SECURITY_CODE", "stock_code"),
-        ColumnSpec("SECURITY_NAME_ABBR", "stock_name"),
+        ColumnSpec("SECURITY_CODE", "ts_code"),
+        ColumnSpec("SECURITY_NAME_ABBR", "name"),
         ColumnSpec("NOTICE_DATE", "notice_date"),
-        ColumnSpec("NET_CASH_FLOW", "net_cash_flow", pl.Float64),
-        ColumnSpec("NET_CASH_FLOW_YOY", "net_cash_flow_yoy", pl.Float64),
-        ColumnSpec("OPERATE_CASH_FLOW", "operate_cash_flow", pl.Float64),
-        ColumnSpec("OPERATE_CASH_FLOW_RATIO", "operate_cash_flow_ratio", pl.Float64),
-        ColumnSpec("INVEST_CASH_FLOW", "invest_cash_flow", pl.Float64),
-        ColumnSpec("INVEST_CASH_FLOW_RATIO", "invest_cash_flow_ratio", pl.Float64),
-        ColumnSpec("FINANCE_CASH_FLOW", "finance_cash_flow", pl.Float64),
-        ColumnSpec("FINANCE_CASH_FLOW_RATIO", "finance_cash_flow_ratio", pl.Float64),
+        ColumnSpec("NETCASH_OPERATE", "net_cashflow", pl.Float64),
+        ColumnSpec("NETCASH_OPERATE_RATIO", "net_cashflow_yoy", pl.Float64),
+        ColumnSpec("SALES_SERVICES", "cfo", pl.Float64),
+        ColumnSpec("SALES_SERVICES_RATIO", "cfo_ratio", pl.Float64),
+        ColumnSpec("NETCASH_INVEST", "cfi", pl.Float64),
+        ColumnSpec("NETCASH_INVEST_RATIO", "cfi_ratio", pl.Float64),
+        ColumnSpec("NETCASH_FINANCE", "cff", pl.Float64),
+        ColumnSpec("NETCASH_FINANCE_RATIO", "cff_ratio", pl.Float64),
     ]
 
     OUTPUT_ORDER = [
-        "seq",
-        "stock_code",
-        "stock_name",
-        "net_cash_flow",
-        "net_cash_flow_yoy",
-        "operate_cash_flow",
-        "operate_cash_flow_ratio",
-        "invest_cash_flow",
-        "invest_cash_flow_ratio",
-        "finance_cash_flow",
-        "finance_cash_flow_ratio",
+        "ts_code",
+        "name",
+        "net_cashflow",
+        "net_cashflow_yoy",
+        "cfo",
+        "cfo_ratio",
+        "cfi",
+        "cfi_ratio",
+        "cff",
+        "cff_ratio",
         "notice_date",
     ]
 
@@ -394,7 +403,7 @@ class KlineBuilder(BaseBuilder):
 
     OUTPUT_ORDER = [
         "date",
-        "stock_code",
+        "ts_code",
         "open",
         "close",
         "high",
@@ -408,7 +417,7 @@ class KlineBuilder(BaseBuilder):
     ]
 
     DATE_COL = "date"
-    DUPLICATE_COLS = ("stock_code", "date")
+    DUPLICATE_COLS = ("ts_code", "date")
 
 
 # =============================================================================
@@ -431,7 +440,7 @@ class ReportConfig:
     report_name: str
     parser_class: type[BaseParser]
     builder_class: type[BaseBuilder]
-    url: str = EAST_MONEY_API_URL
+    url: str = EASTMONEY_FINANCE_API
 
 
 # =============================================================================
@@ -529,11 +538,11 @@ class KlinePipe:
 
     def fetch(
         self,
-        symbol: str = "000001",
-        period: str = "daily",
-        start_date: str = "19700101",
-        end_date: str = "20500101",
-        adjust: str = "",
+        symbol: str,
+        period: Period,
+        start_date: datetime.date,
+        end_date: datetime.date,
+        adjust: AdjustCN | None,
     ) -> pl.DataFrame:
         """
         Fetch stock historical data (kline).
@@ -549,24 +558,23 @@ class KlinePipe:
             Polars DataFrame with historical stock data
         """
         # Build params
-        secid, params = _build_kline_params(symbol, period, start_date, end_date, adjust)
+        start_date_str = start_date.strftime("%Y%m%d")
+        end_date_str = end_date.strftime("%Y%m%d")
+        secid, params = _build_kline_params(
+            symbol, period, start_date_str, end_date_str, adjust if adjust else ""
+        )
 
         # Fetch data
-        raw = self._fetcher.fetch_initial(KLINE_API_URL, params)
+        raw = self._fetcher.fetch_initial(EASTMONEY_KLINE_API, params)
 
         # Parse using KlineParser
         parser = KlineParser()
         data = parser.parse(raw)
         if not data:
             return pl.DataFrame()
-
-        # Build DataFrame
         df = parser.clean(data)
+        df = df.with_columns(pl.lit(symbol).alias("ts_code"))
 
-        # Add stock_code column
-        df = df.with_columns(pl.lit(symbol).alias("stock_code"))
-
-        # Apply builder transformations
         builder = KlineBuilder()
         df = builder.normalize(df)
 
@@ -639,10 +647,11 @@ class EastMoney:
         Returns:
             Polars DataFrame with income statement data
         """
+        log.info(f"Fetching quarterly income for {year} Q{quarter}")
         pipe = ReportPipe(self._fetcher, self._income_config)
         return pipe.fetch(year, quarter)
 
-    def quarterly_balance_sheet(self, year: int, quarter: int) -> pl.DataFrame:
+    def quarterly_balance(self, year: int, quarter: int) -> pl.DataFrame:
         """
         Fetch quarterly balance sheet data.
 
@@ -653,6 +662,7 @@ class EastMoney:
         Returns:
             Polars DataFrame with balance sheet data
         """
+        log.info(f"Fetching quarterly balance for {year} Q{quarter}")
         pipe = ReportPipe(self._fetcher, self._balance_config)
         return pipe.fetch(year, quarter)
 
@@ -667,16 +677,17 @@ class EastMoney:
         Returns:
             Polars DataFrame with cash flow data
         """
+        log.info(f"Fetching quarterly cashflow for {year} Q{quarter}")
         pipe = ReportPipe(self._fetcher, self._cashflow_config)
         return pipe.fetch(year, quarter)
 
     def stock_hist(
         self,
-        symbol: str = "000001",
-        period: str = "daily",
-        start_date: str = "19700101",
-        end_date: str = "20500101",
-        adjust: str = "",
+        symbol: str,
+        period: Period = "daily",
+        start_date: datetime.date | None = None ,
+        end_date: datetime.date | None = None,
+        adjust: AdjustCN | None = "hfq",
     ) -> pl.DataFrame:
         """
         Fetch stock historical data (kline).
@@ -691,7 +702,12 @@ class EastMoney:
         Returns:
             Polars DataFrame with historical stock data
         """
+        log.info(f"Fetching stock historical data for {symbol}")
         pipe = KlinePipe(self._fetcher)
+        if start_date is None:
+            start_date = datetime.date(1970, 1, 1) 
+        if end_date is None:
+            end_date = datetime.date(2050, 1, 1)
         return pipe.fetch(symbol, period, start_date, end_date, adjust)
 
     def close(self) -> None:
@@ -703,174 +719,3 @@ class EastMoney:
 
     def __exit__(self, *args) -> None:
         self.close()
-
-
-# =============================================================================
-# Backward Compatibility
-# =============================================================================
-
-
-def stock_lrb_em(date: str = "20240331", **kwargs) -> pl.DataFrame:
-    """
-    East Money Income Statement (Backward Compatible).
-
-    Args:
-        date: Report date in format "YYYYMMDD"
-        max_workers: Concurrent workers (default: 3)
-        delay_range: (min, max) delay between requests (default: 0.5-1.5)
-
-    Returns:
-        Polars DataFrame (was pandas in original)
-    """
-    # Parse date
-    year = int(date[:4])
-    month = int(date[4:6])
-    quarter = (month - 1) // 3 + 1
-
-    # Extract kwargs
-    max_workers = kwargs.get("max_workers", 3)
-    delay_range = kwargs.get("delay_range", (0.5, 1.5))
-
-    # Use context manager
-    with EastMoney(
-        delay_range=delay_range,
-        max_workers=max_workers,
-    ) as client:
-        return client.quarterly_income(year, quarter)
-
-
-def stock_lrb_em_batch(
-    dates: list[str],
-    max_workers: int = 3,
-    delay_range: tuple[float, float] = (0.5, 1.5),
-) -> dict[str, pl.DataFrame]:
-    """
-    Fetch multiple dates with adaptive rate limiting.
-
-    Args:
-        dates: List of date strings ["20240331", "20240630", ...]
-        max_workers: Concurrent workers per request
-        delay_range: (min, max) delay between pages
-
-    Returns:
-        Dictionary mapping date to DataFrame
-    """
-    results = {}
-
-    for i, date in enumerate(dates):
-        print(f"\nFetching {date} ({i + 1}/{len(dates)})...")
-        try:
-            # Add longer delay between different dates
-            if i > 0:
-                time.sleep(random.uniform(2, 4))
-
-            with EastMoney(delay_range=delay_range, max_workers=max_workers) as client:
-                year = int(date[:4])
-                month = int(date[4:6])
-                quarter = (month - 1) // 3 + 1
-                results[date] = client.quarterly_income(year, quarter)
-        except Exception as e:
-            print(f"Failed to fetch {date}: {e}")
-            results[date] = pl.DataFrame()
-
-    return results
-
-
-def stock_zcfz_em(date: str = "20240331", **kwargs) -> pl.DataFrame:
-    """
-    East Money Balance Sheet (Backward Compatible).
-
-    Args:
-        date: Report date in format "YYYYMMDD"
-        max_workers: Concurrent workers (default: 3)
-        delay_range: (min, max) delay between requests (default: 0.5-1.5)
-
-    Returns:
-        Polars DataFrame (was pandas in original)
-    """
-    # Parse date
-    year = int(date[:4])
-    month = int(date[4:6])
-    quarter = (month - 1) // 3 + 1
-
-    # Extract kwargs
-    max_workers = kwargs.get("max_workers", 3)
-    delay_range = kwargs.get("delay_range", (0.5, 1.5))
-
-    # Use context manager
-    with EastMoney(
-        delay_range=delay_range,
-        max_workers=max_workers,
-    ) as client:
-        return client.quarterly_balance_sheet(year, quarter)
-
-
-def stock_xjll_em(date: str = "20240331", **kwargs) -> pl.DataFrame:
-    """
-    East Money Cash Flow Statement (Backward Compatible).
-
-    Args:
-        date: Report date in format "YYYYMMDD"
-        max_workers: Concurrent workers (default: 3)
-        delay_range: (min, max) delay between requests (default: 0.5-1.5)
-
-    Returns:
-        Polars DataFrame (was pandas in original)
-    """
-    # Parse date
-    year = int(date[:4])
-    month = int(date[4:6])
-    quarter = (month - 1) // 3 + 1
-
-    # Extract kwargs
-    max_workers = kwargs.get("max_workers", 3)
-    delay_range = kwargs.get("delay_range", (0.5, 1.5))
-
-    # Use context manager
-    with EastMoney(
-        delay_range=delay_range,
-        max_workers=max_workers,
-    ) as client:
-        return client.quarterly_cashflow(year, quarter)
-
-
-def stock_zh_a_hist(
-    symbol: str = "000001",
-    period: str = "daily",
-    start_date: str = "19700101",
-    end_date: str = "20500101",
-    adjust: str = "",
-    timeout: float | None = None,
-    **kwargs
-) -> pl.DataFrame:
-    """
-    East Money Stock Historical Data (Backward Compatible).
-
-    Args:
-        symbol: Stock code (e.g., "000001")
-        period: "daily", "weekly", or "monthly"
-        start_date: Start date in "YYYYMMDD" format
-        end_date: End date in "YYYYMMDD" format
-        adjust: "" (no adjustment), "qfq" (forward), "hfq" (backward)
-        timeout: Timeout value (not used, kept for compatibility)
-        **kwargs: Additional arguments (max_workers, delay_range)
-
-    Returns:
-        Polars DataFrame with historical stock data
-    """
-    # Extract kwargs
-    max_workers = kwargs.get("max_workers", 3)
-    delay_range = kwargs.get("delay_range", (0.5, 1.5))
-
-    # Use context manager
-    with EastMoney(
-        delay_range=delay_range,
-        max_workers=max_workers,
-    ) as client:
-        return client.stock_hist(
-            symbol=symbol,
-            period=period,
-            start_date=start_date,
-            end_date=end_date,
-            adjust=adjust,
-        )

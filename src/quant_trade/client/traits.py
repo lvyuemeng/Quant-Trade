@@ -37,6 +37,9 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from quant_trade.config.logger import log
+from quant_trade.transform import normalize_date_column
+
 # =============================================================================
 # Protocols - Duck Typing Interfaces
 # =============================================================================
@@ -163,7 +166,7 @@ class BaseFetch:
         return {
             "User-Agent": random.choice(self.USER_AGENTS),
             "Accept": "application/json, text/plain, */*",
-            "Accept-Encoding": "gzip, deflate, br",
+            # "Accept-Encoding": "gzip, deflate, br",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Connection": "keep-alive",
         }
@@ -306,7 +309,9 @@ class BaseParser:
         if not data:
             return pl.DataFrame()
 
-        return pl.DataFrame(data)
+        # Use infer_schema_length=None to scan all rows for proper type inference
+        # This prevents issues with large numeric values causing overflow
+        return pl.DataFrame(data, infer_schema_length=None)
 
 
 @dataclass
@@ -383,6 +388,7 @@ class BaseBuilder:
         Returns:
             DataFrame with renamed columns
         """
+        log.debug(f"Renaming columns using mapping: {self.COLUMN_MAPPING}")
         rename_map = {k: v for k, v in self.COLUMN_MAPPING.items() if k in df.columns}
         return df.rename(rename_map)
 
@@ -399,19 +405,15 @@ class BaseBuilder:
         Returns:
             DataFrame with converted types
         """
+        log.debug(
+            f"Converting types for columns: {self.NUMERIC_COLS} and date column: {self.DATE_COL}"
+        )
         result = df
-
-        # Convert numeric columns
         for col in self.NUMERIC_COLS:
             if col in result.columns:
                 result = result.with_columns(pl.col(col).cast(pl.Float64, strict=False))
-
-        # Convert date column
         if self.DATE_COL and self.DATE_COL in result.columns:
-            result = result.with_columns(
-                pl.col(self.DATE_COL).str.to_date(strict=False)
-            )
-
+            result = normalize_date_column(result, self.DATE_COL)
         return result
 
     def reorder(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -456,7 +458,7 @@ class BaseBuilder:
         if cols:
             return df.unique(subset=cols)
         return df
-    
+
     def normalize(self, df: pl.DataFrame) -> pl.DataFrame:
         """
         Apply full normalization: rename, convert types, deduplicate, reorder.
@@ -467,10 +469,12 @@ class BaseBuilder:
         Returns:
             Normalized DataFrame
         """
+        log.debug(f"Normalizing df columns: {df.columns}")
         result = self.rename(df)
         result = self.convert_types(result)
         result = self.deduplicate(result)
         result = self.reorder(result)
+        log.debug(f"Normalized df columns: {result.columns}")
         return result
 
 
@@ -568,7 +572,6 @@ class DataPipe:
         df = self.builder.rename(df)
         df = self.builder.convert_types(df)
         df = self.builder.reorder(df)
-
         return df
 
     def __enter__(self) -> "DataPipe":

@@ -27,7 +27,7 @@ class Fundamental:
     All monetary values in CNY yuan, growth rates as decimal (0.25 = 25%).
     """
 
-    IDENT_COLS = ["ts_code", "name", "announcement_date"]
+    IDENT_COLS = ["ts_code", "name", "notice_date"]
 
     @staticmethod
     def _safe_div(
@@ -61,37 +61,59 @@ class Fundamental:
     def quality(df: pl.DataFrame) -> pl.DataFrame:
         """Profitability, margins, efficiency"""
         log.info("Computing quality / profitability metrics")
-        return (
-            df.with_columns(
-                gross_profit=pl.col("total_revenue") - pl.col("operating_cost"),
-            )
-            .with_columns(
-                Fundamental._safe_div("gross_profit", "total_revenue", "gross_margin"),
-                Fundamental._safe_div(
-                    "operating_profit", "total_revenue", "operating_margin"
-                ),
-                Fundamental._safe_div("net_profit", "total_revenue", "net_margin"),
-                Fundamental._safe_div(
-                    "net_profit", "total_equity", "roe", handle_neg_den="null"
-                ),
-                Fundamental._safe_div(
-                    "net_profit", "total_assets", "roa", handle_neg_den="null"
-                ),
-                Fundamental._safe_div(
-                    "total_revenue", "total_assets", "asset_turnover"
-                ),
-            )
-            .select(
-                *Fundamental.IDENT_COLS,
-                cs.starts_with(
-                    "gross_margin",
-                    "operating_margin",
-                    "net_margin",
-                    "roe",
-                    "roa",
-                    "asset_turnover",
-                ),
-            )
+
+        return df.with_columns(
+            # Gross profit
+            (pl.col("total_revenue") - pl.col("operate_cost")).alias("gross_profit"),
+            # Margins
+            Fundamental._safe_div(
+                pl.col("total_revenue") - pl.col("operate_cost"),
+                pl.col("total_revenue"),
+                "gross_margin",
+                fill_null=float("nan"),
+            ),
+            Fundamental._safe_div(
+                "operate_profit",
+                "total_revenue",
+                "operate_margin",
+                fill_null=float("nan"),
+            ),
+            Fundamental._safe_div(
+                "net_profit",
+                "total_revenue",
+                "net_margin",
+                fill_null=float("nan"),
+            ),
+            # Returns
+            Fundamental._safe_div(
+                "net_profit",
+                "total_equity",
+                "roe",
+                handle_neg_den="null",
+                fill_null=float("nan"),
+            ),
+            Fundamental._safe_div(
+                "net_profit",
+                "total_asset",
+                "roa",
+                handle_neg_den="null",
+                fill_null=float("nan"),
+            ),
+            # Efficiency
+            Fundamental._safe_div(
+                "total_revenue",
+                "total_asset",
+                "asset_turnover",
+                fill_null=float("nan"),
+            ),
+        ).select(
+            *Fundamental.IDENT_COLS,
+            "gross_margin",
+            "operate_margin",
+            "net_margin",
+            "roe",
+            "roa",
+            "asset_turnover",
         )
 
     @staticmethod
@@ -104,17 +126,17 @@ class Fundamental:
                 + pl.col("accounts_receivable")
                 + pl.col("inventory"),
                 current_liabilities=pl.col("accounts_payable")
-                + pl.col("advance_receipts"),
+                + pl.col("advance_receivable"),
             )
             .with_columns(
                 Fundamental._safe_div(
-                    "total_debts",
-                    "total_assets",
-                    "debt_to_assets",
+                    "total_debt",
+                    "total_asset",
+                    "debt_asset_ratio",
                     handle_neg_den="null",
                 ),
                 Fundamental._safe_div(
-                    "total_debts",
+                    "total_debt",
                     "total_equity",
                     "debt_to_equity",
                     handle_neg_den="null",
@@ -132,12 +154,15 @@ class Fundamental:
                     handle_neg_den="abs",
                 ),
                 Fundamental._safe_div(
-                    "operating_profit", "finance_cost", "interest_coverage", min_den=1.0
+                    "operate_profit",
+                    "finance_expense",
+                    "interest_coverage",
+                    min_den=1.0,
                 ),
             )
             .select(
                 *Fundamental.IDENT_COLS,
-                "debt_to_assets",
+                "debt_asset_ratio",
                 "debt_to_equity",
                 "current_ratio",
                 "quick_ratio",
@@ -152,8 +177,8 @@ class Fundamental:
         return df.with_columns(
             revenue_growth_yoy=pl.col("total_revenue_yoy") / 100.0,
             net_profit_growth_yoy=pl.col("net_profit_yoy") / 100.0,
-            assets_growth_yoy=pl.col("total_assets_yoy") / 100.0,
-            debt_growth_yoy=pl.col("total_debts_yoy") / 100.0,
+            asset_growth_yoy=pl.col("total_asset_yoy") / 100.0,
+            debt_growth_yoy=pl.col("total_debt_yoy") / 100.0,
             profit_growth_premium=(
                 pl.col("net_profit_yoy") - pl.col("total_revenue_yoy")
             )
@@ -168,7 +193,7 @@ class Fundamental:
             *Fundamental.IDENT_COLS,
             "revenue_growth_yoy",
             "net_profit_growth_yoy",
-            "assets_growth_yoy",
+            "asset_growth_yoy",
             "debt_growth_yoy",
             "profit_growth_premium",
             "roe_last",
@@ -190,8 +215,8 @@ class Fundamental:
                 Fundamental._safe_div(
                     "fcf_proxy", "net_profit", "fcf_to_net_profit", fill_null=0
                 ),
-                Fundamental._safe_div("cfo", "total_assets", "cfo_yield"),
-                Fundamental._safe_div("accrual", "total_assets", "accrual_ratio"),
+                Fundamental._safe_div("cfo", "total_asset", "cfo_yield"),
+                Fundamental._safe_div("accrual", "total_asset", "accrual_ratio"),
             )
             .select(
                 *Fundamental.IDENT_COLS,
@@ -207,28 +232,28 @@ class Fundamental:
     def rolling_ttm(df: pl.DataFrame, min_periods: int = 3) -> pl.DataFrame:
         """
         Compute trailing twelve months (TTM) aggregates and momentum.
-        Assumes df is sorted by ['ts_code', 'announcement_date'].
+        Assumes df is sorted by ['ts_code', 'notice_date'].
         Uses group_by_dynamic with 4-quarter window.
         """
         log.info(f"Computing TTM rolling metrics (min_periods={min_periods})")
 
-        if "announcement_date" not in df.columns:
-            raise ValueError("announcement_date column missing — cannot compute TTM")
+        if "notice_date" not in df.columns:
+            raise ValueError("notice_date column missing — cannot compute TTM")
 
         if "report_period" in df.columns:
-            df = df.sort(["ts_code", "report_period", "announcement_date"]).unique(
+            df = df.sort(["ts_code", "report_period", "notice_date"]).unique(
                 subset=["ts_code", "report_period"], keep="last"
             )
         else:
-            df = df.sort(["ts_code", "announcement_date"]).unique(
-                subset=["ts_code", "announcement_date"], keep="last"
+            df = df.sort(["ts_code", "notice_date"]).unique(
+                subset=["ts_code", "notice_date"], keep="last"
             )
 
-        df = df.sort(["ts_code", "announcement_date"])
+        df = df.sort(["ts_code", "notice_date"])
 
         ttm_agg = (
             df.group_by_dynamic(
-                index_column="announcement_date",
+                index_column="notice_date",
                 every="1q",
                 period="4q",
                 offset="-3q",
@@ -242,11 +267,11 @@ class Fundamental:
                 ttm_cfo=pl.col("cfo").sum(),
                 ttm_fcf=(pl.col("cfo") + pl.col("cfi")).sum(),
                 latest_equity=pl.col("total_equity").last(),
-                latest_assets=pl.col("total_assets").last(),
+                latest_assets=pl.col("total_asset").last(),
                 count=pl.len(),
             )
             .filter(pl.col("count") >= min_periods)
-            .sort(["ts_code", "announcement_date"])
+            .sort(["ts_code", "notice_date"])
         )
 
         ttm_agg = ttm_agg.with_columns(
@@ -264,7 +289,7 @@ class Fundamental:
 
         return ttm_agg.select(
             "ts_code",
-            pl.col("announcement_date").alias("report_date"),
+            pl.col("notice_date").alias("report_date"),
             "ttm_revenue",
             "ttm_net_profit",
             "ttm_cfo",
@@ -283,23 +308,23 @@ class Fundamental:
         needed_raw = Fundamental.IDENT_COLS + [
             "net_profit",
             "total_revenue",
-            "operating_profit",
-            "operating_cost",
-            "total_assets",
+            "operate_profit",
+            "operate_cost",
+            "total_asset",
             "total_equity",
-            "total_debts",
+            "total_debt",
             "cash",
             "accounts_receivable",
             "inventory",
             "accounts_payable",
-            "advance_receipts",
-            "finance_cost",
+            "advance_receivable",
+            "finance_expense",
             "cfo",
             "cfi",
             "net_profit_yoy",
             "total_revenue_yoy",
-            "total_assets_yoy",
-            "total_debts_yoy",
+            "total_asset_yoy",
+            "total_debt_yoy",
         ]
 
         available = [c for c in needed_raw if c in df.columns]
@@ -320,18 +345,7 @@ class Fundamental:
             .join(cf, on=Fundamental.IDENT_COLS, how="inner")
         )
 
-        if base.height > 2000 and "announcement_date" in base.columns:
-            try:
-                ttm = Fundamental.rolling_ttm(base, min_periods=3)
-                combined = combined.join(
-                    ttm.rename({"report_date": "announcement_date"}),
-                    on=["ts_code", "announcement_date"],
-                    how="left",
-                )
-            except Exception as e:
-                log.warning(f"TTM rolling computation skipped: {e}")
-
-        return combined.sort(["ts_code", "announcement_date"])
+        return combined.sort(["ts_code", "notice_date"])
 
 
 class Behavioral:

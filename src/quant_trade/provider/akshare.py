@@ -1,30 +1,73 @@
 """AkShare data provider implementation."""
 
+import datetime
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from functools import cache, partial
 from pathlib import Path
+from typing import Sequence
 
 import akshare as ak
 import polars as pl
-import tqdm
 
 import quant_trade.provider.concurrent as concur
+from quant_trade.client.eastmoney import EastMoney
 from quant_trade.config.logger import log
-from quant_trade.provider.transform import (
+from quant_trade.transform import (
     AdjustCN,
     DateLike,
     Period,
     Quarter,
-    current_quarter_end,
     normalize_date_column,
     normalize_ts_code,
     normalize_ts_code_str,
-    quarter_end,
     to_date,
     to_ymd_str,
 )
+
+
+def quarter_to_report_date(year: int, quarter: Quarter, as_ymd: bool = True) -> str:
+    """Explicit year + quarter → YYYYMMDD or YYYY-MM-DD"""
+    ends = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}
+    s = f"{year}{ends[quarter]}"
+    if not as_ymd:
+        return f"{year}-{ends[quarter][:2]}-{ends[quarter][2:]}"
+    return s
+
+
+def cur_quarter_end() -> tuple[int, Quarter]:
+    """Most recent completed quarter end (explicit — no None handling)"""
+    today = datetime.now().date()
+    year = today.year
+    month = today.month
+
+    if month <= 3:
+        return (year - 1, 4)
+    elif month <= 6:
+        return (year, 1)
+    elif month <= 9:
+        return (year, 2)
+    else:
+        return (year, 3)
+
+
+def quarter_range(
+    start_year: int, start_quarter: Quarter, end_year: int, end_quarter: Quarter
+) -> list[tuple[int, Quarter]]:
+    """Generate list of (year, quarter) tuples covering the range [start, end]."""
+    result = []
+    current_year = start_year
+    current_quarter = start_quarter
+
+    while (current_year, current_quarter) <= (end_year, end_quarter):
+        result.append((current_year, current_quarter))
+        if current_quarter == 4:
+            current_year += 1
+            current_quarter = 1
+        else:
+            current_quarter += 1
+
+    return result
 
 
 def _fetch_and_clean_whole(
@@ -826,55 +869,57 @@ class AkShareMicro:
     def market_ohlcv(
         symbol: str,
         period: Period,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> pl.DataFrame:
-        start_str = to_ymd_str(start_date) if start_date else "19910403"
-        end_str = (
-            to_ymd_str(end_date) if end_date else datetime.now().strftime("%Y%m%d")
-        )
+        with EastMoney() as client:
+            return client.stock_hist(symbol,period,start_date=start_date,end_date=end_date,adjust=adjust)
+        # start_str = to_ymd_str(start_date) if start_date else "19910403"
+        # end_str = (
+        #     to_ymd_str(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        # )
 
-        log.info(
-            f"Fetching {symbol} {period} OHLCV {start_str} → {end_str} (adj={adjust})"
-        )
+        # log.info(
+        #     f"Fetching {symbol} {period} OHLCV {start_str} → {end_str} (adj={adjust})"
+        # )
 
-        # 尝试多个数据源，直到成功获取数据
-        data_sources = [
-            ("eastmoney", fetch_ohlcv_eastmoney),
-            ("sina", fetch_ohlcv_sina),
-            ("tencent", fetch_ohlcv_tencent),
-        ]
+        # # 尝试多个数据源，直到成功获取数据
+        # data_sources = [
+        #     ("eastmoney", fetch_ohlcv_eastmoney),
+        #     ("sina", fetch_ohlcv_sina),
+        #     ("tencent", fetch_ohlcv_tencent),
+        # ]
 
-        for source_name, fetch_func in data_sources:
-            try:
-                log.info(f"Trying {source_name} source for {symbol}")
-                df = fetch_func(
-                    symbol,
-                    period,
-                    start_str,
-                    end_str,
-                    adjust=adjust if adjust is not None else "",
-                )
-                if df is not None and not df.is_empty():
-                    log.info(
-                        f"Successfully fetched data from {source_name} for {symbol}"
-                    )
-                    return df
-                elif df is not None:
-                    log.warning(f"Got empty DataFrame from {source_name} for {symbol}")
-            except Exception as e:
-                log.warning(f"Failed to fetch from {source_name} for {symbol}: {e}")
+        # for source_name, fetch_func in data_sources:
+        #     try:
+        #         log.info(f"Trying {source_name} source for {symbol}")
+        #         df = fetch_func(
+        #             symbol,
+        #             period,
+        #             start_str,
+        #             end_str,
+        #             adjust=adjust if adjust is not None else "",
+        #         )
+        #         if df is not None and not df.is_empty():
+        #             log.info(
+        #                 f"Successfully fetched data from {source_name} for {symbol}"
+        #             )
+        #             return df
+        #         elif df is not None:
+        #             log.warning(f"Got empty DataFrame from {source_name} for {symbol}")
+        #     except Exception as e:
+        #         log.warning(f"Failed to fetch from {source_name} for {symbol}: {e}")
 
-        log.error(f"All data sources failed for {symbol}")
-        return pl.DataFrame()
+        # log.error(f"All data sources failed for {symbol}")
+        # return pl.DataFrame()
 
     @staticmethod
     def batch_market_ohlcv(
-        symbols: list[str],
+        symbols: Sequence[str],
         period: Period,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> list[pl.DataFrame]:
         """
@@ -882,137 +927,98 @@ class AkShareMicro:
         Returns list of pl.DataFrame **in the same order** as input `codes`.
         Empty DataFrame = no data / filtered / failed.
         """
-        worker = partial(concur.Try()(AkShareMicro.market_ohlcv), period=period,
-                         start_date=start_date, end_date=end_date, adjust=adjust)
-        config = concur.BatchConfig.thread()
-        return concur.batch_fetch(config=config,worker=worker,items=symbols)
+        with EastMoney() as client:
+            def worker(symbol: str) -> pl.DataFrame:
+                return client.stock_hist(symbol, period, start_date=start_date, end_date=end_date, adjust=adjust)
+
+            config = concur.BatchConfig.thread()
+            return concur.batch_fetch(config=config, worker=worker, items=symbols)
+
+    # @staticmethod
+    # def _fetch_quarterly_em(
+    #     func: Callable,
+    #     date_str: str,
+    #     rename_map: dict,
+    #     log_name: str,
+    # ) -> pl.DataFrame:
+    #     log.info(f"Fetching {log_name} for {date_str}")
+    #     try:
+    #         raw = func(date=date_str)
+    #         if raw.empty:
+    #             return pl.DataFrame()
+    #         df = pl.from_pandas(raw).rename(rename_map).drop("序号", strict=False)
+    #         df = normalize_date_column(df, "notice_date")
+    #         return df
+    #     except Exception as e:
+    #         log.error(f"{log_name} fetch failed for {date_str}: {e}")
+    #         return pl.DataFrame()
 
     @staticmethod
-    def _fetch_quarterly_em(
-        func: Callable,
-        date_str: str,
-        rename_map: dict,
-        log_name: str,
+    @cache
+    def quarterly_income(
+        year: int | None = None, quarter: Quarter | None = None
     ) -> pl.DataFrame:
-        log.info(f"Fetching {log_name} for {date_str}")
-        try:
-            raw = func(date=date_str)
-            if raw.empty:
-                return pl.DataFrame()
-            df = pl.from_pandas(raw).rename(rename_map).drop("序号", strict=False)
-            df = normalize_date_column(df, "announcement_date")
-            return df
-        except Exception as e:
-            log.error(f"{log_name} fetch failed for {date_str}: {e}")
-            return pl.DataFrame()
+        with EastMoney() as client:
+            if year is None or quarter is None:
+                year, quarter = cur_quarter_end()
+            return client.quarterly_income(year, quarter)
 
     @staticmethod
     @cache
-    def quarterly_income(year: int | None, quarter: Quarter) -> pl.DataFrame:
-        date_str = quarter_end(year, quarter) if year else current_quarter_end()
-        rename_map = {
-            "股票代码": "ts_code",
-            "股票简称": "name",
-            "公告日期": "announcement_date",
-            "净利润": "net_profit",
-            "营业利润": "operating_profit",
-            "利润总额": "total_profit",
-            "营业总收入": "total_revenue",
-            "净利润同比": "net_profit_yoy",
-            "营业总收入同比": "total_revenue_yoy",
-            "营业总支出-营业支出": "operating_cost",
-            "营业总支出-销售费用": "selling_cost",
-            "营业总支出-管理费用": "admin_cost",
-            "营业总支出-财务费用": "finance_cost",
-            "营业总支出-营业总支出": "total_cost",
-        }
-        return AkShareMicro._fetch_quarterly_em(
-            ak.stock_lrb_em, date_str, rename_map, "income statement"
-        )
+    def quarterly_balance(
+        year: int | None = None, quarter: Quarter | None = None
+    ) -> pl.DataFrame:
+        with EastMoney() as client:
+            if year is None or quarter is None:
+                year, quarter = cur_quarter_end()
+            return client.quarterly_balance(year, quarter)
 
     @staticmethod
     @cache
-    def quarterly_balance(year: int | None, quarter: Quarter) -> pl.DataFrame:
-        """Fetch quarterly balance sheet snapshot for all A-shares.
-
-        Uses Eastmoney batch API:
-          - ak.stock_zcfz_em(date="YYYY0331|YYYY0630|YYYY0930|YYYY1231")
-
-        Returns a per-stock table keyed by (ts_code, announcement_date).
-        """
-        date_str = quarter_end(year, quarter) if year else current_quarter_end()
-        rename_map = {
-            # identifiers
-            "股票代码": "ts_code",
-            "股票简称": "name",
-            # dates
-            "公告日期": "announcement_date",
-            # assets (unit：yuan)
-            "资产-货币资金": "cash",
-            "资产-应收账款": "accounts_receivable",
-            "资产-存货": "inventory",
-            "资产-总资产": "total_assets",
-            "资产-总资产同比": "total_assets_yoy",  # unit：%
-            # liabilities (unit：yuan)
-            "负债-应付账款": "accounts_payable",
-            "负债-预收账款": "advance_receipts",
-            "负债-总负债": "total_debts",
-            "负债-总负债同比": "total_debts_yoy",  # unit：%
-            # ratios / equity
-            "资产负债率": "debt_to_assets",  # unit：%
-            "股东权益合计": "total_equity",  # unit：yuan
-        }
-        return AkShareMicro._fetch_quarterly_em(
-            ak.stock_zcfz_em, date_str, rename_map, "balance sheet"
-        )
+    def quarterly_cashflow(
+        year: int | None = None, quarter: Quarter | None = None
+    ) -> pl.DataFrame:
+        with EastMoney() as client:
+            if year is None or quarter is None:
+                year, quarter = cur_quarter_end()
+            return client.quarterly_cashflow(year, quarter)
 
     @staticmethod
-    @cache
-    def quarterly_cashflow(year: int | None, quarter: Quarter) -> pl.DataFrame:
-        """Fetch quarterly cashflow statement snapshot for all A-shares.
-
-        Uses Eastmoney batch API:
-          - ak.stock_xjll_em(date="YYYY0331|YYYY0630|YYYY0930|YYYY1231")
-
-        Returns a per-stock table keyed by (ts_code, announcement_date).
-        """
-        date_str = quarter_end(year, quarter) if year else current_quarter_end()
-        rename_map = {
-            # identifiers
-            "股票代码": "ts_code",
-            "股票简称": "name",
-            # date
-            "公告日期": "announcement_date",
-            # total net cashflow
-            "净现金流-净现金流": "net_cashflow",  # (unit: yuan)
-            "净现金流-同比增长": "net_cashflow_yoy",
-            # operating cashflow
-            "经营性现金流-现金流量净额": "cfo",  # (unit: yuan)
-            "经营性现金流-净现金流占比": "cfo_share",
-            # investing cashflow
-            "投资性现金流-现金流量净额": "cfi",  # (unit: yuan)
-            "投资性现金流-净现金流占比": "cfi_share",  # %
-            # financing cashflow
-            "融资性现金流-现金流量净额": "cff",  # (unit: yuan)
-            "融资性现金流-净现金流占比": "cff_share",  # %
-        }
-
-        return AkShareMicro._fetch_quarterly_em(
-            ak.stock_xjll_em, date_str, rename_map, "cashflow statement"
-        )
-
-    @staticmethod
-    def quarterly_fundamentals(year: int | None, quarter: Quarter) -> pl.DataFrame:
-        inc = AkShareMicro().quarterly_income(year, quarter)
-        bal = AkShareMicro().quarterly_balance(year, quarter)
-        cf = AkShareMicro().quarterly_cashflow(year, quarter)
+    def _fundamental_worker(client:EastMoney, year:int, quarter:Quarter) -> pl.DataFrame:
+        inc = client.quarterly_income(year, quarter)
+        bal = client.quarterly_balance(year, quarter)
+        cf = client.quarterly_cashflow(year, quarter)
 
         if all(df.is_empty() for df in (inc, bal, cf)):
             return pl.DataFrame()
 
-        keys = ["ts_code", "name", "announcement_date"]
-        df = inc.join(bal, on=keys, how="inner").join(cf, on=keys, how="inner")
-        return df
+        keys = ["ts_code", "name", "notice_date"]
+        return inc.join(bal, on=keys).join(cf, on=keys)
+
+    @staticmethod
+    def quarterly_fundamentals(
+        year: int | None = None, quarter: Quarter | None = None
+    ) -> pl.DataFrame:
+        with EastMoney() as client:
+            if year is None or quarter is None:
+                year, quarter = cur_quarter_end()
+            return AkShareMicro._fundamental_worker(client, year, quarter)
+
+    @staticmethod
+    def batch_quarterly_fundamentals(
+        yqs: Sequence[tuple[int, Quarter]],
+    ) -> list[pl.DataFrame]:
+        with EastMoney() as client:
+            def worker(yq: tuple[int, Quarter]) -> pl.DataFrame:
+                year, quarter = yq
+                return concur.Try()(AkShareMicro._fundamental_worker)(client, year, quarter)
+
+            config = concur.BatchConfig.thread()
+            return concur.batch_fetch(
+                config=config,
+                worker=worker,
+                items=yqs,
+            )
 
 
 class AkShareMacro:

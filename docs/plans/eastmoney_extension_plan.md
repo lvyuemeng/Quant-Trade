@@ -38,31 +38,31 @@ class BalanceSheetBuilder(Builder):
         "SECURITY_CODE": "stock_code",
         "SECURITY_NAME_ABBR": "stock_name",
         "NOTICE_DATE": "notice_date",
-        "TOTAL_ASSETS": "total_assets",
-        "MONETARY_CAPITAL": "monetary_capital",
+        "TOTAL_ASSETS": "total_asset",
+        "MONETARY_CAPITAL": "cash",
         "ACCOUNTS_RECEIVABLE": "accounts_receivable",
         "INVENTORY": "inventory",
-        "TOTAL_LIABILITIES": "total_liabilities",
+        "TOTAL_LIABILITIES": "total_debt",
         "ACCOUNTS_PAYABLE": "accounts_payable",
-        "ADVANCE_RECEIPTS": "advance_receipts",
+        "ADVANCE_RECEIPTS": "advance_receivable",
         "TOTAL_EQUITY": "total_equity",
-        "TOTAL_ASSETS_YOY": "total_assets_yoy",
-        "TOTAL_LIABILITIES_YOY": "total_liabilities_yoy",
+        "TOTAL_ASSETS_YOY": "total_asset_yoy",
+        "TOTAL_LIABILITIES_YOY": "total_debt_yoy",
         "DEBT_ASSET_RATIO": "debt_asset_ratio",
     }
     
     NUMERIC_COLS = [
-        "total_assets", "monetary_capital", "accounts_receivable",
-        "inventory", "total_liabilities", "accounts_payable",
-        "advance_receipts", "total_equity", "total_assets_yoy",
-        "total_liabilities_yoy", "debt_asset_ratio",
+        "total_asset", "cash", "accounts_receivable",
+        "inventory", "total_debt", "accounts_payable",
+        "advance_receivable", "total_equity", "total_asset_yoy",
+        "total_debt_yoy", "debt_asset_ratio",
     ]
     
     OUTPUT_COLS = [
-        "seq", "stock_code", "stock_name", "total_assets",
-        "total_assets_yoy", "monetary_capital", "accounts_receivable",
-        "inventory", "total_liabilities", "total_liabilities_yoy",
-        "accounts_payable", "advance_receipts", "debt_asset_ratio",
+        "seq", "stock_code", "stock_name", "total_asset",
+        "total_asset_yoy", "cash", "accounts_receivable",
+        "inventory", "total_debt", "total_debt_yoy",
+        "accounts_payable", "advance_receivable", "debt_asset_ratio",
         "total_equity", "notice_date",
     ]
 ```
@@ -76,27 +76,27 @@ class CashFlowBuilder(Builder):
         "SECURITY_CODE": "stock_code",
         "SECURITY_NAME_ABBR": "stock_name",
         "NOTICE_DATE": "notice_date",
-        "NET_CASH_FLOW": "net_cash_flow",
-        "NET_CASH_FLOW_YOY": "net_cash_flow_yoy",
-        "OPERATE_CASH_FLOW": "operate_cash_flow",
-        "OPERATE_CASH_FLOW_RATIO": "operate_cash_flow_ratio",
-        "INVEST_CASH_FLOW": "invest_cash_flow",
-        "INVEST_CASH_FLOW_RATIO": "invest_cash_flow_ratio",
-        "FINANCE_CASH_FLOW": "finance_cash_flow",
-        "FINANCE_CASH_FLOW_RATIO": "finance_cash_flow_ratio",
+        "NET_CASH_FLOW": "net_cashflow",
+        "NET_CASH_FLOW_YOY": "net_cashflow_yoy",
+        "OPERATE_CASH_FLOW": "cfo",
+        "OPERATE_CASH_FLOW_RATIO": "cfo_ratio",
+        "INVEST_CASH_FLOW": "cfi",
+        "INVEST_CASH_FLOW_RATIO": "cfi_ratio",
+        "FINANCE_CASH_FLOW": "cff",
+        "FINANCE_CASH_FLOW_RATIO": "cff_ratio",
     }
     
     NUMERIC_COLS = [
-        "net_cash_flow", "net_cash_flow_yoy", "operate_cash_flow",
-        "operate_cash_flow_ratio", "invest_cash_flow", "invest_cash_flow_ratio",
-        "finance_cash_flow", "finance_cash_flow_ratio",
+        "net_cashflow", "net_cashflow_yoy", "cfo",
+        "cfo_ratio", "cfi", "cfi_ratio",
+        "cff", "cff_ratio",
     ]
     
     OUTPUT_COLS = [
-        "seq", "stock_code", "stock_name", "net_cash_flow",
-        "net_cash_flow_yoy", "operate_cash_flow", "operate_cash_flow_ratio",
-        "invest_cash_flow", "invest_cash_flow_ratio",
-        "finance_cash_flow", "finance_cash_flow_ratio",
+        "seq", "stock_code", "stock_name", "net_cashflow",
+        "net_cashflow_yoy", "cfo", "cfo_ratio",
+        "cfi", "cfi_ratio",
+        "cff", "cff_ratio",
         "notice_date",
     ]
 ```

@@ -27,10 +27,7 @@ def test_stock_daily(m: ak.AkShareMicro):
 
 def test_quarter_income(m: ak.AkShareMicro):
     df = m.quarterly_income(year=SHEET_YEAR, quarter=SHEET_QUATER)
-    filter_df = df.filter(
-        pl.col("net_profit").is_not_nan() & pl.col("net_profit").gt(0)
-    )
-    print(f"quarter balance: {df.columns} \n {len(filter_df)} {filter_df}")
+    print(f"quarter balance: {df.columns} \n {len(df)} {df}")
 
 
 def test_quarter_balance(m: ak.AkShareMicro):
@@ -48,82 +45,7 @@ def test_quarter_cashflow(m: ak.AkShareMicro):
 
 def test_quarter_fundamental(m: ak.AkShareMicro):
     df = m.quarterly_fundamentals(year=SHEET_YEAR, quarter=SHEET_QUATER)
-    total_stocks = df.height
-    print(f"1. raw: {total_stocks}")
-    print(f"   shape: {df.shape}")
-    print(f"   cols: {df.columns}")
-
-    # 2. 分别检查两个关键字段的缺失值和负值情况
-    print("\n2. 'net_profit':")
-    profit_stats = df.select(
-        [
-            pl.col("net_profit").is_null().sum().alias("null_count"),
-            pl.col("net_profit").is_nan().sum().alias("nan_count"),
-            pl.col("net_profit").is_not_null().sum().alias("not_null_count"),
-            (pl.col("net_profit") <= 0).sum().alias("non_positive_count"),
-            (pl.col("net_profit") > 0).sum().alias("positive_count"),
-        ]
-    )
-    print(profit_stats)
-
-    print("\n3. 'total_equity' 字段分析:")
-    equity_stats = df.select(
-        [
-            pl.col("total_equity").is_null().sum().alias("null_count"),
-            pl.col("total_equity").is_nan().sum().alias("nan_count"),
-            pl.col("total_equity").is_not_null().sum().alias("not_null_count"),
-            (pl.col("total_equity") <= 0).sum().alias("non_positive_count"),
-            (pl.col("total_equity") > 0).sum().alias("positive_count"),
-        ]
-    )
-    print(equity_stats)
-
-    # 3. 检查筛选条件交集
-    print("\n4. intersection:")
-
-    # 条件1：net_profit 有效且为正
-    condition1_df = df.filter(
-        pl.col("net_profit").is_not_null() & pl.col("net_profit").gt(0)
-    )
-
-    # 条件2：total_equity 有效且为正
-    condition2_df = df.filter(
-        pl.col("total_equity").is_not_null() & pl.col("total_equity").gt(0)
-    )
-
-    # 两个条件的并集
-    condition1_or_2 = df.filter(
-        (pl.col("net_profit").is_not_null() & pl.col("net_profit").gt(0))
-        | (pl.col("total_equity").is_not_null() & pl.col("total_equity").gt(0))
-    )
-
-    # 两个条件的交集（你的原始筛选条件）
-    condition1_and_2 = df.filter(
-        pl.col("net_profit").is_not_null()
-        & pl.col("net_profit").gt(0)
-        & pl.col("total_equity").is_not_null()
-        & pl.col("total_equity").gt(0)
-    )
-
-    print(f"   仅满足'净利润>0'条件: {condition1_df.height}")
-    print(f"   仅满足'股东权益>0'条件: {condition2_df.height}")
-    print(f"   满足任一条件: {condition1_or_2.height}")
-    print(f"   同时满足两个条件（你的筛选）: {condition1_and_2.height}")
-
-    # 4. 随机采样查看具体数据
-    print("\n5. 随机采样示例 (前5行):")
-    if not condition1_and_2.is_empty():
-        sample = condition1_and_2.head(5)
-        print(sample.select(["net_profit", "total_equity"]))
-    else:
-        print("   没有符合条件的数据")
-    filter_df = df.filter(
-        pl.col("net_profit").is_not_nan()
-        & pl.col("net_profit").gt(0)
-        & pl.col("total_equity").is_not_nan()
-        & pl.col("total_equity").gt(0)
-    )
-    print(f"quarter balance: {df.columns} \n {len(filter_df)} {filter_df}")
+    print(f"quarter balance: {df.columns} \n {len(df)} {df}")
 
 
 def test_northbound(m: ak.AkShareMacro):
@@ -201,7 +123,7 @@ if __name__ == "__main__":
 
     # === Micro ===
     micro = ak.AkShareMicro()
-    # test_stock_daily(micro)
+    test_stock_daily(micro)
     # test_quarter_income(micro)
     # test_quarter_balance(micro)
     # test_quarter_cashflow(micro)

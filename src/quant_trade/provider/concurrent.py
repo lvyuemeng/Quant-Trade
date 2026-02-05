@@ -19,7 +19,8 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Executor, as_completed
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any, TypeVar, Self
+from functools import partial
+from typing import Any, Self
 
 import polars as pl
 import tqdm
@@ -27,6 +28,7 @@ import tqdm
 from quant_trade.config.logger import log
 
 type FetchResult = pl.DataFrame
+
 
 def optimal_workers(n_tasks: int) -> int:
     """Determine optimal number of workers for ThreadPoolExecutor."""
@@ -37,6 +39,7 @@ def optimal_workers(n_tasks: int) -> int:
     if n_tasks <= 0:
         raise ValueError(f"n_tasks {n_tasks} must be > 0")
     return min(cpu_count, n_tasks)
+
 
 def try_call(
     fetch: Callable[..., FetchResult],
@@ -68,6 +71,7 @@ def try_call(
                 return pl.DataFrame()
             backoff = sleep * (2**attempt)
             import time
+
             time.sleep(backoff)
     return pl.DataFrame()
 
@@ -95,6 +99,7 @@ class BatchConfig:
             BatchConfig with ProcessPoolExecutor
         """
         from concurrent.futures import ProcessPoolExecutor
+
         return cls(
             executor_factory=ProcessPoolExecutor,
             max_workers=workers,
@@ -111,6 +116,7 @@ class BatchConfig:
             BatchConfig with ThreadPoolExecutor
         """
         from concurrent.futures import ThreadPoolExecutor
+
         return cls(
             executor_factory=ThreadPoolExecutor,
             max_workers=workers,
@@ -146,9 +152,16 @@ class Try:
         Returns:
             Wrapper function with retry logic
         """
-        def wrapper(*args: Any, **kwargs: Any) -> FetchResult | pl.DataFrame:
-            return try_call(fetch, self.retry, self.sleep, *args, **kwargs)
-        return wrapper
+        return partial(self.pickable,fetch)
+
+    def pickable(self,fetch:Callable[..., FetchResult], *args,**kwargs) -> FetchResult:
+        """Wrap fetch function with retry logic, ensuring picklability for ProcessPoolExecutor.
+
+        Args:
+            fetch: Function to wrap
+        """
+        return try_call(fetch, self.retry, self.sleep, *args, **kwargs)
+
 
     def with_session(
         self,
@@ -201,11 +214,13 @@ class TryWithSession:
         Returns:
             Wrapper function with session + retry logic
         """
+
         def wrapper(*args: Any, **kwargs: Any) -> FetchResult | pl.DataFrame:
             if self.session_factory is None:
                 return try_call(fetch, self.retry, self.sleep, *args, **kwargs)
             with self.session_factory():
                 return try_call(fetch, self.retry, self.sleep, *args, **kwargs)
+
         return wrapper
 
 
