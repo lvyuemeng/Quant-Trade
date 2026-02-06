@@ -21,8 +21,7 @@ class Metric(Protocol):
 
 
 class Fundamental:
-    """
-    Fundamental factor engineering for Chinese A-shares quarterly data.
+    """Fundamental factor engineering for Chinese A-shares quarterly data.
     Designed to work directly on AkShare Eastmoney merged fundamentals.
     All monetary values in CNY yuan, growth rates as decimal (0.25 = 25%).
     """
@@ -230,8 +229,7 @@ class Fundamental:
 
     @staticmethod
     def rolling_ttm(df: pl.DataFrame, min_periods: int = 3) -> pl.DataFrame:
-        """
-        Compute trailing twelve months (TTM) aggregates and momentum.
+        """Compute trailing twelve months (TTM) aggregates and momentum.
         Assumes df is sorted by ['ts_code', 'notice_date'].
         Uses group_by_dynamic with 4-quarter window.
         """
@@ -305,7 +303,8 @@ class Fundamental:
         log.info("Computing full fundamental feature set")
 
         # Base selection — only needed columns
-        needed_raw = Fundamental.IDENT_COLS + [
+        needed_raw = [
+            *Fundamental.IDENT_COLS,
             "net_profit",
             "total_revenue",
             "operate_profit",
@@ -349,8 +348,7 @@ class Fundamental:
 
 
 class Behavioral:
-    """
-    Feature engineering class for behavioral (market microstructure and price action) metrics.
+    """Feature engineering class for behavioral (market microstructure and price action) metrics.
     Designed to be robust for stocks, indices, and volatility indices (QVIX-like).
 
     Required core columns (OHLCV):
@@ -620,9 +618,7 @@ class Behavioral:
 
     @staticmethod
     def metrics(df: pl.DataFrame, idents: list[str] | None = None) -> pl.DataFrame:
-        """
-        Combine all behavioral feature groups.
-        """
+        """Combine all behavioral feature groups."""
         log.info("Behavioral.metrics: computing full behavioral feature suite")
 
         if df.is_empty() or "date" not in df.columns:
@@ -656,8 +652,7 @@ class Behavioral:
 
 
 class Northbound:
-    """
-    Northbound (沪深港通 北向资金) behavioral feature extractor.
+    """Northbound (沪深港通 北向资金) behavioral feature extractor.
     Input: daily northbound flow data from AkShare (net_buy, fund_inflow, cum_net_buy, date)
     Output: wide-format feature table with momentum, persistence, acceleration signals.
     All features are null-safe and work with partial/missing data.
@@ -807,9 +802,7 @@ class Northbound:
 
     @staticmethod
     def metrics(df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Combine all Northbound feature groups.
-        """
+        """Combine all Northbound feature groups."""
         log.info("Northbound.metrics: computing full northbound feature suite")
 
         if df.is_empty() or "date" not in df.columns:
@@ -838,8 +831,7 @@ class Northbound:
 
 
 class MarginShort:
-    """
-    Feature extractor for A-share margin & short-selling data (SH+SZ combined).
+    """Feature extractor for A-share margin & short-selling data (SH+SZ combined).
     All operations use consistent clipping and null-safe logic.
     """
 
@@ -1029,8 +1021,7 @@ class MarginShort:
 
 
 class Shibor:
-    """
-    SHIBOR funding rate feature extractor.
+    """SHIBOR funding rate feature extractor.
     Focuses on liquidity shocks, curve shape, and stress signals.
     Input columns (from ak.macro_china_shibor_all):
         date, ON_rate, 1W_rate, 1M_rate, 3M_rate, 1Y_rate (and optional change columns)
@@ -1053,9 +1044,7 @@ class Shibor:
 
     @staticmethod
     def shock(df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Liquidity shock & funding pressure signals (focus on overnight).
-        """
+        """Liquidity shock & funding pressure signals (focus on overnight)."""
         log.info("Shibor.shock: computing funding shock & liquidity pressure")
 
         if "ON_rate" not in df.columns:
@@ -1160,9 +1149,7 @@ class Shibor:
 
     @staticmethod
     def metrics(df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Combine all SHIBOR feature groups.
-        """
+        """Combine all SHIBOR feature groups."""
         log.info("Shibor.metrics: computing full SHIBOR feature suite")
 
         if df.is_empty() or "date" not in df.columns:
@@ -1189,9 +1176,7 @@ class Shibor:
 
 @dataclass(frozen=True)
 class CrossSectionFlow:
-    """
-    Build shared group-level statistics for multiple factors.
-    """
+    """Build shared group-level statistics for multiple factors."""
 
     by: list[str]
     namespace: str = "cs"
@@ -1250,8 +1235,7 @@ class CrossSectionFlow:
         factors: list[str],
         limits: tuple[float, float],
     ) -> list[pl.Expr]:
-        """
-        ```
+        """```
         return [
             pl.col(f)
             .clip(
@@ -1281,9 +1265,7 @@ class CrossSectionFlow:
         input_suffix: str | None = None,
         output_suffix: str = "z",
     ) -> list[pl.Expr]:
-        """
-        Z-score using raw column or winsorized column.
-        """
+        """Z-score using raw column or winsorized column."""
         exprs: list[pl.Expr] = []
         for f in factors:
             x = pl.col(self.alias(f, input_suffix)) if input_suffix else pl.col(f)
@@ -1315,9 +1297,7 @@ class CrossSectionFlow:
 
 @dataclass
 class SectorGroup:
-    """
-    Applies cross-sectional normalization (winsor + z-score) per group.
-    """
+    """Applies cross-sectional normalization (winsor + z-score) per group."""
 
     by: list[str]
     factors: list[str]

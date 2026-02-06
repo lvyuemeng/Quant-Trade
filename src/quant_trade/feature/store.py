@@ -112,7 +112,7 @@ class BookLib[B](BookFetcher[B], AssetLib):
 class BatchBookLib[B](BatchBookFetcher[B], AssetLib):
     def _batch_fresh(self: Self, books: Sequence[B]) -> None:
         batch = self._fetch_batch(books)
-        for book, df in zip(books, batch):
+        for book, df in zip(books, batch, strict=False):
             if df.is_empty():
                 log.warning(f"No market data for {book}")
                 continue
@@ -136,7 +136,7 @@ class BatchBookLib[B](BatchBookFetcher[B], AssetLib):
             to_fetch.extend(books)
 
         if to_fetch:
-            for book, raw in zip(to_fetch, self._fetch_batch(to_fetch)):
+            for book, raw in zip(to_fetch, self._fetch_batch(to_fetch), strict=False):
                 if raw.is_empty():
                     continue
                 df = self._process(book, raw)
@@ -342,15 +342,15 @@ class CNMacro(BookLib[MacroBook], AssetLib):
     def _fetch(self, book: MacroBook) -> pl.DataFrame:
         try:
             return self._FETCHERS[book.macro]()
-        except KeyError:
-            raise ValueError(f"Unknown macro book fetch: {book.macro}")
+        except KeyError as e:
+            raise ValueError(f"Unknown macro book fetch: {book.macro}") from e
 
     def _process(self, book: MacroBook, raw: pl.DataFrame) -> pl.DataFrame:
         log.debug(f"raw df: {raw.head(5)}")
         try:
             return self._FEATURES[book.macro](raw)
-        except KeyError:
-            raise ValueError(f"Unknown macro book process: {book.macro}")
+        except KeyError as e:
+            raise ValueError(f"Unknown macro book process: {book.macro}") from e
 
     def read(self, book: MacroBook, *, fresh: bool = False) -> pl.DataFrame:
         df = self._read(book, fresh)
@@ -378,8 +378,7 @@ class CNIndustrySectorGroup(SectorGroup):
 
     @classmethod
     def default_fundamental_metric(cls) -> list[str]:
-        """
-        Default fundamental metrics
+        """Default fundamental metrics
 
         ```
         # Profitability & margins (industry structure driven)

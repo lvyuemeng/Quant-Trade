@@ -23,7 +23,6 @@ def _(mo):
 @app.cell
 def _(mo):
     stock_code = mo.ui.text(placeholder="000001", label="Stock Code")
-    stock_code
     return (stock_code,)
 
 

@@ -1,6 +1,5 @@
 from datetime import date
 
-import os
 import polars as pl
 
 from quant_trade.config.arctic import ArcticDB
@@ -12,16 +11,18 @@ from quant_trade.feature.store import (
     CNMarket,
     CNStockPool,
 )
-from quant_trade.model.base import (
-    GaussianLabelBuilder,
-    LGBDataProcessor,
-    LGBTrainer,
+from quant_trade.model.lgb import (
+    MetricConfig,
+    Processor,
+    Trainer,
+    TuneConfig,
+)
+from quant_trade.model.process import (
+    DiscreteLabelBuilder,
     PurgedKFold,
 )
+from quant_trade.model.store import FSStorage, ModelStore
 from tests.conftest import smoke_configure
-
-# Create model directory if it doesn't exist
-os.makedirs("./model", exist_ok=True)
 
 LABEL = [
     "ret_1m",
@@ -83,11 +84,17 @@ SELECTED_NEUTRAL = [
 def stack_all(
     market: pl.DataFrame, fund: pl.DataFrame, macro: pl.DataFrame
 ) -> pl.DataFrame:
-    market = market.sort(by="date").with_columns(pl.col("date").cast(pl.Date)).sort("date")
-    fund = fund.sort(by=["notice_date", "ts_code"]).with_columns(
-        pl.col("notice_date").cast(pl.Date)
-    ).sort("notice_date")
-    macro = macro.sort(by=["date"]).with_columns(pl.col("date").cast(pl.Date)).sort("date")
+    market = (
+        market.sort(by="date").with_columns(pl.col("date").cast(pl.Date)).sort("date")
+    )
+    fund = (
+        fund.sort(by=["notice_date", "ts_code"])
+        .with_columns(pl.col("notice_date").cast(pl.Date))
+        .sort("notice_date")
+    )
+    macro = (
+        macro.sort(by=["date"]).with_columns(pl.col("date").cast(pl.Date)).sort("date")
+    )
 
     merged = market.join_asof(
         fund,
@@ -135,13 +142,17 @@ if __name__ == "__main__":
     factor_col = "ret_1m"
     feature_cols = SELECTED + sector.zfactors()
 
-    label_builder = GaussianLabelBuilder("ret_1m", rank_by="date")
-    processor = LGBDataProcessor(features=feature_cols, label_cls=label_builder)
-    trainer = LGBTrainer(processor=processor)
+    # Use DiscreteLabelBuilder for LambdaRank (discrete relevance labels)
+    discrete_label = DiscreteLabelBuilder("ret_1m", rank_by="date", num_bins=4)
+    metric_config = MetricConfig.ranking(discrete_label)
+    processor = Processor(features=feature_cols, config=metric_config)
+    trainer = Trainer(processor=processor)
 
     data_batch = PurgedKFold(5, horizon_days=0, embargo_days=0).split(
         merged, date_col="date"
     )
-    result = trainer.train_batchwise(data_batch, optimize=True)
-    result.model.save_model("./model/1.txt")
+    result = trainer.batch_train(data_batch, TuneConfig())
     print(f"results: {result}")
+    card = result.pack(name="test")
+    store = ModelStore(FSStorage(base_dir="./model"))
+    store.register(card=card)

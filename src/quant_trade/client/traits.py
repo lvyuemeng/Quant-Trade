@@ -1,5 +1,4 @@
-"""
-Generic data pipe components for Quant-Trade.
+"""Generic data pipe components for Quant-Trade.
 
 Extracts reusable patterns from data providers into composable traits:
 - Fetcher: HTTP fetching protocol
@@ -56,8 +55,7 @@ from quant_trade.transform import normalize_date_column
 
 
 class Fetcher(Protocol):
-    """
-    Protocol for fetching - duck typing interface.
+    """Protocol for fetching - duck typing interface.
 
     Implementations must provide:
     - fetch_initial(url, params) -> dict
@@ -71,8 +69,7 @@ class Fetcher(Protocol):
 
 
 class Parser(Protocol):
-    """
-    Protocol for parsing.
+    """Protocol for parsing.
 
     Implementations must provide:
     - parse(raw) -> list[dict]
@@ -84,8 +81,7 @@ class Parser(Protocol):
 
 
 class Builder(Protocol):
-    """
-    Protocol for building output.
+    """Protocol for building output.
 
     Implementations must provide:
     - rename(df) -> pl.DataFrame
@@ -104,9 +100,7 @@ class Builder(Protocol):
 
 
 class _RateLimiter:
-    """
-    Thread-safe token-bucket-like rate limiter with jitter.
-    """
+    """Thread-safe token-bucket-like rate limiter with jitter."""
 
     def __init__(self, min_delay: float, max_delay: float):
         self.min_delay = min_delay
@@ -132,9 +126,7 @@ class _RateLimiter:
 
 
 class BaseFetcher:
-    """
-    Advanced Base Fetcher using httpx + tenacity.
-    """
+    """Advanced Base Fetcher using httpx + tenacity."""
 
     USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -301,8 +293,7 @@ class BaseFetcher:
 
 
 class BaseParser:
-    """
-    Base Parser - converts raw JSON to structured data.
+    """Base Parser - converts raw JSON to structured data.
 
     Provides:
     - Configurable data path traversal via DATA_PATH
@@ -326,8 +317,7 @@ class BaseParser:
     PAGES_KEY: str = "pages"
 
     def parse(self, raw: dict) -> list[dict]:
-        """
-        Parse response and extract data list.
+        """Parse response and extract data list.
 
         Args:
             raw: Raw JSON response dictionary
@@ -348,8 +338,7 @@ class BaseParser:
         return data if isinstance(data, list) else []
 
     def get_total_pages(self, raw: dict) -> int:
-        """
-        Get total pages from response.
+        """Get total pages from response.
 
         Args:
             raw: Raw JSON response dictionary
@@ -360,8 +349,7 @@ class BaseParser:
         return raw.get("result", {}).get(self.PAGES_KEY, 1)
 
     def clean(self, data: list[dict]) -> pl.DataFrame:
-        """
-        Clean and convert to Polars DataFrame.
+        """Clean and convert to Polars DataFrame.
 
         Args:
             data: List of data dictionaries
@@ -379,8 +367,7 @@ class BaseParser:
 
 @dataclass
 class ColumnSpec:
-    """
-    Specification for a column transformation.
+    """Specification for a column transformation.
 
     Attributes:
         source: Original column name from API
@@ -394,8 +381,7 @@ class ColumnSpec:
 
 
 class BaseBuilder:
-    """
-    Base Builder - generic DataFrame transformation.
+    """Base Builder - generic DataFrame transformation.
 
     Provides:
     - Column renaming via COLUMN_SPECS
@@ -428,12 +414,12 @@ class BaseBuilder:
     DUPLICATE_COLS: tuple[str, ...] | None = None
 
     @property
-    def COLUMN_MAPPING(self) -> dict[str, str]:
+    def column_map(self) -> dict[str, str]:
         """Generate column mapping from specs."""
         return {spec.source: spec.target for spec in self.COLUMN_SPECS}
 
     @property
-    def NUMERIC_COLS(self) -> list[str]:
+    def numeric_cols(self) -> list[str]:
         """Get numeric column names from specs."""
         return [
             spec.target
@@ -442,8 +428,7 @@ class BaseBuilder:
         ]
 
     def rename(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Apply column renaming based on COLUMN_SPECS.
+        """Apply column renaming based on COLUMN_SPECS.
 
         Args:
             df: Input DataFrame
@@ -451,13 +436,12 @@ class BaseBuilder:
         Returns:
             DataFrame with renamed columns
         """
-        log.debug(f"Renaming columns using mapping: {self.COLUMN_MAPPING}")
-        rename_map = {k: v for k, v in self.COLUMN_MAPPING.items() if k in df.columns}
+        log.debug(f"Renaming columns using mapping: {self.column_map}")
+        rename_map = {k: v for k, v in self.column_map.items() if k in df.columns}
         return df.rename(rename_map)
 
     def convert_types(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Convert column types based on COLUMN_SPECS.
+        """Convert column types based on COLUMN_SPECS.
 
         - Numeric columns: cast to Float64
         - Date columns: parse as date strings
@@ -469,10 +453,10 @@ class BaseBuilder:
             DataFrame with converted types
         """
         log.debug(
-            f"Converting types for columns: {self.NUMERIC_COLS} and date column: {self.DATE_COL}"
+            f"Converting types for columns: {self.numeric_cols} and date column: {self.DATE_COL}"
         )
         result = df
-        for col in self.NUMERIC_COLS:
+        for col in self.numeric_cols:
             if col in result.columns:
                 result = result.with_columns(pl.col(col).cast(pl.Float64, strict=False))
         if self.DATE_COL and self.DATE_COL in result.columns:
@@ -480,8 +464,7 @@ class BaseBuilder:
         return result
 
     def reorder(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Reorder columns and add sequence number.
+        """Reorder columns and add sequence number.
 
         Args:
             df: Input DataFrame
@@ -505,8 +488,7 @@ class BaseBuilder:
         return result.select(ordered)
 
     def deduplicate(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Remove duplicate rows based on DUPLICATE_COLS.
+        """Remove duplicate rows based on DUPLICATE_COLS.
 
         Args:
             df: Input DataFrame
@@ -523,8 +505,7 @@ class BaseBuilder:
         return df
 
     def normalize(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Apply full normalization: rename, convert types, deduplicate, reorder.
+        """Apply full normalization: rename, convert types, deduplicate, reorder.
 
         Args:
             df: Input DataFrame
@@ -547,8 +528,7 @@ class BaseBuilder:
 
 
 class DataPipe:
-    """
-    Generic data pipe that orchestrates Fetcher -> Parser -> Builder.
+    """Generic data pipe that orchestrates Fetcher -> Parser -> Builder.
 
     This is the core abstraction that enables reusable data fetching patterns.
 
@@ -578,8 +558,7 @@ class DataPipe:
         parser: BaseParser,
         builder: Builder,
     ):
-        """
-        Initialize DataPipe.
+        """Initialize DataPipe.
 
         Args:
             fetcher: BaseFetch implementation (provides fetch_pages_concurrent)
@@ -596,8 +575,7 @@ class DataPipe:
         params: dict,
         concurrent_pages: bool = True,
     ) -> pl.DataFrame:
-        """
-        Execute the full data pipeline.
+        """Execute the full data pipeline.
 
         Args:
             url: API endpoint URL
@@ -650,8 +628,7 @@ class DataPipe:
 
 
 def build_data_path(data_path: tuple[str, ...]) -> Callable[[dict], Any]:
-    """
-    Create a function to extract data from a nested dictionary.
+    """Create a function to extract data from a nested dictionary.
 
     Args:
         data_path: Tuple of keys to traverse
@@ -682,8 +659,7 @@ def create_retry_session(
     pool_connections: int = 10,
     pool_maxsize: int = 20,
 ) -> requests.Session:
-    """
-    Create a requests Session with retry strategy.
+    """Create a requests Session with retry strategy.
 
     Args:
         max_retries: Maximum retry attempts

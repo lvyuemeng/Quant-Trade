@@ -84,8 +84,7 @@ def normalize_ts_code_str(
     sep: str = ".",
     case: Literal["upper", "lower"] = "upper",
 ) -> str:
-    """
-    Normalize a single stock code string.
+    """Normalize a single stock code string.
 
     Examples:
         "600519"        -> "600519"
@@ -93,7 +92,6 @@ def normalize_ts_code_str(
         "sh600519"      -> "600519"
         add_exchange=True -> "600519.SH"
     """
-
     # ---- extract digits (fast path, no regex) ----
     digits = "".join(c for c in code if c.isdigit())
 
@@ -123,10 +121,7 @@ def normalize_ts_code_str(
         else:
             exch = "UNKNOWN"
 
-    if case == "lower":
-        exch = exch.lower()
-    else:
-        exch = exch.upper()
+    exch.lower() if case == "lower" else exch.upper()
 
     # ---- assemble ----
     if position == "suffix":
@@ -146,8 +141,7 @@ def normalize_ts_code(
     sep: str = ".",  # ".", "" or others
     case: Literal["upper", "lower"] = "upper",
 ) -> pl.Expr:
-    """
-    Normalize stock code to:
+    """Normalize stock code to:
     - 6-digit string (default)            e.g. "600519"
     - with exchange as suffix/prefix      e.g. "600519.SH", "sh600519", "600519SH"
 

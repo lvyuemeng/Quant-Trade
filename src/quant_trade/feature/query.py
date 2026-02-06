@@ -19,8 +19,7 @@ from ..transform import Quarter
 
 
 def book_key[T](cls: type[T]) -> type[T]:
-    """
-    Class decorator that auto-generates BookKey implementation.
+    """Class decorator that auto-generates BookKey implementation.
 
     Joins all fields with "_" to create storage key.
     Nested BookKey objects are recursively converted.
@@ -55,14 +54,14 @@ def book_key[T](cls: type[T]) -> type[T]:
         if dc_params and getattr(dc_params, "frozen", False):
             to_key = functools.lru_cache(maxsize=None)(to_key)
 
-        setattr(cls, "to_key", to_key)
+        cls.to_key = to_key  # type: ignore[method-assign]
 
     @classmethod
     def _fields(cls_: type[T]) -> tuple[str, ...]:
         """Return field names."""
         return field_names
 
-    setattr(cls, "_fields", _fields)
+    cls._fields = _fields  # type: ignore[method-assign]
 
     def to_dict(self: T) -> dict[str, Any]:
         """Convert to dictionary with nested BookKey expansion."""
@@ -75,17 +74,17 @@ def book_key[T](cls: type[T]) -> type[T]:
                 result[name] = val
         return result
 
-    setattr(cls, "to_dict", to_dict)
+    cls.to_dict = to_dict  # type: ignore[method-assign]
 
     # Enhanced repr showing the key
     # original_repr = cls.__repr__
 
     def __repr__(self: T) -> str:
-        key = getattr(self, "to_key")()
+        key = self.to_key()  # type: ignore[method-call]
         field_str = ", ".join(f"{name}={getattr(self, name)!r}" for name in field_names)
         return f"{cls.__name__}({field_str})[key={key!r}]"
 
-    setattr(cls, "__repr__", __repr__)
+    cls.__repr__ = __repr__
 
     return cls
 
@@ -225,7 +224,8 @@ class RecordBook:
 @final
 class TickerBook(str):
     """A seamless string-based ticker.
-    It behaves exactly like '000001_SZ' but has helper methods attached."""
+    It behaves exactly like '000001_SZ' but has helper methods attached.
+    """
 
     def __new__(cls, symbol: str) -> Self:
         # Ensure we are creating a string properly

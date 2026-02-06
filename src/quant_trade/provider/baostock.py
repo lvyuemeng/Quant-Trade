@@ -337,8 +337,7 @@ class BaoMicro:
         end_date: date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> list[pl.DataFrame]:
-        """
-        Parallel fetch OHLCV for many symbols.
+        """Parallel fetch OHLCV for many symbols.
         Returns list of pl.DataFrame **in the same order** as input `codes`.
         Empty DataFrame = no data / filtered / failed.
         """

@@ -1,5 +1,4 @@
-"""
-East Money data provider with separated concerns.
+"""East Money data provider with separated concerns.
 
 Architecture:
 - Fetcher: Independent HTTP fetching (network only)
@@ -45,8 +44,7 @@ EASTMONEY_KLINE_API: Final[str] = (
 
 
 def _build_quarterly_date(year: int, quarter: int) -> str:
-    """
-    Build formatted date string from year and quarter.
+    """Build formatted date string from year and quarter.
 
     Args:
         year: Report year (e.g., 2024)
@@ -61,8 +59,7 @@ def _build_quarterly_date(year: int, quarter: int) -> str:
 
 
 def _build_quarterly_params(report_name: str, formatted_date: str) -> dict:
-    """
-    Build params for quarterly report API.
+    """Build params for quarterly report API.
 
     Args:
         report_name: Report name (e.g., "RPT_DMSK_FN_INCOME")
@@ -89,8 +86,7 @@ def _build_kline_params(
     end_date: str,
     adjust: str,
 ) -> tuple[str, dict]:
-    """
-    Build params for kline API.
+    """Build params for kline API.
 
     Args:
         symbol: Stock code (e.g., "000001")
@@ -126,8 +122,7 @@ def _build_kline_params(
 
 
 class EastMoneyFetch(BaseFetcher):
-    """
-    EastMoney-specific Fetcher - extends BaseFetch.
+    """EastMoney-specific Fetcher - extends BaseFetch.
 
     Anti-blocking features:
     - Randomized delays between requests
@@ -177,8 +172,7 @@ class EastMoneyFetch(BaseFetcher):
 
 
 class FundemantalParser(BaseParser):
-    """
-    EastMoney-specific Parser - extends BaseParser.
+    """EastMoney-specific Parser - extends BaseParser.
 
     DATA_PATH configured to extract data from EastMoney API response.
     """
@@ -197,8 +191,7 @@ class FundemantalParser(BaseParser):
 
 
 class KlineParser(BaseParser):
-    """
-    Parser for stock kline (historical) data.
+    """Parser for stock kline (historical) data.
 
     DATA_PATH configured for kline API response structure.
     Data is returned as comma-separated strings that need parsing.
@@ -207,8 +200,7 @@ class KlineParser(BaseParser):
     DATA_PATH = ("data", "klines")
 
     def parse(self, raw: dict) -> list[dict]:
-        """
-        Parse kline response and extract data list.
+        """Parse kline response and extract data list.
 
         Args:
             raw: Raw JSON response dictionary
@@ -242,7 +234,7 @@ class KlineParser(BaseParser):
         for kline in klines:
             values = kline.split(",")
             if len(values) == len(column_names):
-                data.append(dict(zip(column_names, values)))
+                data.append(dict(zip(column_names, values, strict=False)))
 
         return data
 
@@ -253,8 +245,7 @@ class KlineParser(BaseParser):
 
 
 class IncomeBuilder(BaseBuilder):
-    """
-    Builder for LRB (Income Statement) data.
+    """Builder for LRB (Income Statement) data.
     Uses ColumnSpec pattern for flexible column definitions.
     """
 
@@ -303,8 +294,7 @@ class IncomeBuilder(BaseBuilder):
 
 
 class BalanceSheetBuilder(BaseBuilder):
-    """
-    Builder for Balance Sheet data.
+    """Builder for Balance Sheet data.
     Uses ColumnSpec pattern for flexible column definitions.
     """
 
@@ -349,8 +339,7 @@ class BalanceSheetBuilder(BaseBuilder):
 
 
 class CashFlowBuilder(BaseBuilder):
-    """
-    Builder for Cash Flow Statement data.
+    """Builder for Cash Flow Statement data.
     Uses ColumnSpec pattern for flexible column definitions.
     """
 
@@ -387,8 +376,7 @@ class CashFlowBuilder(BaseBuilder):
 
 
 class KlineBuilder(BaseBuilder):
-    """
-    Builder for stock kline (historical) data.
+    """Builder for stock kline (historical) data.
     Uses ColumnSpec pattern for flexible column definitions.
     """
 
@@ -432,8 +420,7 @@ class KlineBuilder(BaseBuilder):
 
 @dataclass
 class ReportConfig:
-    """
-    Configuration for quarterly financial reports.
+    """Configuration for quarterly financial reports.
 
     Attributes:
         report_name: Report name for API (e.g., "RPT_DMSK_FN_INCOME")
@@ -454,8 +441,7 @@ class ReportConfig:
 
 
 class ReportPipe:
-    """
-    Pipe for fetching quarterly financial reports.
+    """Pipe for fetching quarterly financial reports.
 
     Handles the common pattern of:
     1. Building params from year/quarter
@@ -465,8 +451,7 @@ class ReportPipe:
     """
 
     def __init__(self, fetcher: EastMoneyFetch, config: ReportConfig):
-        """
-        Initialize ReportPipe.
+        """Initialize ReportPipe.
 
         Args:
             fetcher: Fetcher instance
@@ -476,8 +461,7 @@ class ReportPipe:
         self._config = config
 
     def fetch(self, year: int, quarter: int) -> pl.DataFrame:
-        """
-        Fetch quarterly report data.
+        """Fetch quarterly report data.
 
         Args:
             year: Report year (e.g., 2024)
@@ -523,8 +507,7 @@ class ReportPipe:
 
 
 class KlinePipe:
-    """
-    Pipe for fetching stock historical data (kline).
+    """Pipe for fetching stock historical data (kline).
 
     Handles the pattern of:
     1. Building params from symbol, period, dates
@@ -533,8 +516,7 @@ class KlinePipe:
     """
 
     def __init__(self, fetcher: EastMoneyFetch):
-        """
-        Initialize KlinePipe.
+        """Initialize KlinePipe.
 
         Args:
             fetcher: Fetcher instance
@@ -549,8 +531,7 @@ class KlinePipe:
         end_date: datetime.date,
         adjust: AdjustCN | None,
     ) -> pl.DataFrame:
-        """
-        Fetch stock historical data (kline).
+        """Fetch stock historical data (kline).
 
         Args:
             symbol: Stock code (e.g., "000001")
@@ -565,7 +546,7 @@ class KlinePipe:
         # Build params
         start_date_str = start_date.strftime("%Y%m%d")
         end_date_str = end_date.strftime("%Y%m%d")
-        secid, params = _build_kline_params(
+        _secid, params = _build_kline_params(
             symbol, period, start_date_str, end_date_str, adjust if adjust else ""
         )
 
@@ -592,8 +573,7 @@ class KlinePipe:
 
 
 class EastMoney:
-    """
-    Main interface for East Money data.
+    """Main interface for East Money data.
 
     Composes Fetcher, Parser, Builder internally.
     Fetcher is not exposed in the public interface.
@@ -610,8 +590,7 @@ class EastMoney:
         max_retries: int = 3,
         max_workers: int = 3,
     ):
-        """
-        Initialize EastMoney client.
+        """Initialize EastMoney client.
 
         Args:
             delay_range: (min, max) delay between requests in seconds
@@ -642,8 +621,7 @@ class EastMoney:
         )
 
     def quarterly_income(self, year: int, quarter: int) -> pl.DataFrame:
-        """
-        Fetch quarterly income statement data.
+        """Fetch quarterly income statement data.
 
         Args:
             year: Report year (e.g., 2024)
@@ -657,8 +635,7 @@ class EastMoney:
         return pipe.fetch(year, quarter)
 
     def quarterly_balance(self, year: int, quarter: int) -> pl.DataFrame:
-        """
-        Fetch quarterly balance sheet data.
+        """Fetch quarterly balance sheet data.
 
         Args:
             year: Report year (e.g., 2024)
@@ -672,8 +649,7 @@ class EastMoney:
         return pipe.fetch(year, quarter)
 
     def quarterly_cashflow(self, year: int, quarter: int) -> pl.DataFrame:
-        """
-        Fetch quarterly cash flow statement data.
+        """Fetch quarterly cash flow statement data.
 
         Args:
             year: Report year (e.g., 2024)
@@ -694,8 +670,7 @@ class EastMoney:
         end_date: datetime.date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> pl.DataFrame:
-        """
-        Fetch stock historical data (kline).
+        """Fetch stock historical data (kline).
 
         Args:
             symbol: Stock code (e.g., "000001")

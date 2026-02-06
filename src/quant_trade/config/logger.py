@@ -7,9 +7,7 @@ from loguru import logger
 
 
 def setup_logger(level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"):
-    """
-    Configure logger based on the configuration file
-    """
+    """Configure logger based on the configuration file"""
     # try:
     #     with open(config_path) as f:
     #         config = yaml.safe_load(f)
@@ -61,13 +59,15 @@ def debug_null_profile(df: pl.DataFrame) -> pl.DataFrame:
         col_data = df[col_name]
         non_null = col_data.count()
         null = col_data.null_count()
-        stats_list.append({
-            "column": col_name,
-            "non_null": non_null,
-            "null": null,
-            "non_null_ratio": non_null / total if total > 0 else 0,
-            "null_ratio": null / total if total > 0 else 0,
-        })
+        stats_list.append(
+            {
+                "column": col_name,
+                "non_null": non_null,
+                "null": null,
+                "non_null_ratio": non_null / total if total > 0 else 0,
+                "null_ratio": null / total if total > 0 else 0,
+            }
+        )
 
     stats = pl.DataFrame(stats_list).sort("non_null")
     return stats

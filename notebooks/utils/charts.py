@@ -72,20 +72,35 @@ def plot_kline(
     if show_range_selector:
         fig.update_xaxes(
             rangebreaks=[
-                dict(bounds=["sat", "mon"]),
+                {"bounds": ["sat", "mon"]},
             ],
-            rangeselector=dict(
-                buttons=[
-                    dict(count=1, label="1M", step="month", stepmode="backward"),
-                    dict(count=3, label="3M", step="month", stepmode="backward"),
-                    dict(count=6, label="6M", step="month", stepmode="backward"),
-                    dict(count=1, label="YTD", step="year", stepmode="todate"),
-                    dict(count=1, label="1Y", step="year", stepmode="backward"),
-                    dict(step="all", label="All"),
+            rangeselector={
+                "buttons": [
+                    {
+                        "count": 1,
+                        "label": "1M",
+                        "step": "month",
+                        "stepmode": "backward",
+                    },
+                    {
+                        "count": 3,
+                        "label": "3M",
+                        "step": "month",
+                        "stepmode": "backward",
+                    },
+                    {
+                        "count": 6,
+                        "label": "6M",
+                        "step": "month",
+                        "stepmode": "backward",
+                    },
+                    {"count": 1, "label": "YTD", "step": "year", "stepmode": "todate"},
+                    {"count": 1, "label": "1Y", "step": "year", "stepmode": "backward"},
+                    {"step": "all", "label": "All"},
                 ],
-                xanchor="left",
-                x=0.01,
-            ),
+                "xanchor": "left",
+                "x": 0.01,
+            },
             row=1,
             col=1,
         )

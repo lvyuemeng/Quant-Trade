@@ -367,8 +367,7 @@ def stock_code_sus(date: DateLike) -> pl.DataFrame:
 
 
 class SWIndustryCls:
-    """
-    Shenwan (申万) industry classification manager.
+    """Shenwan (申万) industry classification manager.
     Supports L1/L2/L3 levels, point-in-time views, and caching.
 
     Cache file: ~/.cache/quant/sw_industry_cls.parquet (zstd compressed)
@@ -385,9 +384,7 @@ class SWIndustryCls:
         self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     def load_or_build(self, fresh: bool = False) -> pl.DataFrame:
-        """
-        Load from cache if available and valid, otherwise build and save.
-        """
+        """Load from cache if available and valid, otherwise build and save."""
         if (
             not fresh
             and not self.rebuild_cache
@@ -419,8 +416,7 @@ class SWIndustryCls:
         return df
 
     def _load_or_build_level_maps(self, fresh: bool = False) -> pl.DataFrame:
-        """
-        Build or load a flat L3 → L2 → L1 mapping table.
+        """Build or load a flat L3 → L2 → L1 mapping table.
 
         Returned schema (one row per L3 industry):
             sw_l3_code | sw_l2_code | sw_l2_name | sw_l1_code | sw_l1_name
@@ -451,7 +447,7 @@ class SWIndustryCls:
             raise ValueError("One or more level info fetches returned empty data")
 
         l1_name_to_code: dict[str, str] = dict(
-            zip(l1["sw_l1_name"].to_list(), l1["sw_l1_code"].to_list())
+            zip(l1["sw_l1_name"].to_list(), l1["sw_l1_code"].to_list(), strict=False)
         )
 
         l2_enriched = l2.with_columns(
@@ -467,7 +463,9 @@ class SWIndustryCls:
 
         l2_name_to_code: dict[str, str] = dict(
             zip(
-                l2_enriched["sw_l2_name"].to_list(), l2_enriched["sw_l2_code"].to_list()
+                l2_enriched["sw_l2_name"].to_list(),
+                l2_enriched["sw_l2_code"].to_list(),
+                strict=False,
             )
         )
 
@@ -486,12 +484,14 @@ class SWIndustryCls:
             zip(
                 l2_enriched["sw_l2_code"].to_list(),
                 l2_enriched["sw_l1_code"].to_list(),
+                strict=False,
             )
         )
         l2_code_to_l2_name: dict[str, str] = dict(
             zip(
                 l2_enriched["sw_l2_code"].to_list(),
                 l2_enriched["sw_l2_name"].to_list(),
+                strict=False,
             )
         )
 
@@ -508,6 +508,7 @@ class SWIndustryCls:
                         zip(
                             l1["sw_l1_code"].to_list(),
                             l1["sw_l1_name"].to_list(),
+                            strict=False,
                         )
                     )
                 )
@@ -743,8 +744,7 @@ class SWIndustryCls:
         include_names: bool = False,
         fresh: bool = False,
     ) -> pl.DataFrame:
-        """
-        Simplified L1 mapping: ts_code → sw_l1_code (optionally with names)
+        """Simplified L1 mapping: ts_code → sw_l1_code (optionally with names)
         Can be point-in-time if as_of_date is given.
         """
         df = self.get_full_classification(fresh=fresh)
@@ -762,8 +762,7 @@ class SWIndustryCls:
         return df.select(cols).unique("ts_code", keep="last")
 
     def get_classification_as_of(self, as_of: date) -> pl.DataFrame:
-        """
-        Point-in-time industry classification valid on or before `as_of` date.
+        """Point-in-time industry classification valid on or before `as_of` date.
         Returns the latest known classification per stock where join_date <= as_of.
         """
         df = self.get_full_classification()
@@ -818,9 +817,7 @@ class SWIndustryCls:
 class AkShareUniverse:
     @staticmethod
     def stock_whole() -> pl.DataFrame:
-        """
-        Fetch A-Share stock universe in general.
-        """
+        """Fetch A-Share stock universe in general."""
         df = stock_code_whole()
         return df
 
@@ -922,8 +919,7 @@ class AkShareMicro:
         end_date: date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> list[pl.DataFrame]:
-        """
-        Parallel fetch OHLCV for many symbols.
+        """Parallel fetch OHLCV for many symbols.
         Returns list of pl.DataFrame **in the same order** as input `codes`.
         Empty DataFrame = no data / filtered / failed.
         """
@@ -1061,8 +1057,7 @@ class AkShareMacro:
 
     @staticmethod
     def northbound_flow() -> pl.DataFrame:
-        """
-        Fetch combined northbound (沪港通 + 深港通) net buy flow.
+        """Fetch combined northbound (沪港通 + 深港通) net buy flow.
         Columns: date, net_buy, fund_inflow, cum_net_buy
         """
         # start_dt = to_date(start_date) if start_date else date(2014, 11, 17)
@@ -1120,8 +1115,7 @@ class AkShareMacro:
         # start_date: DateLike | None = None,
         # end_date: DateLike | None = None,
     ) -> pl.DataFrame:
-        """
-        Combined SH+SZ margin & short-selling balance (daily).
+        """Combined SH+SZ margin & short-selling balance (daily).
         Main column of interest: total_margin_balance
         """
         # start_dt = to_date(start_date) if start_date else date(2010, 3, 31)
@@ -1173,9 +1167,7 @@ class AkShareMacro:
 
     @staticmethod
     def shibor() -> pl.DataFrame:
-        """
-        Full SHIBOR rates history (all tenors).
-        """
+        """Full SHIBOR rates history (all tenors)."""
         # start_dt = to_date(start_date) if start_date else date(2017, 3, 17)
         # end_dt = to_date(end_date) if end_date else date.today()
 
@@ -1216,9 +1208,7 @@ class AkShareMacro:
 
     @staticmethod
     def csi1000_daily_ohlcv() -> pl.DataFrame:
-        """
-        CSI 1000 Index daily OHLCV (akshare uses em interface).
-        """
+        """CSI 1000 Index daily OHLCV (akshare uses em interface)."""
         # start_dt = to_date(start_date) if start_date else date(2005, 1, 5)
         # end_dt = to_date(end_date) if end_date else date.today()
 
@@ -1241,9 +1231,7 @@ class AkShareMacro:
         # start_date: DateLike | None = None,
         # end_date: DateLike | None = None,
     ) -> pl.DataFrame:
-        """
-        CSI 1000 Volatility Index (QVIX) daily data.
-        """
+        """CSI 1000 Volatility Index (QVIX) daily data."""
         # start_dt = to_date(start_date) if start_date else date(2005, 2, 9)
         # end_dt = to_date(end_date) if end_date else date.today()
 

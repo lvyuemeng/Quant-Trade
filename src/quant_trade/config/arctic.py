@@ -80,8 +80,7 @@ class ArcticDB:
 
 
 class ArcticAdapter:
-    """
-    Unified, lightweight adapter for ArcticDB read/write.
+    """Unified, lightweight adapter for ArcticDB read/write.
 
     Usage:
         # Write (accepts pandas, polars, arrow, narwhals, dict)
@@ -94,8 +93,7 @@ class ArcticAdapter:
 
     @staticmethod
     def to_write(data: Any) -> pd.DataFrame:
-        """
-        Convert input → ArcticDB-friendly format (pandas DataFrame).
+        """Convert input → ArcticDB-friendly format (pandas DataFrame).
         Priority: Polars > Arrow > Pandas > dict
         """
         if isinstance(data, pl.DataFrame):
@@ -117,9 +115,7 @@ class ArcticAdapter:
 
     @staticmethod
     def from_read(data: Any) -> pl.DataFrame:
-        """
-        Normalize ArcticDB output → Narwhals DataFrame
-        """
+        """Normalize ArcticDB output → Narwhals DataFrame"""
         if hasattr(data, "collect"):
             data = data.collect()
 

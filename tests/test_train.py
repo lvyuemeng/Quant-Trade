@@ -6,7 +6,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from quant_trade.model.base import (
+from quant_trade.model.process import (
     GaussianLabelBuilder,
     LGBDataProcessor,
     LGBModelResult,
@@ -23,10 +23,12 @@ def default_start_date() -> date:
 
 
 def mock_stocks(
-    n_stocks: int = 10, n_days: int = 1000, start_date: date = default_start_date()
+    n_stocks: int = 10, n_days: int = 1000, start_date: date | None = None
 ) -> pl.DataFrame:
     """Create synthetic financial data for testing."""
     # Create dates as a list of strings first, then convert
+    if start_date is None:
+        start_date = default_start_date()
     start_dt = start_date
     dates = [start_dt + timedelta(days=i) for i in range(n_days)]
 
@@ -272,7 +274,7 @@ def test_gaussian_label_builder_basic():
     # Check output columns
     label_col = builder.label_name
     assert label_col in labeled_df.columns
-    assert "label_ret_fwd_21d" == label_col
+    assert label_col == "label_ret_fwd_21d"
 
     # Check no null labels
     assert labeled_df[label_col].null_count() == 0
