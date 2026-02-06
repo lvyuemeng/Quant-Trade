@@ -8,7 +8,7 @@ import pytest
 
 from quant_trade.model.base import (
     GaussianLabelBuilder,
-    LGBDataset,
+    LGBDataProcessor,
     LGBModelResult,
     LGBRankConfig,
     LGBTrainer,
@@ -332,7 +332,7 @@ def test_lgbdataset_build():
     )
 
     features = ["feature_1_z", "feature_2_z"]
-    dataset_builder = LGBDataset(features=features, label_cls=label_builder)
+    dataset_builder = LGBDataProcessor(features=features, label_cls=label_builder)
 
     dataset, feature_names = dataset_builder.build(df)
     dataset = dataset.construct()
@@ -357,7 +357,9 @@ def test_lgbdataset_groups():
     df = mock_stocks(n_stocks=3, n_days=10)
 
     label_builder = GaussianLabelBuilder(factor="ret_fwd_21d", rank_over="date")
-    dataset_builder = LGBDataset(features=["feature_1_z"], label_cls=label_builder)
+    dataset_builder = LGBDataProcessor(
+        features=["feature_1_z"], label_cls=label_builder
+    )
 
     dataset, _ = dataset_builder.build(df)
 
@@ -385,11 +387,11 @@ def test_lgbtrainer_simple_training():
 
     # Setup trainer
     label_builder = GaussianLabelBuilder(factor="ret_fwd_21d", rank_over="date")
-    dataset_builder = LGBDataset(
+    dataset_builder = LGBDataProcessor(
         features=["feature_1_z", "feature_2_z"], label_cls=label_builder
     )
     config = LGBRankConfig()
-    trainer = LGBTrainer(dataset=dataset_builder, config=config)
+    trainer = LGBTrainer(processor=dataset_builder, config=config)
 
     # Train without optimization
     result = trainer.train(train_df=train_df, val_df=val_df, optimize=False, n_trials=1)
@@ -414,10 +416,12 @@ def test_lgbtrainer_with_optimization_small():
     val_df = df.filter(pl.col("date") >= split_date)
 
     label_builder = GaussianLabelBuilder(factor="ret_fwd_21d", rank_over="date")
-    dataset_builder = LGBDataset(features=["feature_1_z"], label_cls=label_builder)
+    dataset_builder = LGBDataProcessor(
+        features=["feature_1_z"], label_cls=label_builder
+    )
 
     config = LGBRankConfig()
-    trainer = LGBTrainer(dataset=dataset_builder, config=config)
+    trainer = LGBTrainer(processor=dataset_builder, config=config)
 
     # Train with optimization (small trial count)
     result = trainer.train(

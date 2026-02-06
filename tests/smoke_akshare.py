@@ -21,7 +21,7 @@ SHEET_QUATER: Final[int] = 1
 
 
 def test_stock_daily(m: ak.AkShareMicro):
-    df = m.market_ohlcv(INDEX_CODE, period=PERIOD)
+    df = m.market_ohlcv("000001", period=PERIOD)
     print(f"stock daily: {df}")
 
 

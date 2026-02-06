@@ -1,13 +1,27 @@
-import multiprocessing
 from datetime import date
 
+import os
+import polars as pl
+
 from quant_trade.config.arctic import ArcticDB
+from quant_trade.feature.query import MacroBook
 from quant_trade.feature.store import (
     CNFundamental,
+    CNIndustrySectorGroup,
     CNMacro,
     CNMarket,
     CNStockPool,
 )
+from quant_trade.model.base import (
+    GaussianLabelBuilder,
+    LGBDataProcessor,
+    LGBTrainer,
+    PurgedKFold,
+)
+from tests.conftest import smoke_configure
+
+# Create model directory if it doesn't exist
+os.makedirs("./model", exist_ok=True)
 
 LABEL = [
     "ret_1m",
@@ -23,7 +37,6 @@ SELECTED = [
     # trend signal
     "above_ma12",
     "ma_cross_up",
-    "ch_pos",
     # rate of change
     "roc_4",
     "roc_12",
@@ -46,14 +59,14 @@ SELECTED = [
     "nb_flow_z_short_northbound"
     "nb_flow_conviction_northbound"
     "nb_flow_trend_northbound"
-    "nb_flow_accel_up_northbound"
+    "nb_flow_accel_up_northbound",
     # marginshort
-    "margin_dev60_marginshort",
-    "short_long_ratio_marginshort",
-    "short_stress_60d_marginshort"
+    # "margin_dev60_marginshort",
+    # "short_long_ratio_marginshort",
+    # "short_stress_60d_marginshort"
     # shibor
-    "shibor_spread_3m_on_shibor",
-    "shibor_liquidity_tighten_shibor",
+    # "shibor_spread_3m_on_shibor",
+    # "shibor_liquidity_tighten_shibor",
 ]
 
 SELECTED_NEUTRAL = [
@@ -67,27 +80,35 @@ SELECTED_NEUTRAL = [
 ]
 
 
-# def batch_loader(
-#     start_date: date,
-#     end_date: date,
-#     n_splits: int,
-#     batch_size_days=261,
-# ) -> Generator[tuple[pl.DataFrame, pl.DataFrame]]:
-#     """Generator that yields data in batches."""
-#     from datetime import timedelta
+def stack_all(
+    market: pl.DataFrame, fund: pl.DataFrame, macro: pl.DataFrame
+) -> pl.DataFrame:
+    market = market.sort(by="date").with_columns(pl.col("date").cast(pl.Date)).sort("date")
+    fund = fund.sort(by=["notice_date", "ts_code"]).with_columns(
+        pl.col("notice_date").cast(pl.Date)
+    ).sort("notice_date")
+    macro = macro.sort(by=["date"]).with_columns(pl.col("date").cast(pl.Date)).sort("date")
 
-#     current_start = start_date
-#     while current_start <= end_date:
-#         current_end = min(current_start + timedelta(days=batch_size_days), end_date)
+    merged = market.join_asof(
+        fund,
+        left_on="date",
+        right_on="notice_date",
+        by=["ts_code"],
+        strategy="backward",
+    )
+    merged = merged.join(macro, on="date", how="inner")
+    merged = merged.sort("ts_code", "date")
 
-#         log.info(f"batch df: {batch_df.columns} \n {batch_df}")
-#         kfold = PurgedKFold(n_splits=2, horizon_days=0, embargo_days=0)
-#         yield from kfold.split(batch_df, date_col="date")
+    merged = merged.filter(
+        (pl.col("date").diff().over("ts_code") > pl.duration(days=10))
+        | (pl.col("date").diff().over("ts_code").is_null())
+    )
 
-#         current_start = current_end + timedelta(days=1)
+    return merged
+
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
+    smoke_configure()
     db = ArcticDB.from_config()
     pool = CNStockPool(db)
     market = CNMarket(db, source="baostock")
@@ -98,22 +119,29 @@ if __name__ == "__main__":
     end_date = date(2020, 12, 31)
 
     cons = pool.read_pool("csi500", date=end_date)
-    # market_df = market.read("601615", fresh=True)
-    # print(f"market df: {market_df.columns} \n {market_df}")
     market_df = market.range_read(
-        ts_codes=cons["ts_code"].to_list(), start=start_date, end=end_date, fresh=True
+        books=cons["ts_code"].to_list(), start=start_date, end=end_date
     )
-    print(f"market df: {market_df.columns} \n {market_df}")
+    fund_df = fund.range_read(
+        start=start_date,
+        end=end_date,
+    )
+    sector = CNIndustrySectorGroup(db, factors=SELECTED_NEUTRAL, std_suffix="_z")
+    neu_fund_df = sector(fund_df)
+    north_df = macro.read(book=MacroBook("northbound"))
 
-# factor = "ret_1y"
-# feature_columns = SELECTED + [f"{item}_z" for item in SELECTED_NEUTRAL]
+    merged = stack_all(market_df, neu_fund_df, north_df)
+    print(f"{len(merged)}")
+    factor_col = "ret_1m"
+    feature_cols = SELECTED + sector.zfactors()
 
-# label_builder = GaussianLabelBuilder("ret_1m", rank_over="date")
-# dataset_builder = LGBDataset(features=feature_columns, label_cls=label_builder)
-# config = LGBRankConfig()
-# trainer = LGBTrainer(dataset=dataset_builder, config=config)
-# result = trainer.train_batchwise(
-#     batch_loader(lib, start_date, end_date, n_splits=3), optimize=True
-# )
-# result.model.save_model("./model/aka.txt")
-# print(f"results: {result}")
+    label_builder = GaussianLabelBuilder("ret_1m", rank_by="date")
+    processor = LGBDataProcessor(features=feature_cols, label_cls=label_builder)
+    trainer = LGBTrainer(processor=processor)
+
+    data_batch = PurgedKFold(5, horizon_days=0, embargo_days=0).split(
+        merged, date_col="date"
+    )
+    result = trainer.train_batchwise(data_batch, optimize=True)
+    result.model.save_model("./model/1.txt")
+    print(f"results: {result}")

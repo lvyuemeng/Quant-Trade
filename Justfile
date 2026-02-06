@@ -19,6 +19,9 @@ test-ci:
 smoke-test file:
     uv run python -m tests.{{file}}
 
+smoke-run file:
+    uv run python -m scripts.{{file}}
+
 # ------------------------
 # Lint / format / typing
 # ------------------------

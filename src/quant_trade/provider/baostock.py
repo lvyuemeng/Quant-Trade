@@ -1,4 +1,5 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from datetime import date
 from functools import partial
 from typing import Any, Protocol
 
@@ -119,7 +120,7 @@ def _fetch_quarterly(
     code = normalize_bao_ts_code(code)
     ident_rename = {
         "code": "ts_code",
-        "pubDate": "announcement_date",
+        "pubDate": "notice_date",
         "statDate": "date",
     }
     df = (
@@ -129,7 +130,7 @@ def _fetch_quarterly(
         .rename(rename)
     )
     df = normalize_date_column(df, date_col="date")
-    df = normalize_date_column(df, date_col="announcement_date")
+    df = normalize_date_column(df, date_col="notice_date")
     df = df.with_columns(normalize_ts_code("ts_code", exchange=None))
     return df
 
@@ -293,7 +294,7 @@ def market_ohlcv(
     return df
 
 
-def csi500_cons(date: DateLike | None = None) -> pl.DataFrame:
+def csi500_cons(date: date | None = None) -> pl.DataFrame:
     log.info(f"Fetching csi500 cons at {date}")
     date_str = to_bao_ymd_str(date) if date else None
     df = (
@@ -309,6 +310,7 @@ def csi500_cons(date: DateLike | None = None) -> pl.DataFrame:
     )
     df = normalize_date_column(df, date_col="date")
     df = df.with_columns(normalize_ts_code("ts_code", exchange=None))
+    df = df.filter(~pl.col("name").str.contains(r"(?i)ST|\*ST"))
     return df
 
 
@@ -319,8 +321,8 @@ class BaoMicro:
     def market_ohlcv(
         symbol: str,
         period: Period,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> pl.DataFrame:
         with BaoSession():
@@ -329,10 +331,10 @@ class BaoMicro:
 
     @staticmethod
     def batch_market_ohlcv(
-        symbols: list[str],
+        symbols: Sequence[str],
         period: Period,
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> list[pl.DataFrame]:
         """
@@ -359,7 +361,7 @@ class BaoMacro:
     """financial statement macro-APIs (BaoStock façade)."""
 
     @staticmethod
-    def csi500_cons(date: DateLike | None = None) -> pl.DataFrame:
+    def csi500_cons(date: date | None = None) -> pl.DataFrame:
         with BaoSession():
             df = csi500_cons(date)
         return df

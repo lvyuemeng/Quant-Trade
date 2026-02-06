@@ -8,8 +8,7 @@ import optuna
 import polars as pl
 from scipy import stats
 
-from quant_trade.config.logger import log
-from quant_trade.feature.process import CrossSection
+from quant_trade.config.logger import log,debug_null_profile
 from quant_trade.transform import DateLike, to_date
 
 
@@ -279,7 +278,7 @@ class LabelBuilder(Protocol):
     @property
     def label_name(self) -> str: ...
     @property
-    def rank_over_name(self) -> str: ...
+    def rank_by_name(self) -> str: ...
 
 
 @dataclass
@@ -297,104 +296,51 @@ class GaussianLabelBuilder:
     4. Gaussian transform: y = Φ⁻¹(u) where Φ is standard normal CDF
     """
 
-    def __init__(
-        self,
-        factor: str,
-        rank_over: str = "date",
-        group_by: list | str | None = None,
-        limits: tuple[float, float] = (0.01, 0.99),
-        alpha: float = 0.5,
-    ):
-        """
-        Args:
-            return_column: Column containing forward returns to transform
-            date_column: Date column for cross-sectional operations
-            group_columns: Additional grouping columns for winsorization
-                          (e.g., ["sw_l1_code"] for industry groups)
-            winsorize_quantiles: Quantiles for winsorization (lower, upper)
-        """
-        self.factor = factor
-        self.rank_over = rank_over
-        self.alpha = alpha
-
-        # Handle group columns
-        if group_by is None:
-            self.group_columns = [rank_over]
-        elif isinstance(group_by, str):
-            self.group_columns = [rank_over, group_by]
-        else:
-            self.group_columns = [rank_over] + list(group_by)
-
-        self.win_lower, self.win_upper = limits
-
-        # Column names for intermediate steps
-        self.win_col = f"{factor}_win"
-        self.count_col = f"{self.win_col}_n"
-        self.rank_col = f"{factor}_rank"
-        self.uniform_col = f"{factor}_uniform"
-        self.label_col = f"label_{factor}"
+    factor: str
+    rank_by: str = "date"
+    by: list[str] | None = None
+    winsor_limits: tuple[float, float] | None = (0.01, 0.99)
+    alpha: float = 0.5
+    label_prefix: str = "label_"
 
     def label(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Apply Gaussian transformation to create labels.
+        log.debug(f"preparing df sanity: {debug_null_profile(df)}")
+        by = self.by + [self.rank_by] if self.by else self.rank_by
 
-        Returns:
-            DataFrame with added label column containing Gaussian-transformed values
-        """
-        df_clean = df.filter(pl.col(self.factor).is_not_null())
-        df_winsorized = df_clean.with_columns(
-            CrossSection.winsorize(
-                col=self.factor,
-                by=self.rank_over,
-                limits=(self.win_lower, self.win_upper),
-                name=self.win_col,
-            )
-        )
-        df_with_count = df_winsorized.with_columns(
-            pl.col(self.win_col).count().over(self.rank_over).alias(self.count_col)
-        )
-        df_ranked = df_with_count.with_columns(
-            CrossSection.rank(
-                self.win_col, by=self.rank_over, name=self.rank_col, ascending=True
-            )
-        )
-        # Apply uniform transformation
-        df_uniform = df_ranked.with_columns(
-            (
-                (pl.col(self.rank_col) - self.alpha)
-                / (pl.col(self.count_col) + 1 - 2 * self.alpha)
-            )
-            .clip(1e-10, 1 - 1e-10)
-            .alias(self.uniform_col)
-        )
-        result = df_uniform.with_columns(
-            pl.col(self.uniform_col)
-            .map_elements(lambda u: stats.norm.ppf(u))
-            .alias(self.label_col)
-        )
-        columns_to_drop = [
-            self.win_col,
-            self.rank_col,
-            self.uniform_col,
-            self.count_col,
-        ]
-        result = result.drop(
-            [c for c in columns_to_drop if c in result.columns]
-        ).filter(pl.col(self.label_col).is_not_null())
+        if self.factor not in df.columns:
+            raise ValueError(f"Factor '{self.factor}' not found in DataFrame")
 
-        return result
+        x = pl.col(self.factor)
+        if self.winsor_limits is not None:
+            lo, hi = self.winsor_limits
+            x = x.clip(
+                x.quantile(lo).over(by),
+                x.quantile(hi).over(by),
+            )
+
+        rank = x.rank("average").over(by)
+        n = pl.len().over(by)
+
+        u = ((rank - self.alpha) / (n + 1 - 2 * self.alpha)).clip(1e-12, 1 - 1e-12)
+
+        label = (
+            pl.when(n >= 3)
+            .then(u.map_elements(lambda u: stats.norm.ppf(u)))
+            .alias(self.label_name)
+        )
+
+        return df.with_columns(label).filter(pl.col(self.label_name).is_not_null())
 
     @property
     def label_name(self) -> str:
-        return self.label_col
+        return f"{self.label_prefix}{self.factor}"
 
     @property
-    def rank_over_name(self) -> str:
-        return self.rank_over
+    def rank_by_name(self) -> str:
+        return self.rank_by
 
 
-@dataclass
-class LGBDataset:
+class LGBDataProcessor:
     """
     Construct LightGBM Dataset objects with correct query groups.
 
@@ -413,15 +359,52 @@ class LGBDataset:
         self.features = features
 
     def build(
-        self, df: pl.DataFrame, ref: lgb.Dataset | None = None
+        self,
+        df: pl.DataFrame,
+        *,
+        ref: lgb.Dataset | None = None,
     ) -> tuple[lgb.Dataset, list[str]]:
         df = self.label_builder.label(df)
-        avail_feats = [f for f in self.features if f in df.columns]
-        X = df.select(avail_feats).drop_nulls().to_numpy()
-        y = df.select(self.label_builder.label_name).drop_nulls().to_series().to_numpy()
-        group_name = self.label_builder.rank_over_name
+        log.debug(f"labelled df sanity: {debug_null_profile(df)}")
 
-        groups = df.group_by(group_name).len().sort(group_name)["len"].to_numpy()
+        if len(df) == 0:
+            raise ValueError("Empty DataFrame after labeling")
+
+        label_col = self.label_builder.label_name
+        group_col = self.label_builder.rank_by_name
+
+        if label_col not in df.columns:
+            raise ValueError(f"Label column '{label_col}' not found")
+
+        if group_col not in df.columns:
+            raise ValueError(f"Group column '{group_col}' not found")
+
+        avail_feats = [f for f in self.features if f in df.columns]
+        if not avail_feats:
+            raise ValueError("No valid feature columns found")
+
+        df = df.select(avail_feats + [label_col] + [group_col]).drop_nulls()
+        if len(df) == 0:
+            raise ValueError(
+                f"DataFrame is empty after dropping nulls. "
+                f"Selected features: {avail_feats}, label: {label_col}, group: {group_col}"
+            )
+        log.debug(f"selected labelled df sanity: {debug_null_profile(df)}")
+
+        df = df.sort(group_col)
+
+        X = df.select(avail_feats).to_numpy()
+        y = df.select(label_col).to_series().to_numpy()
+
+        groups = (
+            df.group_by(group_col, maintain_order=True)
+            .len()
+            .select("len")
+            .to_series()
+            .to_numpy()
+        )
+        assert groups.sum() == len(y), "Group sizes do not sum to sample count"
+
         dataset = lgb.Dataset(
             X,
             y,
@@ -436,13 +419,45 @@ class LGBDataset:
 
 @dataclass
 class LGBModelResult:
-    """Minimal container for model results."""
-
     model: lgb.Booster
     feature_names: list[str]
     metric_val: float
     params: dict[str, Any]
     importance: dict[str, float]
+
+    def summary(self, top_k: int = 10) -> str:
+        lines = []
+
+        lines.append("=== LightGBM Training Result ===")
+        lines.append(f"Metric (val): {self.metric_val:.6f}")
+        lines.append("")
+
+        lines.append("Top features by importance:")
+        imp = (
+            sorted(self.importance.items(), key=lambda x: x[1], reverse=True)
+        )
+        for name, score in imp[:top_k]:
+            lines.append(f"  {name:<25} {score}")
+
+        lines.append("")
+        lines.append("Key parameters:")
+        keys = [
+            "num_leaves",
+            "learning_rate",
+            "min_child_samples",
+            "feature_fraction",
+            "bagging_fraction",
+            "lambda_l1",
+            "lambda_l2",
+        ]
+        for k in keys:
+            if k in self.params:
+                lines.append(f"  {k:<20} {self.params[k]}")
+
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.summary()
 
 
 @dataclass(frozen=True)
@@ -473,11 +488,11 @@ class LGBRankConfig:
 class LGBTrainer:
     def __init__(
         self,
-        dataset: "LGBDataset",
-        config: LGBRankConfig,
+        processor: "LGBDataProcessor",
+        config: LGBRankConfig | None = None,
     ) -> None:
-        self.dataset = dataset
-        self.config = config
+        self.processor = processor
+        self.config = config if config else LGBRankConfig()
 
     def _objective(
         self,
@@ -522,8 +537,8 @@ class LGBTrainer:
         optimize: bool = True,
         n_trials: int = 50,
     ) -> "LGBModelResult":
-        train_ds, features = self.dataset.build(train_df)
-        val_ds, _ = self.dataset.build(val_df)
+        train_ds, features = self.processor.build(train_df)
+        val_ds, _ = self.processor.build(val_df)
 
         cfg = self.config
 

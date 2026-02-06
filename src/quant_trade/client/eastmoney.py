@@ -20,7 +20,7 @@ import polars as pl
 
 from quant_trade.client.traits import (
     BaseBuilder,
-    BaseFetch,
+    BaseFetcher,
     BaseParser,
     ColumnSpec,
 )
@@ -32,8 +32,12 @@ from ..transform import AdjustCN, Period
 # Constants
 # =============================================================================
 
-EASTMONEY_FINANCE_API: Final[str] = "https://datacenter-web.eastmoney.com/api/data/v1/get"
-EASTMONEY_KLINE_API: Final[str] = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+EASTMONEY_FINANCE_API: Final[str] = (
+    "https://datacenter-web.eastmoney.com/api/data/v1/get"
+)
+EASTMONEY_KLINE_API: Final[str] = (
+    "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+)
 
 # =============================================================================
 # Helper Functions
@@ -121,7 +125,7 @@ def _build_kline_params(
 # =============================================================================
 
 
-class EastMoneyFetch(BaseFetch):
+class EastMoneyFetch(BaseFetcher):
     """
     EastMoney-specific Fetcher - extends BaseFetch.
 
@@ -141,34 +145,35 @@ class EastMoneyFetch(BaseFetch):
 
     def fetch_initial(self, url: str, params: dict) -> dict:
         """Fetch initial page to get total pages."""
-        self._rate_limit()
-        response = self._session.get(
+        # global adaptive rate limiting
+        self._apply_rate_limit()
+
+        response = self._client.get(
             url,
             params=params,
             headers=self._get_headers(),
-            timeout=10,
         )
         response.raise_for_status()
         return response.json()
 
     def fetch_page(self, url: str, params: dict, page: int) -> dict:
         """Fetch single page."""
-        self._rate_limit()
-        params_copy = params.copy()
+        self._apply_rate_limit()
+
+        params_copy = dict(params)
         params_copy["pageNumber"] = str(page)
 
-        response = self._session.get(
+        response = self._client.get(
             url,
             params=params_copy,
             headers=self._get_headers(),
-            timeout=(10, 30),
         )
         response.raise_for_status()
         return response.json()
 
     def close(self) -> None:
-        """Close the session."""
-        self._session.close()
+        """Close the client."""
+        self._client.close()
 
 
 class FundemantalParser(BaseParser):
@@ -498,7 +503,7 @@ class ReportPipe:
             return pl.DataFrame()
 
         total_pages = raw.get("result", {}).get("pages", 1)
-        print(f"Total pages to fetch: {total_pages}")
+        log.info(f"Total pages to fetch: {total_pages}")
 
         # Fetch remaining pages concurrently
         if total_pages > 1:
@@ -685,7 +690,7 @@ class EastMoney:
         self,
         symbol: str,
         period: Period = "daily",
-        start_date: datetime.date | None = None ,
+        start_date: datetime.date | None = None,
         end_date: datetime.date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> pl.DataFrame:
@@ -705,7 +710,7 @@ class EastMoney:
         log.info(f"Fetching stock historical data for {symbol}")
         pipe = KlinePipe(self._fetcher)
         if start_date is None:
-            start_date = datetime.date(1970, 1, 1) 
+            start_date = datetime.date(1970, 1, 1)
         if end_date is None:
             end_date = datetime.date(2050, 1, 1)
         return pipe.fetch(symbol, period, start_date, end_date, adjust)

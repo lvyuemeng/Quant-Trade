@@ -152,16 +152,17 @@ class Try:
         Returns:
             Wrapper function with retry logic
         """
-        return partial(self.pickable,fetch)
+        return partial(self.pickable, fetch)
 
-    def pickable(self,fetch:Callable[..., FetchResult], *args,**kwargs) -> FetchResult:
+    def pickable(
+        self, fetch: Callable[..., FetchResult], *args, **kwargs
+    ) -> FetchResult:
         """Wrap fetch function with retry logic, ensuring picklability for ProcessPoolExecutor.
 
         Args:
             fetch: Function to wrap
         """
         return try_call(fetch, self.retry, self.sleep, *args, **kwargs)
-
 
     def with_session(
         self,

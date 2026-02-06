@@ -1,5 +1,5 @@
 import datetime
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from functools import reduce
 from typing import (
     ClassVar,
@@ -25,23 +25,7 @@ from .process import (
     Fundamental,
     SectorGroup,
 )
-from .query import BookKey, MacroBook, QuarterBook, RecordBook, TickerBook
-
-
-@runtime_checkable
-class BookFetcher[B: BookKey](Protocol):
-    """Protocol for classes that can fetch data by BookKey."""
-
-    def _fetch_raw(self, book: B) -> pl.DataFrame: ...
-    def _process(self, book: B, raw: pl.DataFrame) -> pl.DataFrame:
-        return raw
-
-
-@runtime_checkable
-class BatchBookFetcher[B: BookKey](BookFetcher[B], Protocol):
-    """Protocol for classes that can fetch data by BookKey in batch."""
-
-    def _fetch_batch_raw(self, books: Sequence[B]) -> list[pl.DataFrame]: ...
+from .query import MacroBook, QuarterBook
 
 
 class AssetLib:
@@ -62,124 +46,143 @@ class AssetLib:
         """Direct access to ArcticDB library (advanced use only)."""
         return self._lib
 
-    def _try_read(self: Self, book: BookKey) -> pl.DataFrame | None:
-        key = book.to_key()
+    def _has(self, book: str) -> bool:
+        return self._lib.has_symbol(book)
+
+    def _try_read(self: Self, book: str) -> pl.DataFrame:
+        log.info(f"Read data: {book}")
         try:
-            df = ArcticAdapter.from_read(self._lib.read(key))
-            return df if not df.is_empty() else pl.DataFrame()
-        except Exception as e:
-            log.warning(f"Database read failed for {key}: {e}")
+            return ArcticAdapter.from_read(self._lib.read(book))
+        except Exception:
+            log.warning(f"Read empty data of {book}")
             return pl.DataFrame()
 
-    def _try_write(self: Self, book: BookKey, df: pl.DataFrame) -> None:
-        key = book.to_key()
+    def _try_write(self: Self, book: str, df: pl.DataFrame) -> None:
+        log.info(f"Write data: {book}")
+        if df.is_empty():
+            log.warning("Write data is empty")
+            return
+
         try:
-            self._lib.write(key, ArcticAdapter.to_write(df))
+            self._lib.write(book, ArcticAdapter.to_write(df))
         except Exception as e:
-            log.error(f"Database write failed for {key}: {e}")
+            log.error(f"Database write failed for {book}: {e}")
 
 
-class BookLib[B: BookKey](BookFetcher[B], AssetLib):
+@runtime_checkable
+class BookFetcher[B](Protocol):
+    """Protocol for classes that can fetch data by BookKey."""
+
+    def _key(self, book: B) -> str:
+        raise NotImplementedError
+
+    def _fetch(self, book: B) -> pl.DataFrame: ...
+    def _process(self, book: B, raw: pl.DataFrame) -> pl.DataFrame:
+        return raw
+
+
+@runtime_checkable
+class BatchBookFetcher[B](BookFetcher, Protocol):
+    """Protocol for classes that can fetch data by BookKey in batch."""
+
+    def _fetch_batch(self, books: Sequence[B]) -> Sequence[pl.DataFrame]: ...
+
+
+class BookLib[B](BookFetcher[B], AssetLib):
     """Mixin for ArcticDB-backed data by BookKey."""
 
-    def fresh(self: Self, book: B) -> None:
-        log.info(f"Fetching & processing data for {book.to_key()}")
-        raw = self._fetch_raw(book)
+    def _fresh(self: Self, book: B) -> None:
+        log.info(f"Fetching & processing data for {book}")
+        raw = self._fetch(book)
         if raw.is_empty():
-            log.warning(f"No raw data for {book.to_key()}")
+            log.warning(f"No raw data for {book}")
             return
         feat = self._process(book, raw)
-        self._try_write(book, feat)
+        self._try_write(self._key(book), feat)
 
-    def read(self: Self, book: B, fresh: bool = False) -> pl.DataFrame:
-        if fresh or not self._lib.has_symbol(book.to_key()):
-            self.fresh(book)
-        if self._lib.has_symbol(book.to_key()):
-            return ArcticAdapter.from_read(self._lib.read(book.to_key()))
-        raise KeyError(f"Data for {book.to_key()} not found in {self.lib_name()}")
+    def _read(self: Self, book: B, fresh: bool = False) -> pl.DataFrame:
+        key = self._key(book)
+        if fresh or not self._lib.has_symbol(key):
+            self._fresh(book)
+        if self._lib.has_symbol(key):
+            return ArcticAdapter.from_read(self._lib.read(key))
+        raise KeyError(f"Data for {book} not found in {self.lib_name()}")
 
 
-class BatchBookLib[B: BookKey](BatchBookFetcher[B], AssetLib):
-    def batch_fresh(self: Self, books: Sequence[B]) -> None:
-        batch = self._fetch_batch_raw(books)
+class BatchBookLib[B](BatchBookFetcher[B], AssetLib):
+    def _batch_fresh(self: Self, books: Sequence[B]) -> None:
+        batch = self._fetch_batch(books)
         for book, df in zip(books, batch):
             if df.is_empty():
                 log.warning(f"No market data for {book}")
                 continue
             feat = self._process(book, df)
-            self._try_write(book, feat)
+            self._try_write(self._key(book), feat)
 
-    def batch_read(
-        self: Self, books: Iterable[B], *, fresh: bool = False
+    def _batch_read(
+        self: Self, books: Sequence[B], *, fresh: bool = False
     ) -> list[pl.DataFrame]:
-        books_list = list(books)
-
         data: dict[B, pl.DataFrame] = {}
         to_fetch: list[B] = []
 
-        # Phase 1: read cache
         if not fresh:
-            for book in books_list:
-                df = self._try_read(book)
-                if df is not None and not df.is_empty():
+            for book in books:
+                key = self._key(book)
+                if (df := self._try_read(key)) is not None and not df.is_empty():
                     data[book] = df
                 else:
                     to_fetch.append(book)
         else:
-            to_fetch.extend(books_list)
+            to_fetch.extend(books)
 
-        # Phase 2: batch fetch missing
         if to_fetch:
-            for book, raw in zip(to_fetch, self._fetch_batch_raw(to_fetch)):
+            for book, raw in zip(to_fetch, self._fetch_batch(to_fetch)):
                 if raw.is_empty():
                     continue
                 df = self._process(book, raw)
-                data[book] = df
-                self._try_write(book, df)
+                if not df.is_empty():
+                    data[book] = df
+                    key = self._key(book)
+                    self._try_write(key, df)
 
-        # Phase 3: preserve order
         return [
-            df
-            for book in books_list
-            if (df := data.get(book)) is not None and not df.is_empty()
+            data[book] for book in books if (book in data) and not data[book].is_empty()
         ]
 
 
-class CNStockPool(BookLib[RecordBook]):
+class CNStockPool(AssetLib):
     REGION = "CN"
     SYMBOL = "stock"
 
     type Book = Literal["stock_code", "industry_code"]
     type Universe = Literal["csi500"]
 
-    @staticmethod
-    def index_universe(universe: Universe, date: datetime.date) -> RecordBook:
-        return RecordBook(f"{universe}", date)
+    def __init__(self, db: ArcticDB):
+        AssetLib.__init__(self, db)
 
     @staticmethod
-    def _fetch_stock_code() -> pl.DataFrame:
-        return ak.AkShareUniverse().stock_whole()
+    def _index_universe(universe: Universe, date: datetime.date) -> str:
+        return f"{universe}_{date}"
 
-    @staticmethod
-    def _fetch_industry_code() -> pl.DataFrame:
-        return ak.SWIndustryCls().stock_l1_industry_cls()
-
-    @staticmethod
-    def _fetch_csi500_code() -> pl.DataFrame:
-        return bs.BaoMacro().csi500_cons()
-
-    def _fetch_raw(self, book: RecordBook) -> pl.DataFrame:
+    def _fetch_pile(self, book: Book) -> pl.DataFrame:
         match book:
-            case _ if book.universe == "stock_code":
-                return self._fetch_stock_code()
-            case _ if book.universe == "industry_code":
-                return self._fetch_industry_code()
-            case _ if book.universe.startswith("csi500"):
-                return self._fetch_csi500_code()
-        raise ValueError(f"Unknown book fetch: {book}")
+            case "stock_code":
+                return ak.AkShareUniverse().stock_whole()
+            case "industry_code":
+                return ak.SWIndustryCls().stock_l1_industry_cls()
+
+    def _fetch_pool(self, universe: Universe, date: datetime.date) -> pl.DataFrame:
+        match universe:
+            case "csi500":
+                return bs.BaoMacro().csi500_cons(date)
+            # case _:
+            #     raise ValueError(f"Unknown universe fetch: {universe}")
 
     def read_codes(self, book: Book, fresh: bool = False) -> pl.DataFrame:
-        return self.read(RecordBook(book), fresh=fresh)
+        if fresh or not self._has(book):
+            self._try_write(book, self._fetch_pile(book))
+        df = self._try_read(book)
+        return df if df is not None else pl.DataFrame()
 
     def read_pool(
         self,
@@ -188,8 +191,10 @@ class CNStockPool(BookLib[RecordBook]):
         industry_cls: bool = False,
         fresh: bool = False,
     ) -> pl.DataFrame:
-        book = self.index_universe(universe, date)
-        df = self.read(book, fresh=fresh)
+        index = self._index_universe(universe, date)
+        if fresh or not self._has(index):
+            self._try_write(index, self._fetch_pool(universe, date))
+        df = self._try_read(index)
         if industry_cls:
             ind = self.read_codes("industry_code", fresh=fresh)
             df = df.join(ind, on="ts_code", how="inner")
@@ -197,55 +202,51 @@ class CNStockPool(BookLib[RecordBook]):
         return df
 
 
-class CNMarket(BookLib[TickerBook], BatchBookLib[TickerBook]):
+class CNMarket(BookLib[str], BatchBookLib[str], AssetLib):
     REGION = "CN"
     SYMBOL = "market"
 
     def __init__(self, db: ArcticDB, source: Source = "akshare"):
-        super().__init__(db)
+        AssetLib.__init__(self, db)
         self._source: Source = source
 
-    def _fetch_raw(self, book: TickerBook) -> pl.DataFrame:
-        ts_code = book.ts_code
+    def _key(self, book: str) -> str:
+        return book
+
+    def _fetch(self, book: str) -> pl.DataFrame:
         match self._source:
             case "akshare":
-                return ak.AkShareMicro().market_ohlcv(ts_code, "daily")
+                return ak.AkShareMicro().market_ohlcv(book, "daily")
             case "baostock":
-                return bs.BaoMicro().market_ohlcv(ts_code, "daily")
+                return bs.BaoMicro().market_ohlcv(book, "daily")
 
-    def _fetch_batch_raw(self, books: Iterable[TickerBook]) -> list[pl.DataFrame]:
-        ts_codes = [book.ts_code for book in books]
+    def _fetch_batch(self, books: Sequence[str]) -> list[pl.DataFrame]:
         match self._source:
             case "akshare":
-                return ak.AkShareMicro().batch_market_ohlcv(ts_codes, "daily")
+                return ak.AkShareMicro().batch_market_ohlcv(books, "daily")
             case "baostock":
-                return bs.BaoMicro().batch_market_ohlcv(ts_codes, "daily")
+                return bs.BaoMicro().batch_market_ohlcv(books, "daily")
 
-    @staticmethod
-    def _extract_features(df: pl.DataFrame) -> pl.DataFrame:
-        return Behavioral().metrics(df)
+    def _process(self, book: str, raw: pl.DataFrame) -> pl.DataFrame:
+        log.debug(f"raw df: {raw.head(5)}")
+        return (
+            Behavioral()
+            .metrics(raw, idents=["ts_code", "name"])
+            .sort("date")
+            .unique(subset=["date"], keep="last")
+        )
 
-    @staticmethod
-    def _normalize(df: pl.DataFrame) -> pl.DataFrame:
-        return df.sort("date").unique(subset=["date"], keep="last")
+    def read(self, book: str, fresh: bool = False) -> pl.DataFrame:
+        return self._read(book, fresh=fresh)
 
-    def _process(self, book: TickerBook, raw: pl.DataFrame) -> pl.DataFrame:
-        feat = self._extract_features(raw)
-        feat = self._normalize(feat)
-        return feat
-
-    def stack_read(
-        self, books: Iterable[TickerBook], fresh: bool = False
-    ) -> pl.DataFrame:
-        frames = self.batch_read(books=books, fresh=fresh)
-        if not frames:
-            return pl.DataFrame()
+    def stack_read(self, books: Sequence[str], fresh: bool = False) -> pl.DataFrame:
+        frames = self._batch_read(books, fresh=fresh)
         df = pl.concat(frames, how="vertical_relaxed")
         return df
 
     def range_read(
         self,
-        books: Iterable[TickerBook],
+        books: Sequence[str],
         start: datetime.date,
         end: datetime.date,
         fresh: bool = False,
@@ -255,48 +256,44 @@ class CNMarket(BookLib[TickerBook], BatchBookLib[TickerBook]):
         return df
 
 
-class CNFundamental(BookLib[QuarterBook], BatchBookLib[QuarterBook]):
+class CNFundamental(BookLib[QuarterBook], BatchBookLib[QuarterBook], AssetLib):
     REGION = "CN"
     SYMBOL = "fundamental"
 
-    def _fetch_raw(self, book: QuarterBook) -> pl.DataFrame:
+    def __init__(self, db: ArcticDB):
+        AssetLib.__init__(self, db)
+
+    def _key(self, book: QuarterBook) -> str:
+        return book.to_key()
+
+    def _fetch(self, book: QuarterBook) -> pl.DataFrame:
         return ak.AkShareMicro().quarterly_fundamentals(book.year, book.literal_quarter)
 
-    def _fetch_batch_raw(self, books: Iterable[QuarterBook]) -> list[pl.DataFrame]:
-        books = list(books)
-        frames = ak.AkShareMicro().batch_quarterly_fundamentals(
+    def _fetch_batch(self, books: Sequence[QuarterBook]) -> list[pl.DataFrame]:
+        return ak.AkShareMicro().batch_quarterly_fundamentals(
             yqs=[(book.year, book.literal_quarter) for book in books]
         )
-        return frames
 
-    def range_fresh(self, start: datetime.date, end: datetime.date) -> None:
-        books = QuarterBook.date_range(start, end)
-        self.batch_fresh(books=list(books))
-
-    @staticmethod
-    def _extract_features(df: pl.DataFrame) -> pl.DataFrame:
+    def _process(self, book: QuarterBook, raw: pl.DataFrame) -> pl.DataFrame:
+        log.debug(f"raw df: {raw.head(5)}")
         return (
             Fundamental()
-            .metrics(df)
+            .metrics(raw)
             .sort("ts_code")
             .unique(subset=["ts_code"], keep="last")
         )
 
-    def _process(self, book: QuarterBook, raw: pl.DataFrame) -> pl.DataFrame:
-        return self._extract_features(raw)
+    def read(self, book: QuarterBook, fresh: bool = False) -> pl.DataFrame:
+        return self._read(book, fresh=fresh)
 
     def range_read(
         self, start: datetime.date, end: datetime.date, fresh: bool = False
     ) -> pl.DataFrame:
-        books = QuarterBook.date_range(start, end)
-        frames = self.batch_read(books=books, fresh=fresh)
-        if not frames:
-            return pl.DataFrame()
+        frames = self._batch_read(list(QuarterBook.date_range(start, end)), fresh=fresh)
         return pl.concat(frames, how="vertical_relaxed")
 
 
-
-class CNMacro(BookLib[MacroBook]):
+class CNMacro(BookLib[MacroBook], AssetLib):
     REGION = "CN"
     SYMBOL = "macro"
 
@@ -305,7 +302,7 @@ class CNMacro(BookLib[MacroBook]):
     _FEATURES: ClassVar[dict[str, Callable[[pl.DataFrame], pl.DataFrame]]] = {}
 
     def __init__(self, db: ArcticDB):
-        self.db = db
+        AssetLib.__init__(self, db)
         self._init_components_once()
 
     def _init_components_once(self) -> None:
@@ -339,29 +336,40 @@ class CNMacro(BookLib[MacroBook]):
 
         self.__class__._INITIALIZED = True
 
-    def _fetch_raw(self, book: MacroBook) -> pl.DataFrame:
+    def _key(self, book: MacroBook) -> str:
+        return book.to_key()
+
+    def _fetch(self, book: MacroBook) -> pl.DataFrame:
         try:
             return self._FETCHERS[book.macro]()
         except KeyError:
             raise ValueError(f"Unknown macro book fetch: {book.macro}")
 
     def _process(self, book: MacroBook, raw: pl.DataFrame) -> pl.DataFrame:
+        log.debug(f"raw df: {raw.head(5)}")
         try:
             return self._FEATURES[book.macro](raw)
         except KeyError:
             raise ValueError(f"Unknown macro book process: {book.macro}")
 
+    def read(self, book: MacroBook, *, fresh: bool = False) -> pl.DataFrame:
+        df = self._read(book, fresh)
+        return df
+
     def read_all(self, *, fresh: bool = False) -> pl.DataFrame:
         frames: list[pl.DataFrame] = []
         for book in MacroBook.list():
             try:
-                m = self.read(book, fresh=fresh)
+                m = self._read(book, fresh=fresh)
                 m = m.rename({c: f"{c}_{book}" for c in m.columns if c != "date"})
                 frames.append(m)
             except KeyError as e:
                 log.warning(f"Failed to read book '{book}': {e}")
                 pass
-        df = reduce(lambda df_1, df_2: df_1.join(df_2, on="date", how="inner"), frames)
+        df = reduce(
+            lambda df_1, df_2: df_1.join(df_2, on="date", how="inner", coalesce=True),
+            frames,
+        )
         return df
 
 
@@ -372,6 +380,35 @@ class CNIndustrySectorGroup(SectorGroup):
     def default_fundamental_metric(cls) -> list[str]:
         """
         Default fundamental metrics
+
+        ```
+        # Profitability & margins (industry structure driven)
+        "gross_margin",
+        "operate_margin",
+        "net_margin",
+        # Capital efficiency (very industry dependent)
+        "roe",
+        "roa",
+        "asset_turnover",
+        # Leverage & balance sheet structure
+        "debt_to_equity",
+        "debt_asset_ratio",
+        # Liquidity ratios (business-model specific)
+        "current_ratio",
+        "quick_ratio",
+        # Cash flow efficiency
+        "cfo_yield",
+        "ttm_cfo_yield",
+        # Accrual / earnings quality (sector accounting conventions)
+        "accrual_ratio",
+        # Growth rates (structural growth differences)
+        "revenue_growth_yoy",
+        "net_profit_growth_yoy",
+        "asset_growth_yoy",
+        "debt_growth_yoy",
+        # TTM profitability
+        "ttm_roe",
+        ```
         """
         return [
             # Profitability & margins (industry structure driven)
@@ -414,9 +451,9 @@ class CNIndustrySectorGroup(SectorGroup):
     ):
         self.stock_pool = CNStockPool(db)
         self.industry_df: pl.DataFrame | None = None
-        by = self.INDUS_COL + by if by else self.INDUS_COL
+        group_by = self.INDUS_COL + by if by else list(self.INDUS_COL)
         super().__init__(
-            by=by,
+            by=group_by,
             factors=factors,
             std_suffix=std_suffix,
             min_group_size=min_group_size,
@@ -431,9 +468,8 @@ class CNIndustrySectorGroup(SectorGroup):
         if missing:
             raise ValueError(f"factor_df missing required columns: {missing}")
 
-        merged = df.join(self.industry_df, on=required, how="inner").filter(
-            pl.col(self.INDUS_COL).is_null()
-        )
+        merged = df.join(self.industry_df, on=required, how="inner")
+
         original_rows = len(df)
         merged_rows = len(merged)
         if merged_rows < original_rows:
@@ -441,7 +477,6 @@ class CNIndustrySectorGroup(SectorGroup):
                 f"Industry join: {merged_rows}/{original_rows} rows retained "
                 f"({merged_rows / original_rows * 100:.1f}%)"
             )
-
         if merged_rows == 0:
             log.warning("No data after industry join. Check industry data coverage.")
             return df

@@ -78,7 +78,7 @@ def book_key[T](cls: type[T]) -> type[T]:
     setattr(cls, "to_dict", to_dict)
 
     # Enhanced repr showing the key
-    original_repr = cls.__repr__
+    # original_repr = cls.__repr__
 
     def __repr__(self: T) -> str:
         key = getattr(self, "to_key")()
@@ -200,7 +200,11 @@ class RecordBook:
     universe: str
     date: datetime.date | None = None
 
-    def to_key(self) -> str: ...
+    def to_key(self) -> str:
+        """Generate key by joining all field values with '_'."""
+        if self.date is not None:
+            return f"{self.universe}_{self.date}"
+        return self.universe
 
     @classmethod
     def parse_key(cls, key: str) -> Self:
@@ -219,26 +223,27 @@ class RecordBook:
 
 
 @final
-@book_key
-@dataclass(frozen=True, slots=True)
-class TickerBook:
-    """Ticker with optional exchange: '000001_SZ' or just 'AAPL'"""
+class TickerBook(str):
+    """A seamless string-based ticker.
+    It behaves exactly like '000001_SZ' but has helper methods attached."""
 
-    symbol: str
+    def __new__(cls, symbol: str) -> Self:
+        # Ensure we are creating a string properly
+        return super().__new__(cls, symbol)
 
     def to_key(self) -> str:
-        """Override: omit exchange if None."""
-        return self.symbol
+        """Returns itself, because it IS a string."""
+        return self
 
     @classmethod
     def parse_key(cls, key: str) -> Self:
-        """Parse '000001_SZ' or 'AAPL'"""
+        """Parse key into self."""
         return cls(key)
 
     @property
     def ts_code(self) -> str:
         """Polars/ts_code format: '000001.SZ'"""
-        return self.symbol
+        return self.replace("_", ".")
 
 
 @final

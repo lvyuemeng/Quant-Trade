@@ -1,5 +1,6 @@
+from collections.abc import Generator
 from datetime import date, datetime
-from typing import Literal
+from typing import Literal, cast
 
 import polars as pl
 
@@ -40,6 +41,32 @@ def to_ymd_str(d: DateLike, sep: str = "") -> str:
     if sep:
         return dt.strftime(f"%Y{sep}%m{sep}%d")
     return dt.strftime("%Y%m%d")
+
+
+def quarter_next(year: int, quarter: Quarter) -> tuple[int, Quarter]:
+    """Get the next quarter."""
+    if quarter == 4:
+        return (year + 1, 1)
+    return (year, quarter + 1)
+
+
+def quarter_range(start_date: date, end_date: date) -> Generator[tuple[int, Quarter]]:
+    """Generate quarter instances covering the date range [start_date, end_date]."""
+    if start_date > end_date:
+        raise ValueError("start_date must be before or equal to end_date")
+
+    start_year = start_date.year
+    start_quarter = (start_date.month - 1) // 3 + 1
+    end_year = end_date.year
+    end_quarter = (end_date.month - 1) // 3 + 1
+
+    current = (start_year, cast(Quarter, start_quarter))
+    end = (end_year, cast(Quarter, end_quarter))
+
+    while current <= end:
+        yield current
+        cur_year, cur_end = current
+        current = quarter_next(cur_year, cur_end)
 
 
 # ────────────────────────────────────────────────
@@ -197,18 +224,18 @@ def normalize_date_column(
             out = out.cast(pl.Datetime)
         return df.with_columns(out.alias(date_col))
 
-    # ---- Non-string: direct cast ----
+    # ---- Non-string: try direct cast ----
     if dtype != pl.Utf8:
-        return df.with_columns(expr.cast(pl.Date, strict=strict).alias(date_col))
+        out = expr.cast(pl.Date, strict=strict)
+        return df.with_columns(out.alias(date_col))
 
-    n = len(df)
-    threshold = int(n * null_threshold)
+    n = df.height
+    min_valid = int(n * null_threshold)
 
-    def score(e: pl.Expr) -> int:
-        return n - df.select(e.null_count()).item()
+    def non_null_count(e: pl.Expr) -> int:
+        return df.select(e.is_not_null().sum()).item()
 
-    # ---- Parse candidates (ordered, unified) ----
-    candidates: list[tuple[pl.Expr, type[pl.Date | pl.Datetime]]] = []
+    candidates: list[tuple[pl.Expr, type[pl.Date] | type[pl.Datetime]]] = []
 
     # Date formats
     for fmt in (
@@ -230,19 +257,21 @@ def normalize_date_column(
             (expr.str.strptime(pl.Datetime, fmt, strict=False), pl.Datetime)
         )
 
-    # Last-resort auto datetime
+    # Last-resort auto inference
     candidates.append((expr.str.to_datetime(strict=False), pl.Datetime))
 
     # ---- Select best candidate ----
-    best_expr = None
-    best_type = None
+    best_expr: pl.Expr | None = None
+    best_dtype: type[pl.Date] | type[pl.Datetime] | None = None
     best_score = -1
 
-    for cand, cand_type in candidates:
-        s = score(cand)
-        if s > best_score:
-            best_expr, best_type, best_score = cand, cand_type, s
-        if s >= threshold:
+    for cand_expr, cand_dtype in candidates:
+        score = non_null_count(cand_expr)
+        if score > best_score:
+            best_expr = cand_expr
+            best_dtype = cand_dtype
+            best_score = score
+        if score >= min_valid:
             break
 
     if best_expr is None or best_score <= 0:
@@ -252,9 +281,9 @@ def normalize_date_column(
 
     # ---- Normalize output type ----
     out = best_expr
-    if target_type == "date" and best_type == pl.Datetime:
+    if target_type == "date" and best_dtype == pl.Datetime:
         out = out.dt.date()
-    elif target_type == "datetime" and best_type == pl.Date:
+    elif target_type == "datetime" and best_dtype == pl.Date:
         out = out.cast(pl.Datetime)
 
     return df.with_columns(out.alias(date_col))

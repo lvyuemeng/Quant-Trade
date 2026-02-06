@@ -619,7 +619,7 @@ class Behavioral:
         )
 
     @staticmethod
-    def metrics(df: pl.DataFrame) -> pl.DataFrame:
+    def metrics(df: pl.DataFrame, idents: list[str] | None = None) -> pl.DataFrame:
         """
         Combine all behavioral feature groups.
         """
@@ -634,13 +634,25 @@ class Behavioral:
         vola = Behavioral.volatility(df)
         vol = Behavioral.volume(df)
         stru = Behavioral.structure(df)
+
         combined = (
             mom.join(vola, on=Behavioral.IDENT_COLS, how="inner")
             .join(vol, on=Behavioral.IDENT_COLS, how="inner")
             .join(stru, on=Behavioral.IDENT_COLS, how="inner")
         )
 
-        return combined.sort("date")
+        if idents:
+            to_add = [
+                c for c in idents if c in df.columns and c not in combined.columns
+            ]
+            if to_add:
+                combined = combined.join(
+                    df.select([*Behavioral.IDENT_COLS, *to_add]).unique(),
+                    on=Behavioral.IDENT_COLS,
+                    how="left",
+                )
+
+        return combined
 
 
 class Northbound:
@@ -681,8 +693,6 @@ class Northbound:
         if "net_buy" not in df.columns:
             log.warning("No 'net_buy' column → returning empty flow features")
             return df.select(*Northbound.IDENT_COLS)
-
-        df = df.sort("date")
 
         df = df.with_columns(
             Northbound._safe_zscore(
@@ -770,7 +780,7 @@ class Northbound:
             log.warning("No 'net_buy' → returning empty accel features")
             return df.select(*Northbound.IDENT_COLS)
 
-        df = df.sort("date").with_columns(
+        df = df.with_columns(
             nb_flow_delta=pl.col("net_buy").diff(),
             nb_flow_accel=pl.col("net_buy").diff().diff(),
         )
@@ -813,7 +823,7 @@ class Northbound:
         a = Northbound.accel(df)
 
         combined = f.join(p, on=Northbound.IDENT_COLS, how="inner").join(
-            a, on=Northbound.IDENT_COLS, how="inner", coalesce=True
+            a, on=Northbound.IDENT_COLS, how="inner"
         )
         return combined.with_columns(
             # Overall shock: ANY shock from flow or accel windows
@@ -862,8 +872,7 @@ class MarginShort:
             return df.select(*MarginShort.IDENT_COLS)
 
         return (
-            df.sort("date")
-            .with_columns(
+            df.with_columns(
                 margin_ma20=pl.col("total_margin_balance").rolling_mean(
                     20, min_samples=5
                 ),
@@ -904,8 +913,7 @@ class MarginShort:
             return df.select(*MarginShort.IDENT_COLS)
 
         return (
-            df.sort("date")
-            .with_columns(
+            df.with_columns(
                 margin_delta=pl.col("total_margin_balance").diff(),
             )
             .with_columns(
@@ -947,38 +955,34 @@ class MarginShort:
             log.warning(f"Missing columns for stress: {missing}")
             return df.select(*MarginShort.IDENT_COLS)
 
-        df = (
-            df.sort("date")
-            .with_columns(
-                short_long_ratio=MarginShort._safe_ratio(
-                    "short_sell_volume",
-                    "margin_buy_amount",
-                    "short_long_ratio",
-                    clip_lower=0.0,
-                    clip_upper=10.0,
-                ),
-                short_leverage_ratio=MarginShort._safe_ratio(
-                    "short_balance",
-                    "total_margin_balance",
-                    "short_leverage_ratio",
-                    clip_lower=0.0,
-                    clip_upper=2.0,  # raised upper limit
-                ),
-                short_ma20=pl.col("short_sell_volume").rolling_mean(20, min_samples=5),
-                short_ma60=pl.col("short_sell_volume").rolling_mean(60, min_samples=15),
-            )
-            .with_columns(
-                short_pressure_20d=(
-                    pl.col("short_sell_volume") > pl.col("short_ma20") * 1.5
-                ).cast(pl.Int8),
-                short_pressure_60d=(
-                    pl.col("short_sell_volume") > pl.col("short_ma60") * 1.5
-                ).cast(pl.Int8),
-                short_stress_60d=(
-                    pl.col("short_leverage_ratio")
-                    > pl.col("short_leverage_ratio").rolling_mean(60, min_samples=15)
-                ).cast(pl.Int8),
-            )
+        df = df.with_columns(
+            short_long_ratio=MarginShort._safe_ratio(
+                "short_sell_volume",
+                "margin_buy_amount",
+                "short_long_ratio",
+                clip_lower=0.0,
+                clip_upper=10.0,
+            ),
+            short_leverage_ratio=MarginShort._safe_ratio(
+                "short_balance",
+                "total_margin_balance",
+                "short_leverage_ratio",
+                clip_lower=0.0,
+                clip_upper=2.0,  # raised upper limit
+            ),
+            short_ma20=pl.col("short_sell_volume").rolling_mean(20, min_samples=5),
+            short_ma60=pl.col("short_sell_volume").rolling_mean(60, min_samples=15),
+        ).with_columns(
+            short_pressure_20d=(
+                pl.col("short_sell_volume") > pl.col("short_ma20") * 1.5
+            ).cast(pl.Int8),
+            short_pressure_60d=(
+                pl.col("short_sell_volume") > pl.col("short_ma60") * 1.5
+            ).cast(pl.Int8),
+            short_stress_60d=(
+                pl.col("short_leverage_ratio")
+                > pl.col("short_leverage_ratio").rolling_mean(60, min_samples=15)
+            ).cast(pl.Int8),
         )
 
         pressure_cols = cs.starts_with("short_pressure_")
@@ -1008,10 +1012,10 @@ class MarginShort:
 
         lev = MarginShort.level(df)
         imp = MarginShort.impulse(df)
-        str_ = MarginShort.stress(df)
+        stress = MarginShort.stress(df)
 
         combined = lev.join(imp, on=MarginShort.IDENT_COLS, how="inner").join(
-            str_, on=MarginShort.IDENT_COLS, how="inner"
+            stress, on=MarginShort.IDENT_COLS, how="inner"
         )
 
         return combined.with_columns(
@@ -1058,8 +1062,6 @@ class Shibor:
             log.warning("No 'ON_rate' column → returning empty shock features")
             return df.select(*Shibor.IDENT_COLS)
 
-        df = df.sort("date")
-
         df = df.with_columns(
             on_change=pl.col("ON_rate").diff(),
         )
@@ -1104,7 +1106,6 @@ class Shibor:
             log.warning(f"Too few tenors ({available}) → empty curve features")
             return df.select(*Shibor.IDENT_COLS)
 
-        df = df.sort("date")
         exprs = []
 
         if "ON_rate" in available:
@@ -1186,67 +1187,117 @@ class Shibor:
         ).sort("date")
 
 
-class CrossSection:
+@dataclass(frozen=True)
+class CrossSectionFlow:
     """
-    Cross-sectional operations: winsorization, standardization, neutralization.
-    All ops use window functions grouped by 'by' keys (usually date or date+sector).
+    Build shared group-level statistics for multiple factors.
     """
 
-    @staticmethod
-    def winsorize(
-        col: str | pl.Expr,
-        by: str | list[str],
-        limits: tuple[float, float] = (0.01, 0.99),
-        name: str | None = None,
-    ) -> pl.Expr:
-        """
-        Cross-sectional winsorization: clip to group quantiles.
+    by: list[str]
+    namespace: str = "cs"
+    sep: str = "_"
 
-        Args:
-            col: column name or Expr
-            by: group-by key(s) — e.g. "date" or ["date", "sw_l1_code"]
-            limits: (lower, upper) quantile bounds
-            name: output column name (default: original or col + "_win")
+    @property
+    def prefix(self) -> str:
+        return f"{self.namespace}{self.sep}"
 
-        Returns:
-            clipped Expr
-        """
-        c = pl.col(col) if isinstance(col, str) else col
-        out_name = name or (c.meta.output_name() or "value") + "_win"
+    def alias(self, factor: str, suffix: str | None) -> str:
+        if suffix is None:
+            return f"{self.prefix}{factor}"
+        return f"{self.prefix}{factor}{self.sep}{suffix}"
 
-        lower_bound = c.quantile(limits[0]).over(by)
-        upper_bound = c.quantile(limits[1]).over(by)
+    def mean(self, factors: list[str]) -> list[pl.Expr]:
+        return [
+            pl.col(f).mean().over(self.by).alias(self.alias(f, "mean")) for f in factors
+        ]
 
-        return c.clip(lower_bound, upper_bound).alias(out_name)
-
-    @staticmethod
-    def standardize(
-        col: str | pl.Expr,
-        by: str | list[str],
-        min_std: float = 1e-8,
+    def std(
+        self,
+        factors: list[str],
+        *,
         ddof: int = 1,
-        name: str | None = None,
-    ) -> pl.Expr:
+        min_std: float = 1e-8,
+    ) -> list[pl.Expr]:
+        return [
+            pl.col(f)
+            .std(ddof=ddof)
+            .over(self.by)
+            .clip(lower_bound=min_std)
+            .alias(self.alias(f, "std"))
+            for f in factors
+        ]
+
+    def quantiles(
+        self,
+        factors: list[str],
+        limits: tuple[float, float],
+    ) -> list[pl.Expr]:
+        lo, hi = limits
+        exprs: list[pl.Expr] = []
+        for f in factors:
+            exprs.extend(
+                [
+                    pl.col(f).quantile(lo).over(self.by).alias(self.alias(f, "qlo")),
+                    pl.col(f).quantile(hi).over(self.by).alias(self.alias(f, "qhi")),
+                ]
+            )
+        return exprs
+
+    # ---------- transforms (NO dependency on generated cols) ----------
+
+    def winsor(
+        self,
+        factors: list[str],
+        limits: tuple[float, float],
+    ) -> list[pl.Expr]:
         """
-        Cross-sectional z-score: (x - group_mean) / group_std
-
-        Args:
-            col: column or Expr
-            by: group-by key(s)
-            min_std: floor for std to avoid div-by-zero
-            ddof: delta degrees of freedom (1 = sample std)
-            name: output name (default: col + "_z")
-
-        Returns:
-            z-score Expr
+        ```
+        return [
+            pl.col(f)
+            .clip(
+                pl.col(f).quantile(lo).over(self.by),
+                pl.col(f).quantile(hi).over(self.by),
+            )
+            .alias(self.alias(f, "win"))
+            for f in factors
+        ]
+        ```
         """
-        c = pl.col(col) if isinstance(col, str) else col
-        out_name = name or (c.meta.output_name() or "value") + "_z"
+        lo, hi = limits
+        return [
+            pl.col(f)
+            .clip(
+                pl.col(f).quantile(lo).over(self.by),
+                pl.col(f).quantile(hi).over(self.by),
+            )
+            .alias(self.alias(f, "win"))
+            for f in factors
+        ]
 
-        mu = c.mean().over(by)
-        sigma = c.std(ddof=ddof).over(by).clip(lower_bound=min_std)
+    def zscore(
+        self,
+        factors: list[str],
+        *,
+        input_suffix: str | None = None,
+        output_suffix: str = "z",
+    ) -> list[pl.Expr]:
+        """
+        Z-score using raw column or winsorized column.
+        """
+        exprs: list[pl.Expr] = []
+        for f in factors:
+            x = pl.col(self.alias(f, input_suffix)) if input_suffix else pl.col(f)
+            exprs.append(
+                (
+                    (x - pl.col(self.alias(f, "mean"))) / pl.col(self.alias(f, "std"))
+                ).alias(self.alias(f, output_suffix))
+            )
+        return exprs
 
-        return ((c - mu) / sigma).alias(out_name)
+    # ---------- utils ----------
+
+    def stat_cols(self, df: pl.DataFrame) -> list[str]:
+        return [c for c in df.columns if c.startswith(self.prefix)]
 
     @staticmethod
     def rank(
@@ -1255,134 +1306,80 @@ class CrossSection:
         ascending: bool = False,
         name: str | None = None,
     ) -> pl.Expr:
-        """
-        Cross-sectional ranking (optional percentile rank).
-        Useful before neutralization or portfolio sorting.
-        """
         if isinstance(by, str):
             by = [by]
         c = pl.col(factor) if isinstance(factor, str) else factor
-        name_suffix = name or (c.meta.output_name() or "value") + "_rank"
-        rank_expr = (
-            c.rank("average", descending=not ascending).over(by).alias(name_suffix)
-        )
-        return rank_expr
-
-    @staticmethod
-    def neutralize(
-        col: str | pl.Expr,
-        by: str | list[str],
-        winsor_limits: tuple[float, float] | None = (0.01, 0.99),
-        std_suffix: str = "_z",
-        skip_winsor: bool = False,
-    ) -> list[pl.Expr]:
-        """
-        Combined pipeline: optional winsorize → standardize.
-        Returns list of Exprs for use in with_columns().
-        """
-        exprs: list[pl.Expr] = []
-
-        if not skip_winsor and winsor_limits is not None:
-            win_expr = CrossSection.winsorize(
-                col,
-                by=by,
-                limits=winsor_limits,
-                name=f"{col}_win" if isinstance(col, str) else None,
-            )
-            exprs.append(win_expr)
-            # Use winsorized as input to standardize
-            std_input = win_expr.meta.output_name()
-        else:
-            std_input = col
-
-        std_expr = CrossSection.standardize(
-            std_input,
-            by=by,
-            name=f"{col}{std_suffix}" if isinstance(col, str) else None,
-        )
-        exprs.append(std_expr)
-
-        return exprs
+        out = name or (c.meta.output_name() or "value") + "_rank"
+        return c.rank("average", descending=not ascending).over(by).alias(out)
 
 
 @dataclass
 class SectorGroup:
     """
     Applies cross-sectional normalization (winsor + z-score) per group.
-    Usually grouped by date or date + industry/sector.
-    Handles small groups and missing factors gracefully.
     """
 
     by: list[str]
     factors: list[str]
-    std_suffix: str = field(default="_z")
-    min_group_size: int = field(default=5)
-    skip_winsor: bool = field(default=False)
+
     winsor_limits: tuple[float, float] = field(default=(0.01, 0.99))
+    skip_winsor: bool = field(default=False)
+    min_group_size: int = field(default=5)
+    std_suffix: str = field(default="z")
 
-    def normalize(
-        self,
-        df: pl.DataFrame,
-    ) -> pl.DataFrame:
-        """
-        Cross-sectional normalization of multiple factors.
+    def __post_init__(self):
+        self.flow = CrossSectionFlow(by=self.by)
 
-        Args:
-            df: input DataFrame
-            factors: list of numeric columns to normalize
-            by: group-by key(s) — e.g. "date" or ["date", "sw_l1_code"]
-            winsor_limits: quantile clip; None or skip_winsor=True to disable
-            std_suffix: suffix for z-score columns
-            min_group_size: skip groups smaller than this (avoid noise)
-            skip_winsor: if True, skip winsorization step
+    def zfactors(self) -> list[str]:
+        return [self.flow.alias(f, self.std_suffix) for f in self.factors]
 
-        Returns:
-            DataFrame with original columns + {factor}_win (optional) + {factor}_z
-        """
-        by = self.by
-        factors = self.factors
-        min_group_size = self.min_group_size
-        # Validate group keys exist
-        missing_keys = [k for k in by if k not in df.columns]
-        if missing_keys:
-            log.warning(
-                f"Group-by keys missing: {missing_keys} → skipping normalization"
-            )
+    def normalize(self, df: pl.DataFrame) -> pl.DataFrame:
+        # ---- validate ----
+        missing = [k for k in self.by if k not in df.columns]
+        if missing:
+            log.warning(f"Missing group keys {missing}, skip normalization")
             return df
 
-        # Filter valid factors
-        valid_factors = [f for f in factors if f in df.columns]
-        if len(valid_factors) < len(factors):
-            log.warning(
-                f"Skipping missing factors: {set(factors) - set(valid_factors)}"
-            )
-        if not valid_factors:
+        factors = [f for f in self.factors if f in df.columns]
+        if not factors:
             log.info("No valid factors to normalize")
             return df
 
-        log.info(f"Normalizing {len(valid_factors)} factors | group by: {by}")
-
-        # Optional: filter tiny groups
-        if min_group_size > 1:
-            group_sizes = df.group_by(by).agg(pl.len().alias("_size"))
-            df = df.join(group_sizes, on=by, how="left")
-            small_groups = df.filter(pl.col("_size") < min_group_size)
-            if not small_groups.is_empty():
-                log.debug(
-                    f"Skipping {len(small_groups)} rows in small groups (< {min_group_size})"
-                )
-            df = df.filter(pl.col("_size") >= min_group_size).drop("_size")
-
-        # Build all expressions
-        all_exprs: list[pl.Expr] = []
-        for factor in valid_factors:
-            exprs = CrossSection.neutralize(
-                factor,
-                by=by,
-                winsor_limits=self.winsor_limits,
-                std_suffix=self.std_suffix,
-                skip_winsor=self.skip_winsor,
+        flow = self.flow
+        # ---- drop small groups ----
+        if self.min_group_size > 1:
+            df = (
+                df.with_columns(pl.len().over(self.by).alias("__gsize"))
+                .filter(pl.col("__gsize") >= self.min_group_size)
+                .drop("__gsize")
             )
-            all_exprs.extend(exprs)
 
-        return df.with_columns(all_exprs).sort(by)
+        stat_exprs: list[pl.Expr] = []
+        stat_exprs += flow.mean(factors)
+        stat_exprs += flow.std(factors)
+
+        if not self.skip_winsor and self.winsor_limits is not None:
+            stat_exprs += flow.quantiles(factors, self.winsor_limits)
+
+        df = df.with_columns(stat_exprs)
+
+        out_exprs: list[pl.Expr] = []
+
+        if not self.skip_winsor and self.winsor_limits is not None:
+            df = df.with_columns(flow.winsor(factors, self.winsor_limits))
+            out_exprs += flow.zscore(
+                factors,
+                input_suffix="win",
+                output_suffix=self.std_suffix,
+            )
+        else:
+            out_exprs += flow.zscore(
+                factors,
+                input_suffix=None,
+                output_suffix=self.std_suffix,
+            )
+
+        df = df.with_columns(out_exprs)
+        df = df.drop(flow.stat_cols(df)).sort(self.by)
+
+        return df

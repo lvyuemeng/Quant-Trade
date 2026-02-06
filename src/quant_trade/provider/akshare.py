@@ -1,11 +1,9 @@
 """AkShare data provider implementation."""
 
-import datetime
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
-from functools import cache, partial
+from functools import cache
 from pathlib import Path
-from typing import Sequence
 
 import akshare as ak
 import polars as pl
@@ -874,7 +872,9 @@ class AkShareMicro:
         adjust: AdjustCN | None = "hfq",
     ) -> pl.DataFrame:
         with EastMoney() as client:
-            return client.stock_hist(symbol,period,start_date=start_date,end_date=end_date,adjust=adjust)
+            return client.stock_hist(
+                symbol, period, start_date=start_date, end_date=end_date, adjust=adjust
+            )
         # start_str = to_ymd_str(start_date) if start_date else "19910403"
         # end_str = (
         #     to_ymd_str(end_date) if end_date else datetime.now().strftime("%Y%m%d")
@@ -928,8 +928,15 @@ class AkShareMicro:
         Empty DataFrame = no data / filtered / failed.
         """
         with EastMoney() as client:
+
             def worker(symbol: str) -> pl.DataFrame:
-                return client.stock_hist(symbol, period, start_date=start_date, end_date=end_date, adjust=adjust)
+                return client.stock_hist(
+                    symbol,
+                    period,
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust=adjust,
+                )
 
             config = concur.BatchConfig.thread()
             return concur.batch_fetch(config=config, worker=worker, items=symbols)
@@ -984,7 +991,9 @@ class AkShareMicro:
             return client.quarterly_cashflow(year, quarter)
 
     @staticmethod
-    def _fundamental_worker(client:EastMoney, year:int, quarter:Quarter) -> pl.DataFrame:
+    def _fundamental_worker(
+        client: EastMoney, year: int, quarter: Quarter
+    ) -> pl.DataFrame:
         inc = client.quarterly_income(year, quarter)
         bal = client.quarterly_balance(year, quarter)
         cf = client.quarterly_cashflow(year, quarter)
@@ -1008,53 +1017,58 @@ class AkShareMicro:
     def batch_quarterly_fundamentals(
         yqs: Sequence[tuple[int, Quarter]],
     ) -> list[pl.DataFrame]:
-        with EastMoney() as client:
-            def worker(yq: tuple[int, Quarter]) -> pl.DataFrame:
-                year, quarter = yq
-                return concur.Try()(AkShareMicro._fundamental_worker)(client, year, quarter)
+        def worker(yq: tuple[int, Quarter]) -> pl.DataFrame:
+            year, quarter = yq
+            return concur.Try()(AkShareMicro.quarterly_fundamentals)(year, quarter)
 
-            config = concur.BatchConfig.thread()
-            return concur.batch_fetch(
-                config=config,
-                worker=worker,
-                items=yqs,
-            )
+        config = concur.BatchConfig.thread()
+        return concur.batch_fetch(config=config, worker=worker, items=yqs)
+        # with EastMoney() as client:
+
+        #     def worker(yq: tuple[int, Quarter]) -> pl.DataFrame:
+        #         year, quarter = yq
+        #         return concur.Try()(AkShareMicro._fundamental_worker)(
+        #             client, year, quarter
+        #         )
+
+        #     config = concur.BatchConfig.thread()
+        #     return concur.batch_fetch(
+        #         config=config,
+        #         worker=worker,
+        #         items=yqs,
+        #     )
 
 
 class AkShareMacro:
     """AkShare implementation of the macro data interface."""
 
-    @staticmethod
-    def _fetch_and_filter_date_range(
-        df: pl.DataFrame,
-        start_date: date,
-        end_date: date,
-        date_col: str = "date",
-    ) -> pl.DataFrame:
-        """Common final step: normalize date + filter range"""
-        if df.is_empty():
-            return pl.DataFrame(schema={date_col: pl.Date})
+    # @staticmethod
+    # def _fetch_and_filter_date_range(
+    #     df: pl.DataFrame,
+    #     start_date: date,
+    #     end_date: date,
+    #     date_col: str = "date",
+    # ) -> pl.DataFrame:
+    #     """Common final step: normalize date + filter range"""
+    #     if df.is_empty():
+    #         return pl.DataFrame(schema={date_col: pl.Date})
 
-        df = normalize_date_column(df, date_col)
-        return df.filter(
-            (pl.col(date_col) >= pl.lit(start_date))
-            & (pl.col(date_col) <= pl.lit(end_date))
-        ).sort(date_col)
+    #     df = normalize_date_column(df, date_col)
+    #     return df.filter(
+    #         (pl.col(date_col) >= pl.lit(start_date))
+    #         & (pl.col(date_col) <= pl.lit(end_date))
+    #     ).sort(date_col)
 
     @staticmethod
-    @cache
-    def northbound_flow(
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
-    ) -> pl.DataFrame:
+    def northbound_flow() -> pl.DataFrame:
         """
         Fetch combined northbound (沪港通 + 深港通) net buy flow.
         Columns: date, net_buy, fund_inflow, cum_net_buy
         """
-        start_dt = to_date(start_date) if start_date else date(2014, 11, 17)
-        end_dt = to_date(end_date) if end_date else date.today()
+        # start_dt = to_date(start_date) if start_date else date(2014, 11, 17)
+        # end_dt = to_date(end_date) if end_date else date.today()
 
-        log.info(f"Fetching northbound flow {start_dt} → {end_dt}")
+        log.info("Fetching northbound flow")
 
         try:
             # SH
@@ -1095,26 +1109,25 @@ class AkShareMacro:
                 pl.concat([sh, sz], how="vertical").group_by("date").sum().sort("date")
             )
 
-            return AkShareMacro._fetch_and_filter_date_range(combined, start_dt, end_dt)
+            return normalize_date_column(combined, date_col="date")
 
         except Exception as e:
             log.error(f"northbound_flow failed: {e}")
             return pl.DataFrame()
 
     @staticmethod
-    @cache
     def market_margin_short(
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
+        # start_date: DateLike | None = None,
+        # end_date: DateLike | None = None,
     ) -> pl.DataFrame:
         """
         Combined SH+SZ margin & short-selling balance (daily).
         Main column of interest: total_margin_balance
         """
-        start_dt = to_date(start_date) if start_date else date(2010, 3, 31)
-        end_dt = to_date(end_date) if end_date else date.today()
+        # start_dt = to_date(start_date) if start_date else date(2010, 3, 31)
+        # end_dt = to_date(end_date) if end_date else date.today()
 
-        log.info(f"Fetching market margin/short data {start_dt} → {end_dt}")
+        log.info("Fetching market margin/short data")
 
         try:
             sz_raw = ak.macro_china_market_margin_sz()
@@ -1152,25 +1165,21 @@ class AkShareMacro:
                 .sort("date")
             )
 
-            return AkShareMacro._fetch_and_filter_date_range(combined, start_dt, end_dt)
+            return normalize_date_column(combined, date_col="date")
 
         except Exception as e:
             log.error(f"market_margin_short failed: {e}")
             return pl.DataFrame()
 
     @staticmethod
-    @cache
-    def shibor(
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
-    ) -> pl.DataFrame:
+    def shibor() -> pl.DataFrame:
         """
         Full SHIBOR rates history (all tenors).
         """
-        start_dt = to_date(start_date) if start_date else date(2017, 3, 17)
-        end_dt = to_date(end_date) if end_date else date.today()
+        # start_dt = to_date(start_date) if start_date else date(2017, 3, 17)
+        # end_dt = to_date(end_date) if end_date else date.today()
 
-        log.info(f"Fetching SHIBOR rates {start_dt} → {end_dt}")
+        log.info("Fetching SHIBOR rates")
 
         try:
             raw = ak.macro_china_shibor_all()
@@ -1199,25 +1208,21 @@ class AkShareMacro:
                 }
             )
 
-            return AkShareMacro._fetch_and_filter_date_range(df, start_dt, end_dt)
+            return normalize_date_column(df, date_col="date")
 
         except Exception as e:
             log.error(f"shibor fetch failed: {e}")
             return pl.DataFrame()
 
     @staticmethod
-    @cache
-    def csi1000_daily_ohlcv(
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
-    ) -> pl.DataFrame:
+    def csi1000_daily_ohlcv() -> pl.DataFrame:
         """
         CSI 1000 Index daily OHLCV (akshare uses em interface).
         """
-        start_dt = to_date(start_date) if start_date else date(2005, 1, 5)
-        end_dt = to_date(end_date) if end_date else date.today()
+        # start_dt = to_date(start_date) if start_date else date(2005, 1, 5)
+        # end_dt = to_date(end_date) if end_date else date.today()
 
-        log.info(f"Fetching CSI1000 daily OHLCV {start_dt} → {end_dt}")
+        log.info("Fetching CSI1000 daily OHLCV")
 
         try:
             raw = ak.stock_zh_index_daily_em()
@@ -1225,27 +1230,24 @@ class AkShareMacro:
                 return pl.DataFrame()
 
             df = pl.from_pandas(raw).drop("amount", strict=False)
-            df = normalize_date_column(df, "date")  # usually already has 'date'
-
-            return AkShareMacro._fetch_and_filter_date_range(df, start_dt, end_dt)
+            return normalize_date_column(df, date_col="date")
 
         except Exception as e:
             log.error(f"csi1000_daily_ohlcv failed: {e}")
             return pl.DataFrame()
 
     @staticmethod
-    @cache
     def csi1000qvix_daily_ohlc(
-        start_date: DateLike | None = None,
-        end_date: DateLike | None = None,
+        # start_date: DateLike | None = None,
+        # end_date: DateLike | None = None,
     ) -> pl.DataFrame:
         """
         CSI 1000 Volatility Index (QVIX) daily data.
         """
-        start_dt = to_date(start_date) if start_date else date(2005, 2, 9)
-        end_dt = to_date(end_date) if end_date else date.today()
+        # start_dt = to_date(start_date) if start_date else date(2005, 2, 9)
+        # end_dt = to_date(end_date) if end_date else date.today()
 
-        log.info(f"Fetching CSI1000 QVIX {start_dt} → {end_dt}")
+        log.info("Fetching CSI1000 QVIX")
 
         try:
             raw = ak.index_option_1000index_qvix()
@@ -1253,9 +1255,7 @@ class AkShareMacro:
                 return pl.DataFrame()
 
             df = pl.from_pandas(raw).drop_nulls()
-            df = normalize_date_column(df, "date")
-
-            return AkShareMacro._fetch_and_filter_date_range(df, start_dt, end_dt)
+            return normalize_date_column(df, date_col="date")
 
         except Exception as e:
             log.error(f"csi1000qvix_daily_ohlc failed: {e}")

@@ -26,15 +26,25 @@ Usage:
 """
 
 import random
+import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+import httpx
 import polars as pl
 import requests
+import tqdm
 from requests.adapters import HTTPAdapter
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 from urllib3.util.retry import Retry
 
 from quant_trade.config.logger import log
@@ -93,30 +103,40 @@ class Builder(Protocol):
 # =============================================================================
 
 
-class BaseFetch:
+class _RateLimiter:
     """
-    Base Fetcher with anti-blocking features.
-
-    Anti-blocking features:
-    - Randomized delays between requests
-    - User-Agent rotation
-    - Session pooling with retry strategy
-    - Concurrent fetching with ThreadPoolExecutor
-
-    Usage:
-        class MyFetcher(BaseFetch):
-            def fetch_initial(self, url: str, params: dict) -> dict:
-                self._rate_limit()
-                response = self._session.get(url, params=params, headers=self._get_headers())
-                response.raise_for_status()
-                return response.json()
-
-            def fetch_page(self, url: str, params: dict, page: int) -> dict:
-                ...
+    Thread-safe token-bucket-like rate limiter with jitter.
     """
 
-    # User agents for rotation - can be overridden by subclasses
-    USER_AGENTS: list[str] = [
+    def __init__(self, min_delay: float, max_delay: float):
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self._lock = threading.Lock()
+        self._next_allowed = time.monotonic()
+
+    def wait(self, penalty: float = 0.0):
+        with self._lock:
+            now = time.monotonic()
+            base_delay = random.uniform(self.min_delay, self.max_delay)
+            delay = base_delay + penalty
+
+            if now < self._next_allowed:
+                sleep_time = self._next_allowed - now + delay
+            else:
+                sleep_time = delay
+
+            self._next_allowed = max(self._next_allowed, now) + delay
+
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+
+class BaseFetcher:
+    """
+    Advanced Base Fetcher using httpx + tenacity.
+    """
+
+    USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101",
@@ -124,71 +144,91 @@ class BaseFetch:
         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)",
     ]
 
+    _HEADER_PROFILES = [
+        {"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+        {"Accept-Language": "en-US,en;q=0.9"},
+        {"Accept-Language": "en-GB,en;q=0.9"},
+    ]
+
     def __init__(
         self,
         delay_range: tuple[float, float] = (0.5, 1.5),
         max_retries: int = 3,
         max_workers: int = 3,
+        timeout: float = 10.0,
     ):
-        """
-        Initialize BaseFetch.
-
-        Args:
-            delay_range: (min, max) delay between requests in seconds
-            max_retries: Number of retry attempts on failure
-            max_workers: Maximum concurrent workers for page fetching
-        """
         self.delay_range = delay_range
         self.max_retries = max_retries
         self.max_workers = max_workers
-        self._session = self._create_session()
 
-    def _create_session(self) -> requests.Session:
-        """Create session with connection pooling and retry strategy."""
-        session = requests.Session()
-        retry_strategy = Retry(
-            total=self.max_retries,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
+        self._rate_limiter = _RateLimiter(*delay_range)
+
+        self._penalty = 0.0
+        self._penalty_lock = threading.Lock()
+        self._recent_errors = deque(maxlen=20)
+
+        self._client = httpx.Client(
+            http2=True,
+            timeout=httpx.Timeout(timeout),
+            headers=self._get_headers(),
         )
-        adapter = HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=20,
-            max_retries=retry_strategy,
-        )
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        return session
+
+    # ----------------------------
+    # Headers
+    # ----------------------------
 
     def _get_headers(self) -> dict:
-        """Generate headers with random user agent."""
+        profile = random.choice(self._HEADER_PROFILES)
         return {
             "User-Agent": random.choice(self.USER_AGENTS),
             "Accept": "application/json, text/plain, */*",
-            # "Accept-Encoding": "gzip, deflate, br",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Connection": "keep-alive",
+            **profile,
         }
 
-    def _rate_limit(self) -> None:
-        """Apply random delay to mimic human behavior."""
-        time.sleep(random.uniform(*self.delay_range))
+    # ----------------------------
+    # Adaptive penalty
+    # ----------------------------
+
+    def _apply_rate_limit(self):
+        self._rate_limiter.wait(self._penalty)
+
+    def _record_result(self, response: httpx.Response | None, exc: Exception | None):
+        with self._penalty_lock:
+            if exc is not None:
+                self._penalty = min(self._penalty + 0.3, 10.0)
+                return
+
+            if response is None:
+                return
+
+            if response.status_code in (403, 429):
+                self._penalty = min(self._penalty + 1.0, 10.0)
+            else:
+                self._penalty = max(self._penalty - 0.1, 0.0)
+
+    # ----------------------------
+    # Retry wrapper
+    # ----------------------------
+
+    def _retry_decorator(self):
+        return retry(
+            stop=stop_after_attempt(self.max_retries),
+            wait=wait_random_exponential(min=0.5, max=5),
+            retry=retry_if_exception_type(
+                (httpx.TransportError, httpx.HTTPStatusError)
+            ),
+            reraise=True,
+        )
+
+    # ----------------------------
+    # Public API (unchanged)
+    # ----------------------------
 
     def fetch_initial(self, url: str, params: dict) -> dict:
-        """
-        Fetch initial page to get total pages.
-
-        Override in subclass with provider-specific implementation.
-        """
         raise NotImplementedError
 
     def fetch_page(self, url: str, params: dict, page: int) -> dict:
-        """
-        Fetch single page.
-
-        Override in subclass with provider-specific implementation.
-        """
         raise NotImplementedError
 
     def fetch_pages_concurrent(
@@ -197,43 +237,66 @@ class BaseFetch:
         params: dict,
         pages: list[int],
     ) -> list[dict]:
-        """
-        Fetch multiple pages concurrently.
-
-        Args:
-            url: API endpoint URL
-            params: Query parameters (pageNumber will be added per page)
-            pages: List of page numbers to fetch
-
-        Returns:
-            List of response dictionaries
-        """
         results = []
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_page = {
-                executor.submit(self.fetch_page, url, params, page): page
+                executor.submit(self._safe_fetch_page, url, params, page): page
                 for page in pages
             }
 
-            for future in as_completed(future_to_page):
+            n = len(pages)
+            for future in tqdm.tqdm(
+                as_completed(future_to_page),
+                total=n,
+                desc="Fetching data",
+                position=0,
+            ):
+                page = future_to_page[future]
                 try:
                     result = future.result()
-                    results.append(result)
+                    if result is not None:
+                        results.append(result)
                 except Exception as e:
-                    page = future_to_page[future]
-                    print(f"Error fetching page {page}: {e}")
+                    print(f"[WARN] page={page} failed: {e}")
 
         return results
 
-    def close(self) -> None:
-        """Close the session."""
-        self._session.close()
+    # ----------------------------
+    # Internal guarded fetch
+    # ----------------------------
 
-    def __enter__(self) -> "BaseFetch":
+    def _safe_fetch_page(self, url: str, params: dict, page: int):
+        self._apply_rate_limit()
+
+        retryable = self._retry_decorator()
+
+        @retryable
+        def _call():
+            return self.fetch_page(url, params, page)
+
+        try:
+            result = _call()
+            self._record_result(None, None)
+            return result
+        except httpx.HTTPStatusError as e:
+            self._record_result(e.response, e)
+            raise
+        except Exception as e:
+            self._record_result(None, e)
+            raise
+
+    # ----------------------------
+    # Lifecycle
+    # ----------------------------
+
+    def close(self):
+        self._client.close()
+
+    def __enter__(self):
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args):
         self.close()
 
 
@@ -511,7 +574,7 @@ class DataPipe:
 
     def __init__(
         self,
-        fetcher: BaseFetch,
+        fetcher: BaseFetcher,
         parser: BaseParser,
         builder: Builder,
     ):
