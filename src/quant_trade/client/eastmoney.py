@@ -11,21 +11,22 @@ Architecture:
 Uses generic traits from trait.py for reusable patterns.
 """
 
+import asyncio
 import datetime
 from dataclasses import dataclass
 from typing import Final
 
 import polars as pl
+from pyparsing import Any
 
 from quant_trade.client.traits import (
     BaseBuilder,
     BaseFetcher,
-    BaseParser,
     ColumnSpec,
 )
 from quant_trade.config.logger import log
 
-from ..transform import AdjustCN, Period
+from ..transform import AdjustCN, Period, quarter_range
 
 # =============================================================================
 # Constants
@@ -119,17 +120,9 @@ def _build_kline_params(
 # =============================================================================
 # Concrete Implementations
 # =============================================================================
-
-
-class EastMoneyFetch(BaseFetcher):
-    """EastMoney-specific Fetcher - extends BaseFetch.
-
-    Anti-blocking features:
-    - Randomized delays between requests
-    - User-Agent rotation
-    - Session pooling with retry strategy
-    - Concurrent fetching with ThreadPoolExecutor
-    """
+#
+class EastMoneyFetcher(BaseFetcher):
+    """EastMoney-specific Fetcher - extends BaseFetch."""
 
     # User agents for rotation
     USER_AGENTS: list[str] = [
@@ -138,12 +131,22 @@ class EastMoneyFetch(BaseFetcher):
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/2010",
     ]
 
-    def fetch_initial(self, url: str, params: dict) -> dict:
-        """Fetch initial page to get total pages."""
-        # global adaptive rate limiting
-        self._apply_rate_limit()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Create a private event loop for this instance to handle the async bridge
+        try:
+            self._loop = asyncio.get_event_loop()
+        except RuntimeError as e:
+            log.error(f"Async runtime error: {e}")
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
 
-        response = self._client.get(
+    def run(self, future) -> Any:
+        return self._loop.run_until_complete(future)
+
+    async def _fetch_once(self, url: str, params: dict) -> dict:
+        """Fetch initial page to get total pages."""
+        response = await self.client.get(
             url,
             params=params,
             headers=self._get_headers(),
@@ -151,14 +154,12 @@ class EastMoneyFetch(BaseFetcher):
         response.raise_for_status()
         return response.json()
 
-    def fetch_page(self, url: str, params: dict, page: int) -> dict:
+    async def _fetch_page(self, url: str, params: dict, page: int) -> dict:
         """Fetch single page."""
-        self._apply_rate_limit()
-
         params_copy = dict(params)
         params_copy["pageNumber"] = str(page)
 
-        response = self._client.get(
+        response = await self.client.get(
             url,
             params=params_copy,
             headers=self._get_headers(),
@@ -166,31 +167,90 @@ class EastMoneyFetch(BaseFetcher):
         response.raise_for_status()
         return response.json()
 
-    def close(self) -> None:
-        """Close the client."""
-        self._client.close()
+    def sclose(self) -> None:
+        """Gracefully close the underlying async connection pool."""
+        if self.client:
+            self._loop.run_until_complete(self.client.aclose())
 
 
-class FundemantalParser(BaseParser):
-    """EastMoney-specific Parser - extends BaseParser.
+class EastMoneyParser:
+    """Base Parser - converts raw JSON to structured data.
 
-    DATA_PATH configured to extract data from EastMoney API response.
+    Provides:
+    - Configurable data path traversal via DATA_PATH
+    - Total pages extraction via get_total_pages()
+    - Basic DataFrame cleaning
+
+    Usage:
+        class MyParser(BaseParser):
+            DATA_PATH = ("result", "data")
+
+            def parse(self, raw: dict) -> list[dict]:
+                # Custom parsing logic
+                ...
     """
 
-    DATA_PATH = ("result", "data")
+    def parse(self, raw: dict) -> list[dict]: ...
 
     def clean(self, data: list[dict]) -> pl.DataFrame:
-        """Clean and convert to Polars DataFrame with deduplication."""
+        """Clean and convert to Polars DataFrame.
+
+        Args:
+            data: List of data dictionaries
+
+        Returns:
+            Polars DataFrame
+        """
         if not data:
             return pl.DataFrame()
 
         # Use infer_schema_length=None to scan all rows for proper type inference
         # This prevents issues with large numeric values causing overflow
-        df = pl.DataFrame(data, infer_schema_length=None)
-        return df
+        return pl.DataFrame(data, infer_schema_length=None)
 
 
-class KlineParser(BaseParser):
+class FundemantalParser(EastMoneyParser):
+    """EastMoney-specific Parser - extends BaseParser.
+
+    DATA_PATH configured to extract data from EastMoney API response.
+    """
+
+    def parse(self, raw: dict) -> list[dict]:
+        """Parse response and extract data list.
+
+        Args:
+            raw: Raw JSON response dictionary
+
+        Returns:
+            List of data dictionaries
+        """
+        DATA_PATH: list[str] = ["result", "data"]
+        if not raw.get("result"):
+            return []
+
+        # Navigate to data using DATA_PATH
+        data = raw
+        for key in DATA_PATH:
+            data = data.get(key, {})
+            if data is None:
+                return []
+
+        return data if isinstance(data, list) else []
+
+    def get_total_pages(self, raw: dict) -> int:
+        """Get total pages from response.
+
+        Args:
+            raw: Raw JSON response dictionary
+
+        Returns:
+            Total number of pages (default: 1)
+        """
+        PAGES_KEY: str = "pages"
+        return raw.get("result", {}).get(PAGES_KEY, 1)
+
+
+class KlineParser(EastMoneyParser):
     """Parser for stock kline (historical) data.
 
     DATA_PATH configured for kline API response structure.
@@ -430,7 +490,6 @@ class ReportConfig:
     """
 
     report_name: str
-    parser_class: type[BaseParser]
     builder_class: type[BaseBuilder]
     url: str = EASTMONEY_FINANCE_API
 
@@ -450,7 +509,7 @@ class ReportPipe:
     4. Parsing and building DataFrame
     """
 
-    def __init__(self, fetcher: EastMoneyFetch, config: ReportConfig):
+    def __init__(self, fetcher: EastMoneyFetcher, config: ReportConfig):
         """Initialize ReportPipe.
 
         Args:
@@ -460,7 +519,7 @@ class ReportPipe:
         self._fetcher = fetcher
         self._config = config
 
-    def fetch(self, year: int, quarter: int) -> pl.DataFrame:
+    async def fetch_one(self, year: int, quarter: int) -> pl.DataFrame:
         """Fetch quarterly report data.
 
         Args:
@@ -475,26 +534,26 @@ class ReportPipe:
         params = _build_quarterly_params(self._config.report_name, formatted_date)
 
         # Create parser and builder instances
-        parser = self._config.parser_class()
+        parser = FundemantalParser()
         builder = self._config.builder_class()
 
-        # Fetch initial page
-        raw = self._fetcher.fetch_initial(self._config.url, params)
-
-        # Parse and get total pages
+        fetcher = self._fetcher
+        raw =await fetcher.fetch_once(self._config.url, params)
+        if not raw:
+            log.error("Failed to fetch raw data")
+            return pl.DataFrame()
         data = parser.parse(raw)
         if not data:
+            log.error("Failed to parse raw data")
             return pl.DataFrame()
 
-        total_pages = raw.get("result", {}).get("pages", 1)
+        total_pages = parser.get_total_pages(raw)
         log.info(f"Total pages to fetch: {total_pages}")
 
         # Fetch remaining pages concurrently
         if total_pages > 1:
             pages_to_fetch = list(range(2, total_pages + 1))
-            page_results = self._fetcher.fetch_pages_concurrent(
-                self._config.url, params, pages_to_fetch
-            )
+            page_results = await fetcher.fetch_pages_concurrent(self._config.url, params, pages_to_fetch)
 
             for page_raw in page_results:
                 page_data = parser.parse(page_raw)
@@ -515,7 +574,7 @@ class KlinePipe:
     3. Parsing and building DataFrame
     """
 
-    def __init__(self, fetcher: EastMoneyFetch):
+    def __init__(self, fetcher: EastMoneyFetcher):
         """Initialize KlinePipe.
 
         Args:
@@ -523,13 +582,13 @@ class KlinePipe:
         """
         self._fetcher = fetcher
 
-    def fetch(
+    async def fetch_one(
         self,
         symbol: str,
-        period: Period,
-        start_date: datetime.date,
-        end_date: datetime.date,
-        adjust: AdjustCN | None,
+        start_date,
+        end_date,
+        period,
+        adjust,
     ) -> pl.DataFrame:
         """Fetch stock historical data (kline).
 
@@ -543,17 +602,15 @@ class KlinePipe:
         Returns:
             Polars DataFrame with historical stock data
         """
-        # Build params
         start_date_str = start_date.strftime("%Y%m%d")
         end_date_str = end_date.strftime("%Y%m%d")
+
         _secid, params = _build_kline_params(
-            symbol, period, start_date_str, end_date_str, adjust if adjust else ""
+            symbol, period, start_date_str, end_date_str, adjust or ""
         )
 
-        # Fetch data
-        raw = self._fetcher.fetch_initial(EASTMONEY_KLINE_API, params)
+        raw = await self._fetcher.fetch_once(EASTMONEY_KLINE_API, params)
 
-        # Parse using KlineParser
         parser = KlineParser()
         data = parser.parse(raw)
         if not data:
@@ -563,7 +620,6 @@ class KlinePipe:
 
         builder = KlineBuilder()
         df = builder.normalize(df)
-
         return df
 
 
@@ -586,39 +642,35 @@ class EastMoney:
 
     def __init__(
         self,
-        delay_range: tuple[float, float] = (0.5, 1.5),
         max_retries: int = 3,
-        max_workers: int = 3,
     ):
         """Initialize EastMoney client.
 
         Args:
-            delay_range: (min, max) delay between requests in seconds
             max_retries: Number of retry attempts on failure
-            max_workers: Maximum concurrent workers for page fetching
         """
-        self._fetcher = EastMoneyFetch(
-            delay_range=delay_range,
-            max_retries=max_retries,
-            max_workers=max_workers,
-        )
+        self._fetcher = EastMoneyFetcher(max_retries=max_retries)
 
         # Create report configurations
         self._income_config = ReportConfig(
             report_name="RPT_DMSK_FN_INCOME",
-            parser_class=FundemantalParser,
             builder_class=IncomeBuilder,
         )
         self._balance_config = ReportConfig(
             report_name="RPT_DMSK_FN_BALANCE",
-            parser_class=FundemantalParser,
             builder_class=BalanceSheetBuilder,
         )
         self._cashflow_config = ReportConfig(
             report_name="RPT_DMSK_FN_CASHFLOW",
-            parser_class=FundemantalParser,
             builder_class=CashFlowBuilder,
         )
+
+    def batch_fetch_by(self,config:ReportConfig,start_date:datetime.date,end_date:datetime.date) -> pl.DataFrame:
+        log.info(f"Fetching quarterly income from {start_date} to {end_date}")
+        pipe = ReportPipe(self._fetcher,config)
+        date_range = quarter_range(start_date=start_date,end_date=end_date)
+        tasks = [pipe.fetch_one(year,quarter) for year,quarter in date_range]
+        return self._fetcher.run(asyncio.gather(*tasks))
 
     def quarterly_income(self, year: int, quarter: int) -> pl.DataFrame:
         """Fetch quarterly income statement data.
@@ -632,7 +684,7 @@ class EastMoney:
         """
         log.info(f"Fetching quarterly income for {year} Q{quarter}")
         pipe = ReportPipe(self._fetcher, self._income_config)
-        return pipe.fetch(year, quarter)
+        return self._fetcher.run(pipe.fetch_one(year, quarter))
 
     def quarterly_balance(self, year: int, quarter: int) -> pl.DataFrame:
         """Fetch quarterly balance sheet data.
@@ -646,7 +698,7 @@ class EastMoney:
         """
         log.info(f"Fetching quarterly balance for {year} Q{quarter}")
         pipe = ReportPipe(self._fetcher, self._balance_config)
-        return pipe.fetch(year, quarter)
+        return self._fetcher.run(pipe.fetch_one(year, quarter))
 
     def quarterly_cashflow(self, year: int, quarter: int) -> pl.DataFrame:
         """Fetch quarterly cash flow statement data.
@@ -660,7 +712,36 @@ class EastMoney:
         """
         log.info(f"Fetching quarterly cashflow for {year} Q{quarter}")
         pipe = ReportPipe(self._fetcher, self._cashflow_config)
-        return pipe.fetch(year, quarter)
+        return self._fetcher.run(pipe.fetch_one(year, quarter))
+
+    def batch_stock_hist(
+        self,
+        symbols: list[str],
+        period: Period = "daily",
+        start_date: datetime.date | None = None,
+        end_date: datetime.date | None = None,
+        adjust: AdjustCN | None = "hfq",
+    ) -> list[pl.DataFrame]:
+        """Fetch stock historical data (kline).
+
+        Args:
+            symbol: Stock code (e.g., "000001")
+            period: "daily", "weekly", or "monthly"
+            start_date: Start date in "YYYYMMDD" format
+            end_date: End date in "YYYYMMDD" format
+            adjust: "" (no adjustment), "qfq" (forward), "hfq" (backward)
+
+        Returns:
+            Polars DataFrame with historical stock data
+        """
+        log.info(f"Fetching stock historical data for {symbols}")
+        pipe = KlinePipe(self._fetcher)
+        if start_date is None:
+            start_date = datetime.date(1970, 1, 1)
+        if end_date is None:
+            end_date = datetime.date(2050, 1, 1)
+        tasks = [pipe.fetch_one(symbol, period, start_date, end_date, adjust) for symbol in symbols]
+        return self._fetcher.run(asyncio.gather(*tasks))
 
     def stock_hist(
         self,
@@ -682,17 +763,11 @@ class EastMoney:
         Returns:
             Polars DataFrame with historical stock data
         """
-        log.info(f"Fetching stock historical data for {symbol}")
-        pipe = KlinePipe(self._fetcher)
-        if start_date is None:
-            start_date = datetime.date(1970, 1, 1)
-        if end_date is None:
-            end_date = datetime.date(2050, 1, 1)
-        return pipe.fetch(symbol, period, start_date, end_date, adjust)
+        return self.batch_stock_hist([symbol],period=period,start_date=start_date,end_date=end_date,adjust=adjust)[0]
 
     def close(self) -> None:
         """Close the fetcher."""
-        self._fetcher.close()
+        self._fetcher.sclose()
 
     def __enter__(self) -> "EastMoney":
         return self

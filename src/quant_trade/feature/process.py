@@ -14,6 +14,8 @@ import polars.selectors as cs
 
 from quant_trade.config.logger import log
 
+from ..transform import GSIZE
+
 
 class Metric(Protocol):
     @staticmethod
@@ -1315,7 +1317,7 @@ class SectorGroup:
 
     def normalize(self, df: pl.DataFrame) -> pl.DataFrame:
         # ---- validate ----
-        missing = [k for k in self.by if k not in df.columns]
+        missing = set(self.by).difference(df.columns)
         if missing:
             log.warning(f"Missing group keys {missing}, skip normalization")
             return df
@@ -1329,9 +1331,9 @@ class SectorGroup:
         # ---- drop small groups ----
         if self.min_group_size > 1:
             df = (
-                df.with_columns(pl.len().over(self.by).alias("__gsize"))
-                .filter(pl.col("__gsize") >= self.min_group_size)
-                .drop("__gsize")
+                df.with_columns(pl.len().over(self.by).alias(GSIZE))
+                .filter(pl.col(GSIZE) >= self.min_group_size)
+                .drop(GSIZE)
             )
 
         stat_exprs: list[pl.Expr] = []

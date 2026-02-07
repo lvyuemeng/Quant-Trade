@@ -123,6 +123,63 @@ class BatchConfig:
         )
 
 
+def batch_fetch[T](
+    config: BatchConfig,
+    worker: Callable[[T], FetchResult],
+    items: Sequence[T],
+) -> list[FetchResult | pl.DataFrame]:
+    """Execute parallel fetch for multiple items with order preservation.
+
+    Args:
+        config: BatchConfig with executor settings
+        fetch_func: Pickleable function that takes one item and returns DataFrame
+        items: Sequence of inputs - each item passed as single argument
+
+    Returns:
+        List of results in same order as items.
+        Empty DataFrame for failed items.
+
+    Example:
+        def fetch_daily(symbol: str) -> pl.DataFrame:
+            ...
+
+        dfs = batch_fetch(
+            config=BatchConfig.thread(),
+            fetch_func=fetch_daily,
+            items=["sh.600000", "sz.000001"],
+        )
+    """
+    if not items:
+        return []
+
+    n = len(items)
+    results: list[FetchResult | pl.DataFrame] = [pl.DataFrame()] * n
+
+    workers = config.max_workers or optimal_workers(n)
+
+    with config.executor_factory(max_workers=workers) as executor:  # type: ignore[arg-type]
+        futures: dict[Any, int] = {}
+        for idx, item in enumerate(items):
+            future = executor.submit(worker, item)
+            futures[future] = idx
+
+        for future in tqdm.tqdm(
+            as_completed(futures),
+            total=n,
+            desc="Fetching data",
+            position=0,
+        ):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                item = items[idx]
+                log.error(f"Failed to fetch {item}: {e}")
+                results[idx] = pl.DataFrame()
+
+    return results
+
+
 @dataclass(frozen=True, slots=True)
 class Try:
     """Factory for creating retry-wrapped callables.
@@ -223,60 +280,3 @@ class TryWithSession:
                 return try_call(fetch, self.retry, self.sleep, *args, **kwargs)
 
         return wrapper
-
-
-def batch_fetch[T](
-    config: BatchConfig,
-    worker: Callable[[T], FetchResult],
-    items: Sequence[T],
-) -> list[FetchResult | pl.DataFrame]:
-    """Execute parallel fetch for multiple items with order preservation.
-
-    Args:
-        config: BatchConfig with executor settings
-        fetch_func: Pickleable function that takes one item and returns DataFrame
-        items: Sequence of inputs - each item passed as single argument
-
-    Returns:
-        List of results in same order as items.
-        Empty DataFrame for failed items.
-
-    Example:
-        def fetch_daily(symbol: str) -> pl.DataFrame:
-            ...
-
-        dfs = batch_fetch(
-            config=BatchConfig.thread(),
-            fetch_func=fetch_daily,
-            items=["sh.600000", "sz.000001"],
-        )
-    """
-    if not items:
-        return []
-
-    n = len(items)
-    results: list[FetchResult | pl.DataFrame] = [pl.DataFrame()] * n
-
-    workers = config.max_workers or optimal_workers(n)
-
-    with config.executor_factory(max_workers=workers) as executor:  # type: ignore[arg-type]
-        futures: dict[Any, int] = {}
-        for idx, item in enumerate(items):
-            future = executor.submit(worker, item)
-            futures[future] = idx
-
-        for future in tqdm.tqdm(
-            as_completed(futures),
-            total=n,
-            desc="Fetching data",
-            position=0,
-        ):
-            idx = futures[future]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                item = items[idx]
-                log.error(f"Failed to fetch {item}: {e}")
-                results[idx] = pl.DataFrame()
-
-    return results

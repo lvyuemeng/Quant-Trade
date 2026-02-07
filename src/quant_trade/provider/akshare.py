@@ -2,11 +2,12 @@
 
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
-from functools import cache
+from functools import cache, partial
 from pathlib import Path
 
 import akshare as ak
 import polars as pl
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 import quant_trade.provider.concurrent as concur
 from quant_trade.client.eastmoney import EastMoney
@@ -18,19 +19,19 @@ from quant_trade.transform import (
     Quarter,
     normalize_date_column,
     normalize_ts_code,
-    normalize_ts_code_str,
     to_date,
     to_ymd_str,
 )
 
+from ..client.csindex import CSIndex
 
-def quarter_to_report_date(year: int, quarter: Quarter, as_ymd: bool = True) -> str:
-    """Explicit year + quarter → YYYYMMDD or YYYY-MM-DD"""
-    ends = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}
-    s = f"{year}{ends[quarter]}"
-    if not as_ymd:
-        return f"{year}-{ends[quarter][:2]}-{ends[quarter][2:]}"
-    return s
+# def quarter_to_report_date(year: int, quarter: Quarter, as_ymd: bool = True) -> str:
+#     """Explicit year + quarter → YYYYMMDD or YYYY-MM-DD"""
+#     ends = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}
+#     s = f"{year}{ends[quarter]}"
+#     if not as_ymd:
+#         return f"{year}-{ends[quarter][:2]}-{ends[quarter][2:]}"
+#     return s
 
 
 def cur_quarter_end() -> tuple[int, Quarter]:
@@ -49,23 +50,23 @@ def cur_quarter_end() -> tuple[int, Quarter]:
         return (year, 3)
 
 
-def quarter_range(
-    start_year: int, start_quarter: Quarter, end_year: int, end_quarter: Quarter
-) -> list[tuple[int, Quarter]]:
-    """Generate list of (year, quarter) tuples covering the range [start, end]."""
-    result = []
-    current_year = start_year
-    current_quarter = start_quarter
+# def quarter_range(
+#     start_year: int, start_quarter: Quarter, end_year: int, end_quarter: Quarter
+# ) -> list[tuple[int, Quarter]]:
+#     """Generate list of (year, quarter) tuples covering the range [start, end]."""
+#     result = []
+#     current_year = start_year
+#     current_quarter = start_quarter
 
-    while (current_year, current_quarter) <= (end_year, end_quarter):
-        result.append((current_year, current_quarter))
-        if current_quarter == 4:
-            current_year += 1
-            current_quarter = 1
-        else:
-            current_quarter += 1
+#     while (current_year, current_quarter) <= (end_year, end_quarter):
+#         result.append((current_year, current_quarter))
+#         if current_quarter == 4:
+#             current_year += 1
+#             current_quarter = 1
+#         else:
+#             current_quarter += 1
 
-    return result
+#     return result
 
 
 def _fetch_and_clean_whole(
@@ -100,158 +101,158 @@ def _fetch_and_clean_whole(
         )
 
 
-def _fetch_ohlcv(
-    fetcher: Callable,
-    symbol: str,
-    period: Period,
-    start_str: str,
-    end_str: str,
-    adjust: str,
-    column_map: dict,
-    daily_only: bool = False,
-    prefix: bool = False,
-) -> pl.DataFrame | None:
-    """Unified OHLCV fetcher for multiple sources."""
-    try:
-        # Check if daily-only data requested
-        if daily_only and period != "daily":
-            log.warning(
-                f"{fetcher.__name__} only supports daily data, requested {period}"
-            )
-            return None
+# def _fetch_ohlcv(
+#     fetcher: Callable,
+#     symbol: str,
+#     period: Period,
+#     start_str: str,
+#     end_str: str,
+#     adjust: str,
+#     column_map: dict,
+#     daily_only: bool = False,
+#     prefix: bool = False,
+# ) -> pl.DataFrame | None:
+#     """Unified OHLCV fetcher for multiple sources."""
+#     try:
+#         # Check if daily-only data requested
+#         if daily_only and period != "daily":
+#             log.warning(
+#                 f"{fetcher.__name__} only supports daily data, requested {period}"
+#             )
+#             return None
 
-        if prefix:
-            symbol = normalize_ts_code_str(
-                symbol, add_exchange=True, position="prefix", sep="", case="lower"
-            )
+#         if prefix:
+#             symbol = normalize_ts_code_str(
+#                 symbol, add_exchange=True, position="prefix", sep="", case="lower"
+#             )
 
-        df_raw = fetcher(symbol, start_str, end_str, adjust or "")
-        if df_raw.empty:
-            return None
-        df = pl.from_pandas(df_raw).rename(column_map)
+#         df_raw = fetcher(symbol, start_str, end_str, adjust or "")
+#         if df_raw.empty:
+#             return None
+#         df = pl.from_pandas(df_raw).rename(column_map)
 
-        required_cols = [
-            "date",
-            "ts_code",
-            "open",
-            "close",
-            "high",
-            "low",
-            "volume",
-            "amount",
-            "amplitude",
-            "pct_chg",
-            "change",
-            "turnover_rate",
-        ]
-        for col in required_cols:
-            if col not in df.columns:
-                df = df.with_columns(pl.lit(None).alias(col))
+#         required_cols = [
+#             "date",
+#             "ts_code",
+#             "open",
+#             "close",
+#             "high",
+#             "low",
+#             "volume",
+#             "amount",
+#             "amplitude",
+#             "pct_chg",
+#             "change",
+#             "turnover_rate",
+#         ]
+#         for col in required_cols:
+#             if col not in df.columns:
+#                 df = df.with_columns(pl.lit(None).alias(col))
 
-        # Add ts_code if missing
-        if "ts_code" not in df.columns:
-            df = df.with_columns(pl.lit(symbol).alias("ts_code"))
+#         # Add ts_code if missing
+#         if "ts_code" not in df.columns:
+#             df = df.with_columns(pl.lit(symbol).alias("ts_code"))
 
-        df = df.select(required_cols)
-        return normalize_date_column(df, "date")
+#         df = df.select(required_cols)
+#         return normalize_date_column(df, "date")
 
-    except Exception as e:
-        log.warning(f"{fetcher.__name__} fetch failed: {e}")
-        return None
-
-
-def fetch_ohlcv_eastmoney(
-    symbol: str, period: Period, start_str: str, end_str: str, adjust: str = ""
-) -> pl.DataFrame | None:
-    EASTMONEY_COLS = {
-        "日期": "date",
-        "股票代码": "ts_code",
-        "开盘": "open",
-        "收盘": "close",
-        "最高": "high",
-        "最低": "low",
-        "成交量": "volume",
-        "成交额": "amount",
-        "振幅": "amplitude",
-        "涨跌幅": "pct_chg",
-        "涨跌额": "change",
-        "换手率": "turnover_rate",
-    }
-    return _fetch_ohlcv(
-        fetcher=lambda s, start, end, adj: ak.stock_zh_a_hist(
-            symbol=s,
-            period=period,
-            start_date=start,
-            end_date=end,
-            adjust=adj,
-            timeout=60,
-        ),
-        symbol=symbol,
-        period=period,
-        start_str=start_str,
-        end_str=end_str,
-        adjust=adjust,
-        column_map=EASTMONEY_COLS,
-    )
+#     except Exception as e:
+#         log.warning(f"{fetcher.__name__} fetch failed: {e}")
+#         return None
 
 
-def fetch_ohlcv_sina(
-    symbol: str, period: Period, start_str: str, end_str: str, adjust: str = ""
-) -> pl.DataFrame | None:
-    SINA_COLS = {
-        "date": "date",
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "volume": "volume",
-        "amount": "amount",
-        "turnover": "turnover_rate",
-    }
-    return _fetch_ohlcv(
-        fetcher=lambda s, start, end, adj: ak.stock_zh_a_daily(
-            symbol=s, start_date=start, end_date=end, adjust=adj
-        ),
-        symbol=symbol,
-        period=period,
-        start_str=start_str,
-        end_str=end_str,
-        adjust=adjust,
-        column_map=SINA_COLS,
-        daily_only=True,
-        prefix=True,
-    )
+# def fetch_ohlcv_eastmoney(
+#     symbol: str, period: Period, start_str: str, end_str: str, adjust: str = ""
+# ) -> pl.DataFrame | None:
+#     EASTMONEY_COLS = {
+#         "日期": "date",
+#         "股票代码": "ts_code",
+#         "开盘": "open",
+#         "收盘": "close",
+#         "最高": "high",
+#         "最低": "low",
+#         "成交量": "volume",
+#         "成交额": "amount",
+#         "振幅": "amplitude",
+#         "涨跌幅": "pct_chg",
+#         "涨跌额": "change",
+#         "换手率": "turnover_rate",
+#     }
+#     return _fetch_ohlcv(
+#         fetcher=lambda s, start, end, adj: ak.stock_zh_a_hist(
+#             symbol=s,
+#             period=period,
+#             start_date=start,
+#             end_date=end,
+#             adjust=adj,
+#             timeout=60,
+#         ),
+#         symbol=symbol,
+#         period=period,
+#         start_str=start_str,
+#         end_str=end_str,
+#         adjust=adjust,
+#         column_map=EASTMONEY_COLS,
+#     )
 
 
-def fetch_ohlcv_tencent(
-    symbol: str, period: Period, start_str: str, end_str: str, adjust: str = ""
-) -> pl.DataFrame | None:
-    TENCENT_COLS = {
-        "date": "date",
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "amount": "volume",  # special handling
-    }
-    df = _fetch_ohlcv(
-        fetcher=lambda s, start, end, adj: ak.stock_zh_a_hist_tx(
-            symbol=s, start_date=start, end_date=end, adjust=adj
-        ),
-        symbol=symbol,
-        period=period,
-        start_str=start_str,
-        end_str=end_str,
-        adjust=adjust,
-        column_map=TENCENT_COLS,
-        daily_only=True,
-        prefix=True,
-    )
-    if df is not None:
-        df.with_columns((pl.col("volume") * 100).alias("volume"))
-        return df
-    else:
-        return None
+# def fetch_ohlcv_sina(
+#     symbol: str, period: Period, start_str: str, end_str: str, adjust: str = ""
+# ) -> pl.DataFrame | None:
+#     SINA_COLS = {
+#         "date": "date",
+#         "open": "open",
+#         "high": "high",
+#         "low": "low",
+#         "close": "close",
+#         "volume": "volume",
+#         "amount": "amount",
+#         "turnover": "turnover_rate",
+#     }
+#     return _fetch_ohlcv(
+#         fetcher=lambda s, start, end, adj: ak.stock_zh_a_daily(
+#             symbol=s, start_date=start, end_date=end, adjust=adj
+#         ),
+#         symbol=symbol,
+#         period=period,
+#         start_str=start_str,
+#         end_str=end_str,
+#         adjust=adjust,
+#         column_map=SINA_COLS,
+#         daily_only=True,
+#         prefix=True,
+#     )
+
+
+# def fetch_ohlcv_tencent(
+#     symbol: str, period: Period, start_str: str, end_str: str, adjust: str = ""
+# ) -> pl.DataFrame | None:
+#     TENCENT_COLS = {
+#         "date": "date",
+#         "open": "open",
+#         "high": "high",
+#         "low": "low",
+#         "close": "close",
+#         "amount": "volume",  # special handling
+#     }
+#     df = _fetch_ohlcv(
+#         fetcher=lambda s, start, end, adj: ak.stock_zh_a_hist_tx(
+#             symbol=s, start_date=start, end_date=end, adjust=adj
+#         ),
+#         symbol=symbol,
+#         period=period,
+#         start_str=start_str,
+#         end_str=end_str,
+#         adjust=adjust,
+#         column_map=TENCENT_COLS,
+#         daily_only=True,
+#         prefix=True,
+#     )
+#     if df is not None:
+#         df.with_columns((pl.col("volume") * 100).alias("volume"))
+#         return df
+#     else:
+#         return None
 
 
 @cache
@@ -823,11 +824,11 @@ class AkShareUniverse:
 
     @staticmethod
     def stock_slice(
-        trade_date: DateLike | None = None,
+        trade_date: date | None = None,
         min_listed_days: int = 365,
         remove_st: bool = True,
     ) -> pl.DataFrame:
-        trade_date = to_date(trade_date) if trade_date else date.today()
+        trade_date = trade_date if trade_date else date.today()
         log.info(f"Building tradable universe for {trade_date}")
 
         universe = AkShareUniverse().stock_whole()
@@ -858,6 +859,11 @@ class AkShareUniverse:
 
         return q.sort("ts_code").select(["ts_code", "name"]).collect()
 
+    @staticmethod
+    def csi_index_cons(symbol: str) -> pl.DataFrame:
+        with CSIndex() as client:
+            return client.index_cons(symbol)
+
 
 class AkShareMicro:
     @staticmethod
@@ -872,44 +878,6 @@ class AkShareMicro:
             return client.stock_hist(
                 symbol, period, start_date=start_date, end_date=end_date, adjust=adjust
             )
-        # start_str = to_ymd_str(start_date) if start_date else "19910403"
-        # end_str = (
-        #     to_ymd_str(end_date) if end_date else datetime.now().strftime("%Y%m%d")
-        # )
-
-        # log.info(
-        #     f"Fetching {symbol} {period} OHLCV {start_str} → {end_str} (adj={adjust})"
-        # )
-
-        # # 尝试多个数据源，直到成功获取数据
-        # data_sources = [
-        #     ("eastmoney", fetch_ohlcv_eastmoney),
-        #     ("sina", fetch_ohlcv_sina),
-        #     ("tencent", fetch_ohlcv_tencent),
-        # ]
-
-        # for source_name, fetch_func in data_sources:
-        #     try:
-        #         log.info(f"Trying {source_name} source for {symbol}")
-        #         df = fetch_func(
-        #             symbol,
-        #             period,
-        #             start_str,
-        #             end_str,
-        #             adjust=adjust if adjust is not None else "",
-        #         )
-        #         if df is not None and not df.is_empty():
-        #             log.info(
-        #                 f"Successfully fetched data from {source_name} for {symbol}"
-        #             )
-        #             return df
-        #         elif df is not None:
-        #             log.warning(f"Got empty DataFrame from {source_name} for {symbol}")
-        #     except Exception as e:
-        #         log.warning(f"Failed to fetch from {source_name} for {symbol}: {e}")
-
-        # log.error(f"All data sources failed for {symbol}")
-        # return pl.DataFrame()
 
     @staticmethod
     def batch_market_ohlcv(
@@ -923,38 +891,15 @@ class AkShareMicro:
         Returns list of pl.DataFrame **in the same order** as input `codes`.
         Empty DataFrame = no data / filtered / failed.
         """
-        with EastMoney() as client:
-
-            def worker(symbol: str) -> pl.DataFrame:
-                return client.stock_hist(
-                    symbol,
-                    period,
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust,
-                )
-
-            config = concur.BatchConfig.thread()
-            return concur.batch_fetch(config=config, worker=worker, items=symbols)
-
-    # @staticmethod
-    # def _fetch_quarterly_em(
-    #     func: Callable,
-    #     date_str: str,
-    #     rename_map: dict,
-    #     log_name: str,
-    # ) -> pl.DataFrame:
-    #     log.info(f"Fetching {log_name} for {date_str}")
-    #     try:
-    #         raw = func(date=date_str)
-    #         if raw.empty:
-    #             return pl.DataFrame()
-    #         df = pl.from_pandas(raw).rename(rename_map).drop("序号", strict=False)
-    #         df = normalize_date_column(df, "notice_date")
-    #         return df
-    #     except Exception as e:
-    #         log.error(f"{log_name} fetch failed for {date_str}: {e}")
-    #         return pl.DataFrame()
+        worker = partial(
+            concur.Try()(AkShareMicro.market_ohlcv),
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+        )
+        config = concur.BatchConfig.thread()
+        return concur.batch_fetch(config=config, worker=worker, items=symbols)
 
     @staticmethod
     @cache
@@ -1013,9 +958,13 @@ class AkShareMicro:
     def batch_quarterly_fundamentals(
         yqs: Sequence[tuple[int, Quarter]],
     ) -> list[pl.DataFrame]:
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=4, max=10),
+        )
         def worker(yq: tuple[int, Quarter]) -> pl.DataFrame:
             year, quarter = yq
-            return concur.Try()(AkShareMicro.quarterly_fundamentals)(year, quarter)
+            return AkShareMicro.quarterly_fundamentals(year, quarter)
 
         config = concur.BatchConfig.thread()
         return concur.batch_fetch(config=config, worker=worker, items=yqs)
@@ -1037,23 +986,6 @@ class AkShareMicro:
 
 class AkShareMacro:
     """AkShare implementation of the macro data interface."""
-
-    # @staticmethod
-    # def _fetch_and_filter_date_range(
-    #     df: pl.DataFrame,
-    #     start_date: date,
-    #     end_date: date,
-    #     date_col: str = "date",
-    # ) -> pl.DataFrame:
-    #     """Common final step: normalize date + filter range"""
-    #     if df.is_empty():
-    #         return pl.DataFrame(schema={date_col: pl.Date})
-
-    #     df = normalize_date_column(df, date_col)
-    #     return df.filter(
-    #         (pl.col(date_col) >= pl.lit(start_date))
-    #         & (pl.col(date_col) <= pl.lit(end_date))
-    #     ).sort(date_col)
 
     @staticmethod
     def northbound_flow() -> pl.DataFrame:
@@ -1118,9 +1050,6 @@ class AkShareMacro:
         """Combined SH+SZ margin & short-selling balance (daily).
         Main column of interest: total_margin_balance
         """
-        # start_dt = to_date(start_date) if start_date else date(2010, 3, 31)
-        # end_dt = to_date(end_date) if end_date else date.today()
-
         log.info("Fetching market margin/short data")
 
         try:
@@ -1168,12 +1097,10 @@ class AkShareMacro:
     @staticmethod
     def shibor() -> pl.DataFrame:
         """Full SHIBOR rates history (all tenors)."""
-        # start_dt = to_date(start_date) if start_date else date(2017, 3, 17)
-        # end_dt = to_date(end_date) if end_date else date.today()
-
         log.info("Fetching SHIBOR rates")
 
         try:
+            ak.index_stock_cons_csindex()
             raw = ak.macro_china_shibor_all()
             if raw.empty:
                 return pl.DataFrame()
@@ -1209,9 +1136,6 @@ class AkShareMacro:
     @staticmethod
     def csi1000_daily_ohlcv() -> pl.DataFrame:
         """CSI 1000 Index daily OHLCV (akshare uses em interface)."""
-        # start_dt = to_date(start_date) if start_date else date(2005, 1, 5)
-        # end_dt = to_date(end_date) if end_date else date.today()
-
         log.info("Fetching CSI1000 daily OHLCV")
 
         try:
@@ -1227,14 +1151,8 @@ class AkShareMacro:
             return pl.DataFrame()
 
     @staticmethod
-    def csi1000qvix_daily_ohlc(
-        # start_date: DateLike | None = None,
-        # end_date: DateLike | None = None,
-    ) -> pl.DataFrame:
+    def csi1000qvix_daily_ohlc() -> pl.DataFrame:
         """CSI 1000 Volatility Index (QVIX) daily data."""
-        # start_dt = to_date(start_date) if start_date else date(2005, 2, 9)
-        # end_dt = to_date(end_date) if end_date else date.today()
-
         log.info("Fetching CSI1000 QVIX")
 
         try:

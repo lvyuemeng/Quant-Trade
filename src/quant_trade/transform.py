@@ -1,6 +1,6 @@
 from collections.abc import Generator
 from datetime import date, datetime
-from typing import Literal, cast
+from typing import Final, Literal, cast
 
 import polars as pl
 
@@ -8,6 +8,9 @@ type DateLike = str | date | datetime
 type Period = Literal["daily", "weekly", "monthly"]
 type Quarter = Literal[1, 2, 3, 4]
 type AdjustCN = Literal["hfq", "qfq"]
+
+RANK: Final[str] = "__rank"
+GSIZE: Final[str] = "__gsize"
 
 
 # ────────────────────────────────────────────────

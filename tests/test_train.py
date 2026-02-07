@@ -1,17 +1,12 @@
 from datetime import date, timedelta
 from typing import cast
 
-import lightgbm as lgb
 import numpy as np
 import polars as pl
 import pytest
 
 from quant_trade.model.process import (
     GaussianLabelBuilder,
-    LGBDataProcessor,
-    LGBModelResult,
-    LGBRankConfig,
-    LGBTrainer,
     PurgedKFold,
     PurgedTimeSplit,
     WalkForwardValidation,
@@ -154,11 +149,11 @@ def test_purged_time_split_edge_cases():
 
     # Should fail with very late split date (no test data)
     with pytest.raises(ValueError):
-        splitter.split(df, split_date="2025-01-01", date_col="date")
+        splitter.split(df, split_date=date(2025, 1, 1), date_col="date")
 
     # Should fail with very early split date (no training data)
     with pytest.raises(ValueError):
-        splitter.split(df, split_date="2019-12-01", date_col="date")
+        splitter.split(df, split_date=date(2019, 2, 1), date_col="date")
 
 
 # ============================================================================
@@ -264,9 +259,9 @@ def test_gaussian_label_builder_basic():
     # Create simple test data
     builder = GaussianLabelBuilder(
         factor="ret_fwd_21d",
-        rank_over="date",
-        group_by="sw_l1_code",
-        limits=(0.05, 0.95),
+        rank_by="date",
+        by=["sw_l1_code"],
+        winsor_limits=(0.05, 0.95),
     )
 
     labeled_df = builder.label(mock_stocks(3, 100))
@@ -281,15 +276,13 @@ def test_gaussian_label_builder_basic():
 
     # Check properties
     assert builder.label_name == "label_ret_fwd_21d"
-    assert builder.rank_over_name == "date"
+    assert builder.rank_by_name == "date"
 
 
 def test_gaussian_label_transformation_properties():
     """Test mathematical properties of Gaussian transformation."""
     test_data = mock_stocks(n_stocks=10, n_days=100)
-    builder = GaussianLabelBuilder(
-        factor="ret_fwd_21d", rank_over="date", group_by=None
-    )
+    builder = GaussianLabelBuilder(factor="ret_fwd_21d", rank_by="date", by=None)
 
     labeled_df = builder.label(test_data)
     for date_ in test_data["date"]:
@@ -309,7 +302,7 @@ def test_gaussian_label_transformation_properties():
 def test_gaussian_label_builder_with_missing():
     """Test handling of missing values."""
     test_data = mock_stocks(10, 100)
-    builder = GaussianLabelBuilder(factor="ret_fwd_21d", rank_over="date")
+    builder = GaussianLabelBuilder(factor="ret_fwd_21d", rank_by="date")
     labeled_df = builder.label(test_data)
 
     # Should filter out null returns
@@ -318,120 +311,3 @@ def test_gaussian_label_builder_with_missing():
     # Check we have fewer rows than original (nulls removed)
     original_with_nulls = test_data.filter(pl.col("ret_fwd_21d").is_not_null())
     assert len(labeled_df) == len(original_with_nulls)
-
-
-# ============================================================================
-# LGBDataset Tests
-# ============================================================================
-
-
-def test_lgbdataset_build():
-    """Test LightGBM dataset construction."""
-    df = mock_stocks(n_days=20)
-
-    label_builder = GaussianLabelBuilder(
-        factor="ret_fwd_21d", rank_over="date", group_by="sw_l1_code"
-    )
-
-    features = ["feature_1_z", "feature_2_z"]
-    dataset_builder = LGBDataProcessor(features=features, label_cls=label_builder)
-
-    dataset, feature_names = dataset_builder.build(df)
-    dataset = dataset.construct()
-
-    # Check output types
-    assert isinstance(dataset, lgb.Dataset)
-    assert isinstance(feature_names, list)
-
-    # Check features
-    assert len(feature_names) == 2
-    assert "feature_1_z" in feature_names
-    assert "feature_2_z" in feature_names
-
-    # Check data shape
-    X, y = dataset.get_data(), dataset.get_label()
-    assert cast(np.ndarray, X).shape[0] == cast(np.ndarray, y).shape[0]
-    assert cast(np.ndarray, X).shape[1] == len(feature_names)
-
-
-def test_lgbdataset_groups():
-    """Test that query groups are correctly constructed."""
-    df = mock_stocks(n_stocks=3, n_days=10)
-
-    label_builder = GaussianLabelBuilder(factor="ret_fwd_21d", rank_over="date")
-    dataset_builder = LGBDataProcessor(
-        features=["feature_1_z"], label_cls=label_builder
-    )
-
-    dataset, _ = dataset_builder.build(df)
-
-    # Check groups (should be 10 groups, one per date, with 3 stocks each)
-    groups = dataset.get_group()
-    groups = cast(np.ndarray, groups)
-    assert len(groups) == 10  # 10 dates
-    assert all(g == 3 for g in groups)  # 3 stocks per date
-
-
-# ============================================================================
-# LGBTrainer Tests
-# ============================================================================
-
-
-def test_lgbtrainer_simple_training():
-    """Test basic training without optimization."""
-    # Create small dataset
-    df = mock_stocks(n_stocks=5, n_days=50)
-
-    # Split data
-    split_date = default_start_date() + timedelta(20)
-    train_df = df.filter(pl.col("date") < split_date)
-    val_df = df.filter(pl.col("date") >= split_date)
-
-    # Setup trainer
-    label_builder = GaussianLabelBuilder(factor="ret_fwd_21d", rank_over="date")
-    dataset_builder = LGBDataProcessor(
-        features=["feature_1_z", "feature_2_z"], label_cls=label_builder
-    )
-    config = LGBRankConfig()
-    trainer = LGBTrainer(processor=dataset_builder, config=config)
-
-    # Train without optimization
-    result = trainer.train(train_df=train_df, val_df=val_df, optimize=False, n_trials=1)
-
-    # Check result structure
-    assert isinstance(result, LGBModelResult)
-    assert isinstance(result.model, lgb.Booster)
-    assert isinstance(result.feature_names, list)
-    assert isinstance(result.params, dict)
-    assert isinstance(result.importance, dict)
-
-    # Check feature importance matches features
-    assert set(result.importance.keys()) == set(result.feature_names)
-
-
-def test_lgbtrainer_with_optimization_small():
-    """Test training with optimization on small dataset."""
-    df = mock_stocks(n_stocks=3, n_days=50)
-
-    split_date = default_start_date() + timedelta(20)
-    train_df = df.filter(pl.col("date") < split_date)
-    val_df = df.filter(pl.col("date") >= split_date)
-
-    label_builder = GaussianLabelBuilder(factor="ret_fwd_21d", rank_over="date")
-    dataset_builder = LGBDataProcessor(
-        features=["feature_1_z"], label_cls=label_builder
-    )
-
-    config = LGBRankConfig()
-    trainer = LGBTrainer(processor=dataset_builder, config=config)
-
-    # Train with optimization (small trial count)
-    result = trainer.train(
-        train_df=train_df,
-        val_df=val_df,
-        optimize=True,
-        n_trials=2,  # Minimal for testing
-    )
-
-    assert result is not None
-    assert "num_leaves" in result.params

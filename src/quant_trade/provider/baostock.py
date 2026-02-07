@@ -314,6 +314,16 @@ def csi500_cons(date: date | None = None) -> pl.DataFrame:
     return df
 
 
+class BaoUniverse:
+    """financial statement macro-APIs (BaoStock façade)."""
+
+    @staticmethod
+    def csi500_cons(date: date | None = None) -> pl.DataFrame:
+        with BaoSession():
+            df = csi500_cons(date)
+        return df
+
+
 class BaoMicro:
     """financial statement micro-APIs (BaoStock façade)."""
 
@@ -341,6 +351,7 @@ class BaoMicro:
         Returns list of pl.DataFrame **in the same order** as input `codes`.
         Empty DataFrame = no data / filtered / failed.
         """
+        # tenacity @retry can't be used due to pickable of process
         worker = partial(
             concur.Try()(BaoMicro.market_ohlcv),
             period=period,
@@ -348,19 +359,10 @@ class BaoMicro:
             end_date=end_date,
             adjust=adjust,
         )
+
         config = concur.BatchConfig.process()
         return concur.batch_fetch(
             config=config,
             worker=worker,
             items=symbols,
         )
-
-
-class BaoMacro:
-    """financial statement macro-APIs (BaoStock façade)."""
-
-    @staticmethod
-    def csi500_cons(date: date | None = None) -> pl.DataFrame:
-        with BaoSession():
-            df = csi500_cons(date)
-        return df

@@ -59,10 +59,6 @@ class AssetLib:
 
     def _try_write(self: Self, book: str, df: pl.DataFrame) -> None:
         log.info(f"Write data: {book}")
-        if df.is_empty():
-            log.warning("Write data is empty")
-            return
-
         try:
             self._lib.write(book, ArcticAdapter.to_write(df))
         except Exception as e:
@@ -94,9 +90,9 @@ class BookLib[B](BookFetcher[B], AssetLib):
     def _fresh(self: Self, book: B) -> None:
         log.info(f"Fetching & processing data for {book}")
         raw = self._fetch(book)
-        if raw.is_empty():
-            log.warning(f"No raw data for {book}")
-            return
+        # if raw.is_empty():
+        #     log.warning(f"No raw data for {book}")
+        #     return
         feat = self._process(book, raw)
         self._try_write(self._key(book), feat)
 
@@ -113,9 +109,9 @@ class BatchBookLib[B](BatchBookFetcher[B], AssetLib):
     def _batch_fresh(self: Self, books: Sequence[B]) -> None:
         batch = self._fetch_batch(books)
         for book, df in zip(books, batch, strict=False):
-            if df.is_empty():
-                log.warning(f"No market data for {book}")
-                continue
+            # if df.is_empty():
+            #     log.warning(f"No market data for {book}")
+            #     continue
             feat = self._process(book, df)
             self._try_write(self._key(book), feat)
 
@@ -128,7 +124,7 @@ class BatchBookLib[B](BatchBookFetcher[B], AssetLib):
         if not fresh:
             for book in books:
                 key = self._key(book)
-                if (df := self._try_read(key)) is not None and not df.is_empty():
+                if (df := self._try_read(key)) is not None:
                     data[book] = df
                 else:
                     to_fetch.append(book)
@@ -155,7 +151,7 @@ class CNStockPool(AssetLib):
     SYMBOL = "stock"
 
     type Book = Literal["stock_code", "industry_code"]
-    type Universe = Literal["csi500"]
+    type Universe = Literal["sci", "csi500", "csi1000", "csi2000", "csia100"]
 
     def __init__(self, db: ArcticDB):
         AssetLib.__init__(self, db)
@@ -164,7 +160,7 @@ class CNStockPool(AssetLib):
     def _index_universe(universe: Universe, date: datetime.date) -> str:
         return f"{universe}_{date}"
 
-    def _fetch_pile(self, book: Book) -> pl.DataFrame:
+    def _fetch_whole(self, book: Book) -> pl.DataFrame:
         match book:
             case "stock_code":
                 return ak.AkShareUniverse().stock_whole()
@@ -173,14 +169,20 @@ class CNStockPool(AssetLib):
 
     def _fetch_pool(self, universe: Universe, date: datetime.date) -> pl.DataFrame:
         match universe:
+            case "sci":
+                return ak.AkShareUniverse().csi_index_cons("000001")
+            case "csia100":
+                return ak.AkShareUniverse().csi_index_cons("000903")
             case "csi500":
-                return bs.BaoMacro().csi500_cons(date)
-            # case _:
-            #     raise ValueError(f"Unknown universe fetch: {universe}")
+                return ak.AkShareUniverse().csi_index_cons("000905")
+            case "csi2000":
+                return ak.AkShareUniverse().csi_index_cons("932000")
+            case "csi1000":
+                return ak.AkShareUniverse().csi_index_cons("000852")
 
     def read_codes(self, book: Book, fresh: bool = False) -> pl.DataFrame:
         if fresh or not self._has(book):
-            self._try_write(book, self._fetch_pile(book))
+            self._try_write(book, self._fetch_whole(book))
         df = self._try_read(book)
         return df if df is not None else pl.DataFrame()
 
@@ -241,7 +243,8 @@ class CNMarket(BookLib[str], BatchBookLib[str], AssetLib):
 
     def stack_read(self, books: Sequence[str], fresh: bool = False) -> pl.DataFrame:
         frames = self._batch_read(books, fresh=fresh)
-        df = pl.concat(frames, how="vertical_relaxed")
+        frames = [frame for frame in frames if not frame.is_empty()]
+        df = pl.concat(frames, how="diagonal")
         return df
 
     def range_read(
@@ -442,7 +445,7 @@ class CNIndustrySectorGroup(SectorGroup):
         self,
         db: ArcticDB,
         factors: list[str],
-        std_suffix: str = "_z",
+        std_suffix: str = "z",
         min_group_size: int = 5,
         skip_winsor: bool = False,
         by: list[str] | None = None,

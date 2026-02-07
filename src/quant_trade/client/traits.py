@@ -24,27 +24,21 @@ Usage:
     df = pipe.run(url, params)
 """
 
+import asyncio
 import random
-import threading
-import time
-from collections import deque
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
 import polars as pl
-import requests
 import tqdm
-from requests.adapters import HTTPAdapter
+import tqdm.asyncio
 from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_random_exponential,
+    wait_exponential,
 )
-from urllib3.util.retry import Retry
 
 from quant_trade.config.logger import log
 from quant_trade.transform import normalize_date_column
@@ -69,15 +63,10 @@ class Fetcher(Protocol):
 
 
 class Parser(Protocol):
-    """Protocol for parsing.
+    """Protocol for parsing."""
 
-    Implementations must provide:
-    - parse(raw) -> list[dict]
-    - clean(data) -> pl.DataFrame
-    """
-
-    def parse(self, raw: dict) -> list[dict]: ...
-    def clean(self, data: list[dict]) -> pl.DataFrame: ...
+    def parse(self, raw: Any) -> Any: ...
+    def clean(self, data: Any) -> pl.DataFrame: ...
 
 
 class Builder(Protocol):
@@ -97,36 +86,38 @@ class Builder(Protocol):
 # =============================================================================
 # Base Implementations
 # =============================================================================
+#
+@dataclass
+class _AdaptiveController:
+    """EWMA-based controller to manage backpressure and circuit breaking."""
 
+    alpha: float = 0.2
+    failure_threshold: float = 0.7  # Trip circuit breaker if pressure > 0.7
 
-class _RateLimiter:
-    """Thread-safe token-bucket-like rate limiter with jitter."""
+    def __post_init__(self):
+        self.value = 0.0
+        self._lock = asyncio.Lock()
 
-    def __init__(self, min_delay: float, max_delay: float):
-        self.min_delay = min_delay
-        self.max_delay = max_delay
-        self._lock = threading.Lock()
-        self._next_allowed = time.monotonic()
+    async def record_success(self):
+        async with self._lock:
+            self.value = (1 - self.alpha) * self.value
 
-    def wait(self, penalty: float = 0.0):
-        with self._lock:
-            now = time.monotonic()
-            base_delay = random.uniform(self.min_delay, self.max_delay)
-            delay = base_delay + penalty
+    async def record_failure(self, weight: float = 1.0):
+        async with self._lock:
+            # Standard EWMA formula
+            self.value = min(1.0, (1 - self.alpha) * self.value + self.alpha * weight)
 
-            if now < self._next_allowed:
-                sleep_time = self._next_allowed - now + delay
-            else:
-                sleep_time = delay
-
-            self._next_allowed = max(self._next_allowed, now) + delay
-
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+    @property
+    def is_tripped(self) -> bool:
+        return self.value > self.failure_threshold
 
 
 class BaseFetcher:
-    """Advanced Base Fetcher using httpx + tenacity."""
+    """Advanced Base Fetcher using httpx + tenacity.
+
+    Caveat: **Do not** use **multi-thread** **in** session but outside of it
+    due to single thread constraint of event loop.
+    """
 
     USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -144,30 +135,30 @@ class BaseFetcher:
 
     def __init__(
         self,
-        delay_range: tuple[float, float] = (0.5, 1.5),
+        base_delay: float = 0.5,
         max_retries: int = 3,
-        max_workers: int = 3,
+        concurrency: int = 5,
         timeout: float = 10.0,
+        # proxies: dict[str,str]|None = None
     ):
-        self.delay_range = delay_range
+        self.concurrency = concurrency
+        self.base_delay = base_delay
         self.max_retries = max_retries
-        self.max_workers = max_workers
 
-        self._rate_limiter = _RateLimiter(*delay_range)
+        # Adaptive components
+        self.controller = _AdaptiveController()
+        self.semaphore = asyncio.Semaphore(concurrency)
 
-        self._penalty = 0.0
-        self._penalty_lock = threading.Lock()
-        self._recent_errors = deque(maxlen=20)
-
-        self._client = httpx.Client(
-            http2=True,
+        # Client configuration
+        self.client = httpx.AsyncClient(
+            http2=True,  # Critical for modern sites
             timeout=httpx.Timeout(timeout),
-            headers=self._get_headers(),
+            # proxies=proxies,
+            follow_redirects=True,
+            limits=httpx.Limits(
+                max_keepalive_connections=concurrency, max_connections=concurrency * 2
+            ),
         )
-
-    # ----------------------------
-    # Headers
-    # ----------------------------
 
     def _get_headers(self) -> dict:
         profile = random.choice(self._HEADER_PROFILES)
@@ -175,194 +166,85 @@ class BaseFetcher:
             "User-Agent": random.choice(self.USER_AGENTS),
             "Accept": "application/json, text/plain, */*",
             "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Cache-Control": "no-cache",
+            "DNT": "1",
             **profile,
         }
 
-    # ----------------------------
-    # Adaptive penalty
-    # ----------------------------
+    async def _handle_backoff(self):
+        """Dynamic delay based on EWMA pressure."""
+        # Base jittered delay + exponential pressure penalty
+        pressure_penalty = self.controller.value * 5.0
+        delay = random.uniform(self.base_delay, self.base_delay * 2) + pressure_penalty
 
-    def _apply_rate_limit(self):
-        self._rate_limiter.wait(self._penalty)
+        if self.controller.is_tripped:
+            log.warning(
+                f"Circuit breaker active (Pressure: {self.controller.value:.2f}). Cooling down..."
+            )
+            delay += 10.0
 
-    def _record_result(self, response: httpx.Response | None, exc: Exception | None):
-        with self._penalty_lock:
-            if exc is not None:
-                self._penalty = min(self._penalty + 0.3, 10.0)
-                return
+        await asyncio.sleep(delay)
 
-            if response is None:
-                return
-
-            if response.status_code in (403, 429):
-                self._penalty = min(self._penalty + 1.0, 10.0)
-            else:
-                self._penalty = max(self._penalty - 0.1, 0.0)
-
-    # ----------------------------
-    # Retry wrapper
-    # ----------------------------
-
-    def _retry_decorator(self):
-        return retry(
-            stop=stop_after_attempt(self.max_retries),
-            wait=wait_random_exponential(min=0.5, max=5),
-            retry=retry_if_exception_type(
-                (httpx.TransportError, httpx.HTTPStatusError)
-            ),
-            reraise=True,
-        )
-
-    # ----------------------------
-    # Public API (unchanged)
-    # ----------------------------
-
-    def fetch_initial(self, url: str, params: dict) -> dict:
+    async def _fetch_once(self, url: str, params: dict) -> Any:
         raise NotImplementedError
 
-    def fetch_page(self, url: str, params: dict, page: int) -> dict:
+    async def fetch_once(self, url: str, params: dict) -> dict:
+        """Generic low-level async request with rate limiting & retries."""
+        async with self.semaphore:
+            await self._handle_backoff()
+
+            @retry(
+                stop=stop_after_attempt(self.max_retries),
+                wait=wait_exponential(multiplier=1, min=2, max=10),
+                retry=retry_if_exception_type(
+                    (httpx.RequestError, httpx.HTTPStatusError)
+                ),
+                reraise=True,
+            )
+            async def _do():
+                return await self._fetch_once(url, params)
+
+            try:
+                res = await _do()
+                await self.controller.record_success()
+                return res
+            except httpx.HTTPStatusError as e:
+                # 429 and 403 are critical signals in scraping
+                weight = 1.0 if e.response.status_code in (429, 403) else 0.5
+                await self.controller.record_failure(weight=weight)
+                log.error(
+                    f"Blocked ({e.response.status_code}). Pressure: {self.controller.value:.2f}"
+                )
+                return {}
+            except Exception as e:
+                await self.controller.record_failure(
+                    weight=1.0 if "429" in str(e) else 0.5
+                )
+                return {}
+
+    async def _fetch_page(self, url: str, params: dict, page: int) -> Any:
         raise NotImplementedError
 
-    def fetch_pages_concurrent(
-        self,
-        url: str,
-        params: dict,
-        pages: list[int],
+    async def fetch_pages_concurrent(
+        self, url: str, params: dict, pages: list[int]
     ) -> list[dict]:
-        results = []
+        """Public API to fetch multiple pages efficiently."""
+        tasks = [self._fetch_page(url, params, p) for p in pages]
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_page = {
-                executor.submit(self._safe_fetch_page, url, params, page): page
-                for page in pages
-            }
+        results = await tqdm.asyncio.tqdm.gather(*tasks, desc="Scraping Quant Data")
+        return [r for r in results if r is not None]
 
-            n = len(pages)
-            for future in tqdm.tqdm(
-                as_completed(future_to_page),
-                total=n,
-                desc="Fetching data",
-                position=0,
-            ):
-                page = future_to_page[future]
-                try:
-                    result = future.result()
-                    if result is not None:
-                        results.append(result)
-                except Exception as e:
-                    print(f"[WARN] page={page} failed: {e}")
+    async def close(self):
+        await self.client.aclose()
 
-        return results
-
-    # ----------------------------
-    # Internal guarded fetch
-    # ----------------------------
-
-    def _safe_fetch_page(self, url: str, params: dict, page: int):
-        self._apply_rate_limit()
-
-        retryable = self._retry_decorator()
-
-        @retryable
-        def _call():
-            return self.fetch_page(url, params, page)
-
-        try:
-            result = _call()
-            self._record_result(None, None)
-            return result
-        except httpx.HTTPStatusError as e:
-            self._record_result(e.response, e)
-            raise
-        except Exception as e:
-            self._record_result(None, e)
-            raise
-
-    # ----------------------------
-    # Lifecycle
-    # ----------------------------
-
-    def close(self):
-        self._client.close()
-
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, *args):
-        self.close()
-
-
-class BaseParser:
-    """Base Parser - converts raw JSON to structured data.
-
-    Provides:
-    - Configurable data path traversal via DATA_PATH
-    - Total pages extraction via get_total_pages()
-    - Basic DataFrame cleaning
-
-    Usage:
-        class MyParser(BaseParser):
-            DATA_PATH = ("result", "data")
-
-            def parse(self, raw: dict) -> list[dict]:
-                # Custom parsing logic
-                ...
-    """
-
-    # Keys to traverse to get data list, e.g., ("result", "data")
-    # Override in subclass for different API structures
-    DATA_PATH: tuple[str, ...] = ("result", "data")
-
-    # Key for total pages in response
-    PAGES_KEY: str = "pages"
-
-    def parse(self, raw: dict) -> list[dict]:
-        """Parse response and extract data list.
-
-        Args:
-            raw: Raw JSON response dictionary
-
-        Returns:
-            List of data dictionaries
-        """
-        if not raw.get("result"):
-            return []
-
-        # Navigate to data using DATA_PATH
-        data = raw
-        for key in self.DATA_PATH:
-            data = data.get(key, {})
-            if data is None:
-                return []
-
-        return data if isinstance(data, list) else []
-
-    def get_total_pages(self, raw: dict) -> int:
-        """Get total pages from response.
-
-        Args:
-            raw: Raw JSON response dictionary
-
-        Returns:
-            Total number of pages (default: 1)
-        """
-        return raw.get("result", {}).get(self.PAGES_KEY, 1)
-
-    def clean(self, data: list[dict]) -> pl.DataFrame:
-        """Clean and convert to Polars DataFrame.
-
-        Args:
-            data: List of data dictionaries
-
-        Returns:
-            Polars DataFrame
-        """
-        if not data:
-            return pl.DataFrame()
-
-        # Use infer_schema_length=None to scan all rows for proper type inference
-        # This prevents issues with large numeric values causing overflow
-        return pl.DataFrame(data, infer_schema_length=None)
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.client.aclose()
 
 
 @dataclass
@@ -436,7 +318,7 @@ class BaseBuilder:
         Returns:
             DataFrame with renamed columns
         """
-        log.debug(f"Renaming columns using mapping: {self.column_map}")
+        log.debug(f"Renaming columns using mapping: \n {self.column_map}")
         rename_map = {k: v for k, v in self.column_map.items() if k in df.columns}
         return df.rename(rename_map)
 
@@ -453,17 +335,17 @@ class BaseBuilder:
             DataFrame with converted types
         """
         log.debug(
-            f"Converting types for columns: {self.numeric_cols} and date column: {self.DATE_COL}"
+            f"Converting types: numeric columns: \n {self.numeric_cols} \n date column: \n {self.DATE_COL}"
         )
         result = df
         for col in self.numeric_cols:
             if col in result.columns:
                 result = result.with_columns(pl.col(col).cast(pl.Float64, strict=False))
         if self.DATE_COL and self.DATE_COL in result.columns:
-            result = normalize_date_column(result, self.DATE_COL)
+            result = normalize_date_column(result, self.DATE_COL).sort(self.DATE_COL)
         return result
 
-    def reorder(self, df: pl.DataFrame) -> pl.DataFrame:
+    def extract(self, df: pl.DataFrame) -> pl.DataFrame:
         """Reorder columns and add sequence number.
 
         Args:
@@ -473,19 +355,19 @@ class BaseBuilder:
             DataFrame with columns in OUTPUT_ORDER and seq column
         """
         # Select only columns that exist in OUTPUT_ORDER
-        available = [c for c in self.OUTPUT_ORDER if c in df.columns]
+        # available = [c for c in self.OUTPUT_ORDER if c in df.columns]
 
-        # Add sequence column at position 0
-        if df.height > 0:
-            result = df.select(available).with_columns(
-                pl.arange(1, df.height + 1).alias("seq")
-            )
-        else:
-            result = df.select(available)
+        # # Add sequence column at position 0
+        # if df.height > 0:
+        #     result = df.select(available).with_columns(
+        #         pl.arange(1, df.height + 1).alias("seq")
+        #     )
+        # else:
+        #     result = df.select(available)
 
         # Reorder to match OUTPUT_ORDER
-        ordered = [c for c in self.OUTPUT_ORDER if c in result.columns]
-        return result.select(ordered)
+        ordered = [c for c in self.OUTPUT_ORDER if c in df.columns]
+        return df.select(ordered)
 
     def deduplicate(self, df: pl.DataFrame) -> pl.DataFrame:
         """Remove duplicate rows based on DUPLICATE_COLS.
@@ -513,11 +395,12 @@ class BaseBuilder:
         Returns:
             Normalized DataFrame
         """
-        log.debug(f"Normalizing df columns: {df.columns}")
+        if df.columns:
+            log.debug(f"Normalizing df columns: {df.columns}")
         result = self.rename(df)
-        result = self.convert_types(result)
+        result = self.extract(result)
         result = self.deduplicate(result)
-        result = self.reorder(result)
+        result = self.convert_types(result)
         log.debug(f"Normalized df columns: {result.columns}")
         return result
 
@@ -527,99 +410,99 @@ class BaseBuilder:
 # =============================================================================
 
 
-class DataPipe:
-    """Generic data pipe that orchestrates Fetcher -> Parser -> Builder.
+# class DataPipe:
+#     """Generic data pipe that orchestrates Fetcher -> Parser -> Builder.
 
-    This is the core abstraction that enables reusable data fetching patterns.
+#     This is the core abstraction that enables reusable data fetching patterns.
 
-    Features:
-    - Full pipeline orchestration: fetch -> parse -> clean -> transform
-    - Concurrent page fetching support
-    - Context manager support
+#     Features:
+#     - Full pipeline orchestration: fetch -> parse -> clean -> transform
+#     - Concurrent page fetching support
+#     - Context manager support
 
-    Usage:
-        pipe = DataPipe(
-            fetcher=MyFetcher(),
-            parser=MyParser(),
-            builder=MyBuilder(),
-        )
+#     Usage:
+#         pipe = DataPipe(
+#             fetcher=MyFetcher(),
+#             parser=MyParser(),
+#             builder=MyBuilder(),
+#         )
 
-        with pipe as p:
-            df = p.run(url, params)
+#         with pipe as p:
+#             df = p.run(url, params)
 
-        # Or without context manager:
-        df = pipe.run(url, params)
-        pipe.fetcher.close()
-    """
+#         # Or without context manager:
+#         df = pipe.run(url, params)
+#         pipe.fetcher.close()
+#     """
 
-    def __init__(
-        self,
-        fetcher: BaseFetcher,
-        parser: BaseParser,
-        builder: Builder,
-    ):
-        """Initialize DataPipe.
+#     def __init__(
+#         self,
+#         fetcher: BaseFetcher,
+#         parser: BaseParser,
+#         builder: Builder,
+#     ):
+#         """Initialize DataPipe.
 
-        Args:
-            fetcher: BaseFetch implementation (provides fetch_pages_concurrent)
-            parser: BaseParser implementation (provides get_total_pages)
-            builder: Builder implementation
-        """
-        self.fetcher = fetcher
-        self.parser = parser
-        self.builder = builder
+#         Args:
+#             fetcher: BaseFetch implementation (provides fetch_pages_concurrent)
+#             parser: BaseParser implementation (provides get_total_pages)
+#             builder: Builder implementation
+#         """
+#         self.fetcher = fetcher
+#         self.parser = parser
+#         self.builder = builder
 
-    def run(
-        self,
-        url: str,
-        params: dict,
-        concurrent_pages: bool = True,
-    ) -> pl.DataFrame:
-        """Execute the full data pipeline.
+#     def run(
+#         self,
+#         url: str,
+#         params: dict,
+#         concurrent_pages: bool = True,
+#     ) -> pl.DataFrame:
+#         """Execute the full data pipeline.
 
-        Args:
-            url: API endpoint URL
-            params: Query parameters
-            concurrent_pages: Whether to fetch pages concurrently
+#         Args:
+#             url: API endpoint URL
+#             params: Query parameters
+#             concurrent_pages: Whether to fetch pages concurrently
 
-        Returns:
-            Transformed Polars DataFrame
-        """
-        # Fetch initial page
-        raw = self.fetcher.fetch_initial(url, params)
+#         Returns:
+#             Transformed Polars DataFrame
+#         """
+#         # Fetch initial page
+#         raw = self.fetcher.fetch_initial(url, params)
 
-        # Parse and get total pages
-        data = self.parser.parse(raw)
-        if not data:
-            return pl.DataFrame()
+#         # Parse and get total pages
+#         data = self.parser.parse(raw)
+#         if not data:
+#             return pl.DataFrame()
 
-        total_pages = self.parser.get_total_pages(raw)
+#         total_pages = self.parser.get_total_pages(raw)
 
-        # Fetch remaining pages concurrently
-        if concurrent_pages and total_pages > 1:
-            pages_to_fetch = list(range(2, total_pages + 1))
-            page_results = self.fetcher.fetch_pages_concurrent(
-                url, params, pages_to_fetch
-            )
+#         # Fetch remaining pages concurrently
+#         if concurrent_pages and total_pages > 1:
+#             pages_to_fetch = list(range(2, total_pages + 1))
+#             page_results = self.fetcher.fetch_pages_concurrent(
+#                 url, params, pages_to_fetch
+#             )
 
-            for page_raw in page_results:
-                page_data = self.parser.parse(page_raw)
-                data.extend(page_data)
+#             for page_raw in page_results:
+#                 page_data = self.parser.parse(page_raw)
+#                 data.extend(page_data)
 
-        # Build DataFrame
-        df = self.parser.clean(data)
+#         # Build DataFrame
+#         df = self.parser.clean(data)
 
-        # Apply builder transformations
-        df = self.builder.rename(df)
-        df = self.builder.convert_types(df)
-        df = self.builder.reorder(df)
-        return df
+#         # Apply builder transformations
+#         df = self.builder.rename(df)
+#         df = self.builder.convert_types(df)
+#         df = self.builder.reorder(df)
+#         return df
 
-    def __enter__(self) -> "DataPipe":
-        return self
+#     def __enter__(self) -> "DataPipe":
+#         return self
 
-    def __exit__(self, *args) -> None:
-        self.fetcher.close()
+#     def __exit__(self, *args) -> None:
+#         self.fetcher.close()
 
 
 # =============================================================================
@@ -627,61 +510,61 @@ class DataPipe:
 # =============================================================================
 
 
-def build_data_path(data_path: tuple[str, ...]) -> Callable[[dict], Any]:
-    """Create a function to extract data from a nested dictionary.
+# def build_data_path(data_path: tuple[str, ...]) -> Callable[[dict], Any]:
+#     """Create a function to extract data from a nested dictionary.
 
-    Args:
-        data_path: Tuple of keys to traverse
+#     Args:
+#         data_path: Tuple of keys to traverse
 
-    Returns:
-        Function that extracts data from a dict
+#     Returns:
+#         Function that extracts data from a dict
 
-    Example:
-        extract_data = build_data_path(("result", "data"))
-        data = extract_data(response)  # Returns response["result"]["data"]
-    """
+#     Example:
+#         extract_data = build_data_path(("result", "data"))
+#         data = extract_data(response)  # Returns response["result"]["data"]
+#     """
 
-    def extract(data: dict) -> Any:
-        result = data
-        for key in data_path:
-            if isinstance(result, dict):
-                result = result.get(key, {})
-            else:
-                return None
-        return result if result else None
+#     def extract(data: dict) -> Any:
+#         result = data
+#         for key in data_path:
+#             if isinstance(result, dict):
+#                 result = result.get(key, {})
+#             else:
+#                 return None
+#         return result if result else None
 
-    return extract
+#     return extract
 
 
-def create_retry_session(
-    max_retries: int = 3,
-    backoff_factor: float = 1,
-    pool_connections: int = 10,
-    pool_maxsize: int = 20,
-) -> requests.Session:
-    """Create a requests Session with retry strategy.
+# def create_retry_session(
+#     max_retries: int = 3,
+#     backoff_factor: float = 1,
+#     pool_connections: int = 10,
+#     pool_maxsize: int = 20,
+# ) -> requests.Session:
+#     """Create a requests Session with retry strategy.
 
-    Args:
-        max_retries: Maximum retry attempts
-        backoff_factor: Backoff multiplier between retries
-        pool_connections: Number of pool connections
-        pool_maxsize: Maximum pool size
+#     Args:
+#         max_retries: Maximum retry attempts
+#         backoff_factor: Backoff multiplier between retries
+#         pool_connections: Number of pool connections
+#         pool_maxsize: Maximum pool size
 
-    Returns:
-        Configured requests Session
-    """
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=max_retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(
-        pool_connections=pool_connections,
-        pool_maxsize=pool_maxsize,
-        max_retries=retry_strategy,
-    )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+#     Returns:
+#         Configured requests Session
+#     """
+#     session = requests.Session()
+#     retry_strategy = Retry(
+#         total=max_retries,
+#         backoff_factor=backoff_factor,
+#         status_forcelist=[429, 500, 502, 503, 504],
+#         allowed_methods=["GET"],
+#     )
+#     adapter = HTTPAdapter(
+#         pool_connections=pool_connections,
+#         pool_maxsize=pool_maxsize,
+#         max_retries=retry_strategy,
+#     )
+#     session.mount("http://", adapter)
+#     session.mount("https://", adapter)
+#     return session

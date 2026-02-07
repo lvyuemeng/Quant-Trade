@@ -21,11 +21,13 @@ SHEET_QUATER = 1
 
 
 def test_db_stock(db: ArcticDB):
-    stock_lib = CNStockPool(db)
-    stock_codes = stock_lib.read_codes("stock_code")
-    print(f"stock code: {stock_codes}")
-    indus_codes = stock_lib.read_codes("industry_code")
-    print(f"stock code: {indus_codes.sample(30)}")
+    lib = CNStockPool(db)
+    # stock_codes = lib.read_codes("stock_code")
+    # print(f"stock code: {stock_codes}")
+    # indus_codes = lib.read_codes("industry_code")
+    # print(f"stock code: {indus_codes.sample(30)}")
+    csi1000 = lib.read_pool("csi1000", date=datetime.date.today())
+    print(f"csi1000 {csi1000}")
 
 
 def test_db_fundamental(db: ArcticDB):

@@ -13,13 +13,14 @@ from quant_trade.feature.store import (
 )
 from quant_trade.model.lgb import (
     MetricConfig,
+    Predictor,
     Processor,
     Trainer,
     TuneConfig,
 )
 from quant_trade.model.process import (
     DiscreteLabelBuilder,
-    PurgedKFold,
+    WalkForwardValidation,
 )
 from quant_trade.model.store import FSStorage, ModelStore
 from tests.conftest import smoke_configure
@@ -36,8 +37,8 @@ SELECTED = [
     "ma12_dev",
     "ma24_dev",
     # trend signal
-    "above_ma12",
-    "ma_cross_up",
+    # "above_ma12",
+    # "ma_cross_up",
     # rate of change
     "roc_4",
     "roc_12",
@@ -57,10 +58,8 @@ SELECTED = [
     "profit_growth_premium",
     # Macro
     # northbound
-    "nb_flow_z_short_northbound"
-    "nb_flow_conviction_northbound"
-    "nb_flow_trend_northbound"
-    "nb_flow_accel_up_northbound",
+    "nb_flow_z_shortnb_flow_conviction",
+    "nb_flow_trendnb_flow_accel_up",
     # marginshort
     # "margin_dev60_marginshort",
     # "short_long_ratio_marginshort",
@@ -107,52 +106,65 @@ def stack_all(
     merged = merged.sort("ts_code", "date")
 
     merged = merged.filter(
-        (pl.col("date").diff().over("ts_code") > pl.duration(days=10))
+        (pl.col("date").diff().over("ts_code") > pl.duration(days=5))
         | (pl.col("date").diff().over("ts_code").is_null())
     )
 
     return merged
 
 
-if __name__ == "__main__":
-    smoke_configure()
+def merged_data(
+    zfeatures: list[str], start: date, end: date
+) -> tuple[pl.DataFrame, list[str]]:
     db = ArcticDB.from_config()
     pool = CNStockPool(db)
-    market = CNMarket(db, source="baostock")
+    market = CNMarket(db, source="akshare")
     fund = CNFundamental(db)
     macro = CNMacro(db)
-
-    start_date = date(2017, 2, 1)
-    end_date = date(2020, 12, 31)
-
-    cons = pool.read_pool("csi500", date=end_date)
+    cons = pool.read_pool("csi1000", date=end)
     market_df = market.range_read(
-        books=cons["ts_code"].to_list(), start=start_date, end=end_date
+        books=cons["ts_code"].to_list(), start=start, end=end
     )
     fund_df = fund.range_read(
-        start=start_date,
-        end=end_date,
+        start=start,
+        end=end,
     )
-    sector = CNIndustrySectorGroup(db, factors=SELECTED_NEUTRAL, std_suffix="_z")
+    sector = CNIndustrySectorGroup(db, factors=zfeatures, std_suffix="z")
     neu_fund_df = sector(fund_df)
     north_df = macro.read(book=MacroBook("northbound"))
 
     merged = stack_all(market_df, neu_fund_df, north_df)
-    print(f"{len(merged)}")
-    factor_col = "ret_1m"
-    feature_cols = SELECTED + sector.zfactors()
+    return (merged, sector.zfactors())
 
+
+def train(data: pl.DataFrame, name: str, label: str, features: list[str]):
     # Use DiscreteLabelBuilder for LambdaRank (discrete relevance labels)
-    discrete_label = DiscreteLabelBuilder("ret_1m", rank_by="date", num_bins=4)
+    discrete_label = DiscreteLabelBuilder(label, rank_by="date", num_bins=6)
     metric_config = MetricConfig.ranking(discrete_label)
-    processor = Processor(features=feature_cols, config=metric_config)
+    processor = Processor(features=features, config=metric_config)
     trainer = Trainer(processor=processor)
 
-    data_batch = PurgedKFold(5, horizon_days=0, embargo_days=0).split(
-        merged, date_col="date"
+    data_batch = WalkForwardValidation(5, horizon_days=0, embargo_days=0).split(
+        data, date_col="date"
     )
     result = trainer.batch_train(data_batch, TuneConfig())
     print(f"results: {result}")
-    card = result.pack(name="test")
+    card = result.pack(name=name)
     store = ModelStore(FSStorage(base_dir="./model"))
-    store.register(card=card)
+    store.register(card=card, overwrite=True)
+
+
+def predict(data: pl.DataFrame, name: str, label: str) -> pl.DataFrame:
+    store = ModelStore(FSStorage(base_dir="./model"))
+    discrete_label = DiscreteLabelBuilder(label, rank_by="date", num_bins=6)
+    config = MetricConfig.ranking(discrete_label)
+    predictor = Predictor.from_store(config, store, name)
+    return predictor.predict(data)
+
+
+if __name__ == "__main__":
+    smoke_configure()
+    start = date(2017, 1, 1)
+    end = date(2025, 1, 1)
+    data, zfactors = merged_data(SELECTED_NEUTRAL, start, end)
+    train(data, name="17_25_ret_1y", label="ret_1y", features=SELECTED_NEUTRAL + SELECTED)
