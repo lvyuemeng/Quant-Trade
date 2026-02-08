@@ -15,7 +15,7 @@ from typing import (
     runtime_checkable,
 )
 
-from ..transform import Quarter
+from quant_trade.transform import Quarter
 
 
 def book_key[T](cls: type[T]) -> type[T]:
@@ -111,12 +111,13 @@ class QuarterBook:
     # Pre-compile regex for parsing (class-level optimization)
     _KEY_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^(\d{4})_Q([1-4])$")
 
-    def to_key(self) -> str:
+    @property
+    def key(self) -> str:
         """Override: More efficient than auto-generated version."""
         return f"{self.year}_Q{self.quarter}"
 
     @classmethod
-    def parse_key(cls, key: str) -> Self:
+    def from_str(cls, key: str) -> Self:
         """Parse key into QuarterBook instance."""
         if not key:
             raise ValueError("Empty key")

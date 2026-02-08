@@ -1,15 +1,14 @@
 """AkShare data provider implementation."""
 
-from collections.abc import Callable, Sequence
-from datetime import date, datetime, timedelta
-from functools import cache, partial
+from collections.abc import Sequence
+from datetime import date
+from functools import cache
 from pathlib import Path
 
 import akshare as ak
 import polars as pl
-from tenacity import retry, stop_after_attempt, wait_exponential
 
-import quant_trade.provider.concurrent as concur
+from quant_trade.client.csindex import CSIndex
 from quant_trade.client.eastmoney import EastMoney
 from quant_trade.config.logger import log
 from quant_trade.transform import (
@@ -17,13 +16,11 @@ from quant_trade.transform import (
     DateLike,
     Period,
     Quarter,
+    cur_quarter,
     normalize_date_column,
     normalize_ts_code,
     to_date,
-    to_ymd_str,
 )
-
-from ..client.csindex import CSIndex
 
 # def quarter_to_report_date(year: int, quarter: Quarter, as_ymd: bool = True) -> str:
 #     """Explicit year + quarter → YYYYMMDD or YYYY-MM-DD"""
@@ -32,22 +29,6 @@ from ..client.csindex import CSIndex
 #     if not as_ymd:
 #         return f"{year}-{ends[quarter][:2]}-{ends[quarter][2:]}"
 #     return s
-
-
-def cur_quarter_end() -> tuple[int, Quarter]:
-    """Most recent completed quarter end (explicit — no None handling)"""
-    today = datetime.now().date()
-    year = today.year
-    month = today.month
-
-    if month <= 3:
-        return (year - 1, 4)
-    elif month <= 6:
-        return (year, 1)
-    elif month <= 9:
-        return (year, 2)
-    else:
-        return (year, 3)
 
 
 # def quarter_range(
@@ -69,36 +50,36 @@ def cur_quarter_end() -> tuple[int, Quarter]:
 #     return result
 
 
-def _fetch_and_clean_whole(
-    fetch_func: Callable,
-    rename_map: dict,
-    date_col: str = "publish_date",
-    code_col: str = "ts_code",
-    name_col: str = "name",
-) -> pl.DataFrame:
-    """Common pattern: fetch → pandas → polars → rename → select → normalize date"""
-    try:
-        raw = fetch_func()
-        if raw.empty:
-            log.warning(f"Empty result from {fetch_func.__name__}")
-            return pl.DataFrame(
-                schema={code_col: pl.Utf8, name_col: pl.Utf8, date_col: pl.Date}
-            )
+# def _fetch_and_clean_whole(
+#     fetch_func: Callable,
+#     rename_map: dict,
+#     date_col: str = "publish_date",
+#     code_col: str = "ts_code",
+#     name_col: str = "name",
+# ) -> pl.DataFrame:
+#     """Common pattern: fetch → pandas → polars → rename → select → normalize date"""
+#     try:
+#         raw = fetch_func()
+#         if raw.empty:
+#             log.warning(f"Empty result from {fetch_func.__name__}")
+#             return pl.DataFrame(
+#                 schema={code_col: pl.Utf8, name_col: pl.Utf8, date_col: pl.Date}
+#             )
 
-        df = pl.from_pandas(raw)
-        df = df.rename(rename_map)
-        df = df.select([code_col, name_col, date_col])
-        df = normalize_date_column(df, date_col)
-        df = df.with_columns(
-            pl.col(code_col).cast(pl.Utf8),
-            pl.col(name_col).cast(pl.Utf8),
-        )
-        return df
-    except Exception as e:
-        log.error(f"Failed to fetch whole list: {e}")
-        return pl.DataFrame(
-            schema={code_col: pl.Utf8, name_col: pl.Utf8, date_col: pl.Date}
-        )
+#         df = pl.from_pandas(raw)
+#         df = df.rename(rename_map)
+#         df = df.select([code_col, name_col, date_col])
+#         df = normalize_date_column(df, date_col)
+#         df = df.with_columns(
+#             pl.col(code_col).cast(pl.Utf8),
+#             pl.col(name_col).cast(pl.Utf8),
+#         )
+#         return df
+#     except Exception as e:
+#         log.error(f"Failed to fetch whole list: {e}")
+#         return pl.DataFrame(
+#             schema={code_col: pl.Utf8, name_col: pl.Utf8, date_col: pl.Date}
+#         )
 
 
 # def _fetch_ohlcv(
@@ -255,116 +236,116 @@ def _fetch_and_clean_whole(
 #         return None
 
 
-@cache
-def stock_code_sh_whole() -> pl.DataFrame:
-    return _fetch_and_clean_whole(
-        lambda: ak.stock_info_sh_name_code(symbol="主板A股"),
-        {
-            "证券代码": "ts_code",
-            "证券简称": "name",
-            "上市日期": "publish_date",
-        },
-    )
+# @cache
+# def stock_code_sh_whole() -> pl.DataFrame:
+#     return _fetch_and_clean_whole(
+#         lambda: ak.stock_info_sh_name_code(symbol="主板A股"),
+#         {
+#             "证券代码": "ts_code",
+#             "证券简称": "name",
+#             "上市日期": "publish_date",
+#         },
+#     )
 
 
-@cache
-def stock_code_sz_whole() -> pl.DataFrame:
-    return _fetch_and_clean_whole(
-        lambda: ak.stock_info_sz_name_code(symbol="A股列表"),
-        {
-            "A股代码": "ts_code",
-            "A股简称": "name",
-            "A股上市日期": "publish_date",
-        },
-    )
+# @cache
+# def stock_code_sz_whole() -> pl.DataFrame:
+#     return _fetch_and_clean_whole(
+#         lambda: ak.stock_info_sz_name_code(symbol="A股列表"),
+#         {
+#             "A股代码": "ts_code",
+#             "A股简称": "name",
+#             "A股上市日期": "publish_date",
+#         },
+#     )
 
 
-@cache
-def stock_code_bj_whole() -> pl.DataFrame:
-    return _fetch_and_clean_whole(
-        ak.stock_info_bj_name_code,
-        {
-            "证券代码": "ts_code",
-            "证券简称": "name",
-            "上市日期": "publish_date",
-        },
-    )
+# @cache
+# def stock_code_bj_whole() -> pl.DataFrame:
+#     return _fetch_and_clean_whole(
+#         ak.stock_info_bj_name_code,
+#         {
+#             "证券代码": "ts_code",
+#             "证券简称": "name",
+#             "上市日期": "publish_date",
+#         },
+#     )
 
 
-@cache
-def stock_code_delist_sh() -> pl.DataFrame:
-    df = _fetch_and_clean_whole(
-        lambda: ak.stock_info_sh_delist(symbol="全部"),
-        {
-            "公司代码": "ts_code",
-            "公司简称": "name",
-            "暂停上市日期": "off_date",
-        },
-        date_col="off_date",
-    )
-    return df.filter(pl.col("off_date").is_not_null())
+# @cache
+# def stock_code_delist_sh() -> pl.DataFrame:
+#     df = _fetch_and_clean_whole(
+#         lambda: ak.stock_info_sh_delist(symbol="全部"),
+#         {
+#             "公司代码": "ts_code",
+#             "公司简称": "name",
+#             "暂停上市日期": "off_date",
+#         },
+#         date_col="off_date",
+#     )
+#     return df.filter(pl.col("off_date").is_not_null())
 
 
-@cache
-def stock_code_delist_sz() -> pl.DataFrame:
-    df = _fetch_and_clean_whole(
-        lambda: ak.stock_info_sz_delist(symbol="终止上市公司"),
-        {
-            "证券代码": "ts_code",
-            "证券简称": "name",
-            "终止上市日期": "off_date",
-        },
-        date_col="off_date",
-    )
-    return df.filter(pl.col("off_date").is_not_null())
+# @cache
+# def stock_code_delist_sz() -> pl.DataFrame:
+#     df = _fetch_and_clean_whole(
+#         lambda: ak.stock_info_sz_delist(symbol="终止上市公司"),
+#         {
+#             "证券代码": "ts_code",
+#             "证券简称": "name",
+#             "终止上市日期": "off_date",
+#         },
+#         date_col="off_date",
+#     )
+#     return df.filter(pl.col("off_date").is_not_null())
 
 
-@cache
-def stock_code_delist() -> pl.DataFrame:
-    sh = stock_code_delist_sh()
-    sz = stock_code_delist_sz()
-    if sh.is_empty() and sz.is_empty():
-        return pl.DataFrame(
-            schema={"ts_code": pl.Utf8, "name": pl.Utf8, "off_date": pl.Date}
-        )
-    return pl.concat([sh, sz], how="vertical_relaxed").unique("ts_code", keep="last")
+# @cache
+# def stock_code_delist() -> pl.DataFrame:
+#     sh = stock_code_delist_sh()
+#     sz = stock_code_delist_sz()
+#     if sh.is_empty() and sz.is_empty():
+#         return pl.DataFrame(
+#             schema={"ts_code": pl.Utf8, "name": pl.Utf8, "off_date": pl.Date}
+#         )
+#     return pl.concat([sh, sz], how="vertical_relaxed").unique("ts_code", keep="last")
 
 
-@cache
-def stock_code_whole() -> pl.DataFrame:
-    sh = stock_code_sh_whole()
-    sz = stock_code_sz_whole()
-    bj = stock_code_bj_whole()
-    if all(d.is_empty() for d in [sh, sz, bj]):
-        log.warning("No listed stocks fetched from any exchange")
-        return pl.DataFrame(
-            schema={"ts_code": pl.Utf8, "name": pl.Utf8, "publish_date": pl.Date}
-        )
-    return pl.concat([sh, sz, bj], how="vertical_relaxed").unique(
-        "ts_code", keep="first"
-    )
+# @cache
+# def stock_code_whole() -> pl.DataFrame:
+#     sh = stock_code_sh_whole()
+#     sz = stock_code_sz_whole()
+#     bj = stock_code_bj_whole()
+#     if all(d.is_empty() for d in [sh, sz, bj]):
+#         log.warning("No listed stocks fetched from any exchange")
+#         return pl.DataFrame(
+#             schema={"ts_code": pl.Utf8, "name": pl.Utf8, "publish_date": pl.Date}
+#         )
+#     return pl.concat([sh, sz, bj], how="vertical_relaxed").unique(
+#         "ts_code", keep="first"
+#     )
 
 
-@cache
-def stock_code_sus(date: DateLike) -> pl.DataFrame:
-    ymd = to_ymd_str(date)
-    try:
-        raw = ak.stock_tfp_em(date=ymd)
-        if raw.empty:
-            return pl.DataFrame(schema={"ts_code": pl.Utf8, "name": pl.Utf8})
+# @cache
+# def stock_code_sus(date: DateLike) -> pl.DataFrame:
+#     ymd = to_ymd_str(date)
+#     try:
+#         raw = ak.stock_tfp_em(date=ymd)
+#         if raw.empty:
+#             return pl.DataFrame(schema={"ts_code": pl.Utf8, "name": pl.Utf8})
 
-        df = pl.from_pandas(raw).select(
-            pl.col("代码").alias("ts_code"),
-            pl.col("名称").alias("name"),
-        )
-        df = df.with_columns(
-            pl.col("ts_code").cast(pl.Utf8),
-            pl.col("name").cast(pl.Utf8),
-        )
-        return df
-    except Exception as e:
-        log.error(f"Failed to fetch stock_tfp_em for {ymd}: {e}")
-        return pl.DataFrame(schema={"ts_code": pl.Utf8, "name": pl.Utf8})
+#         df = pl.from_pandas(raw).select(
+#             pl.col("代码").alias("ts_code"),
+#             pl.col("名称").alias("name"),
+#         )
+#         df = df.with_columns(
+#             pl.col("ts_code").cast(pl.Utf8),
+#             pl.col("name").cast(pl.Utf8),
+#         )
+#         return df
+#     except Exception as e:
+#         log.error(f"Failed to fetch stock_tfp_em for {ymd}: {e}")
+#         return pl.DataFrame(schema={"ts_code": pl.Utf8, "name": pl.Utf8})
 
 
 class SWIndustryCls:
@@ -557,7 +538,7 @@ class SWIndustryCls:
                     log.info(f"[{idx}/{total}] Processing {l3_code} ({l3_name})")
 
                 try:
-                    cons = self.sw_l3_constituents(l3_code)
+                    cons = self.sw_l3_cons(l3_code)
                     if cons.is_empty():
                         continue
 
@@ -681,7 +662,7 @@ class SWIndustryCls:
             log.error(f"L3 info fetch failed: {e}")
             return pl.DataFrame()
 
-    def sw_l3_constituents(self, sw_l3_code: str) -> pl.DataFrame:
+    def sw_l3_cons(self, sw_l3_code: str) -> pl.DataFrame:
         """Fetch constituents of one L3 industry"""
         try:
             raw = ak.sw_index_third_cons(symbol=sw_l3_code)
@@ -721,18 +702,7 @@ class SWIndustryCls:
             log.warning(f"Constituents fetch failed for {sw_l3_code}: {e}")
             return pl.DataFrame()
 
-    # @staticmethod
-    # def derive_sw_levels(l3_code: str) -> tuple[str, str, str]:
-    #     """Derive L1 and L2 codes from L3 code (Shenwan format)"""
-    #     base = l3_code.replace(".SI", "").strip()
-    #     if len(base) != 6 or not base.isdigit():
-    #         raise ValueError(f"Invalid Shenwan L3 code format: {l3_code}")
-
-    #     l1 = f"{base[:2]}0000.SI"
-    #     l2 = f"{base[:4]}00.SI"
-    #     return l1, l2, l3_code
-
-    def get_full_classification(self, fresh: bool = False) -> pl.DataFrame:
+    def stock_industry_cls(self, fresh: bool = False) -> pl.DataFrame:
         """Get or build the master table (ts_code → industry codes + join_date)"""
         if self._full_cls is None:
             log.info(f"Get full classification in force: {fresh}")
@@ -748,7 +718,7 @@ class SWIndustryCls:
         """Simplified L1 mapping: ts_code → sw_l1_code (optionally with names)
         Can be point-in-time if as_of_date is given.
         """
-        df = self.get_full_classification(fresh=fresh)
+        df = self.stock_industry_cls(fresh=fresh)
         if df.is_empty():
             return pl.DataFrame(schema={"ts_code": pl.Utf8, "sw_l1_code": pl.Utf8})
 
@@ -766,7 +736,7 @@ class SWIndustryCls:
         """Point-in-time industry classification valid on or before `as_of` date.
         Returns the latest known classification per stock where join_date <= as_of.
         """
-        df = self.get_full_classification()
+        df = self.stock_industry_cls()
         if df.is_empty():
             return pl.DataFrame()
 
@@ -816,48 +786,48 @@ class SWIndustryCls:
 
 
 class AkShareUniverse:
-    @staticmethod
-    def stock_whole() -> pl.DataFrame:
-        """Fetch A-Share stock universe in general."""
-        df = stock_code_whole()
-        return df
+    # @staticmethod
+    # def stock_whole() -> pl.DataFrame:
+    #     """Fetch A-Share stock universe in general."""
+    #     df = stock_code_whole()
+    #     return df
 
-    @staticmethod
-    def stock_slice(
-        trade_date: date | None = None,
-        min_listed_days: int = 365,
-        remove_st: bool = True,
-    ) -> pl.DataFrame:
-        trade_date = trade_date if trade_date else date.today()
-        log.info(f"Building tradable universe for {trade_date}")
+    # @staticmethod
+    # def stock_slice(
+    #     trade_date: date | None = None,
+    #     min_listed_days: int = 365,
+    #     remove_st: bool = True,
+    # ) -> pl.DataFrame:
+    #     trade_date = trade_date if trade_date else date.today()
+    #     log.info(f"Building tradable universe for {trade_date}")
 
-        universe = AkShareUniverse().stock_whole()
-        if universe.is_empty():
-            return pl.DataFrame(schema={"ts_code": pl.Utf8, "name": pl.Utf8})
+    #     universe = AkShareUniverse().stock_whole()
+    #     if universe.is_empty():
+    #         return pl.DataFrame(schema={"ts_code": pl.Utf8, "name": pl.Utf8})
 
-        delist = stock_code_delist()
+    #     delist = stock_code_delist()
 
-        q = (
-            universe.lazy()
-            .filter(pl.col("publish_date") <= pl.lit(trade_date))
-            .filter(
-                pl.col("publish_date")
-                <= pl.lit(trade_date - timedelta(days=min_listed_days))
-            )
-        )
+    #     q = (
+    #         universe.lazy()
+    #         .filter(pl.col("publish_date") <= pl.lit(trade_date))
+    #         .filter(
+    #             pl.col("publish_date")
+    #             <= pl.lit(trade_date - timedelta(days=min_listed_days))
+    #         )
+    #     )
 
-        if remove_st:
-            q = q.filter(~pl.col("name").str.contains(r"(?i)ST|\*ST"))
+    #     if remove_st:
+    #         q = q.filter(~pl.col("name").str.contains(r"(?i)ST|\*ST"))
 
-        if not delist.is_empty():
-            delisted = (
-                delist.filter(pl.col("off_date") <= pl.lit(trade_date))
-                .select("ts_code")
-                .lazy()  # Convert to LazyFrame
-            )
-            q = q.join(delisted, on="ts_code", how="anti")
+    #     if not delist.is_empty():
+    #         delisted = (
+    #             delist.filter(pl.col("off_date") <= pl.lit(trade_date))
+    #             .select("ts_code")
+    #             .lazy()  # Convert to LazyFrame
+    #         )
+    #         q = q.join(delisted, on="ts_code", how="anti")
 
-        return q.sort("ts_code").select(["ts_code", "name"]).collect()
+    #     return q.sort("ts_code").select(["ts_code", "name"]).collect()
 
     @staticmethod
     def csi_index_cons(symbol: str) -> pl.DataFrame:
@@ -891,15 +861,10 @@ class AkShareMicro:
         Returns list of pl.DataFrame **in the same order** as input `codes`.
         Empty DataFrame = no data / filtered / failed.
         """
-        worker = partial(
-            concur.Try()(AkShareMicro.market_ohlcv),
-            period=period,
-            start_date=start_date,
-            end_date=end_date,
-            adjust=adjust,
-        )
-        config = concur.BatchConfig.thread()
-        return concur.batch_fetch(config=config, worker=worker, items=symbols)
+        with EastMoney() as client:
+            return client.batch_stock_hist(
+                symbols, period, start_date, end_date, adjust
+            )
 
     @staticmethod
     @cache
@@ -908,7 +873,7 @@ class AkShareMicro:
     ) -> pl.DataFrame:
         with EastMoney() as client:
             if year is None or quarter is None:
-                year, quarter = cur_quarter_end()
+                year, quarter = cur_quarter()
             return client.quarterly_income(year, quarter)
 
     @staticmethod
@@ -918,7 +883,7 @@ class AkShareMicro:
     ) -> pl.DataFrame:
         with EastMoney() as client:
             if year is None or quarter is None:
-                year, quarter = cur_quarter_end()
+                year, quarter = cur_quarter()
             return client.quarterly_balance(year, quarter)
 
     @staticmethod
@@ -928,22 +893,8 @@ class AkShareMicro:
     ) -> pl.DataFrame:
         with EastMoney() as client:
             if year is None or quarter is None:
-                year, quarter = cur_quarter_end()
+                year, quarter = cur_quarter()
             return client.quarterly_cashflow(year, quarter)
-
-    @staticmethod
-    def _fundamental_worker(
-        client: EastMoney, year: int, quarter: Quarter
-    ) -> pl.DataFrame:
-        inc = client.quarterly_income(year, quarter)
-        bal = client.quarterly_balance(year, quarter)
-        cf = client.quarterly_cashflow(year, quarter)
-
-        if all(df.is_empty() for df in (inc, bal, cf)):
-            return pl.DataFrame()
-
-        keys = ["ts_code", "name", "notice_date"]
-        return inc.join(bal, on=keys).join(cf, on=keys)
 
     @staticmethod
     def quarterly_fundamentals(
@@ -951,37 +902,29 @@ class AkShareMicro:
     ) -> pl.DataFrame:
         with EastMoney() as client:
             if year is None or quarter is None:
-                year, quarter = cur_quarter_end()
-            return AkShareMicro._fundamental_worker(client, year, quarter)
+                year, quarter = cur_quarter()
+            inc = client.quarterly_income(year, quarter)
+            bal = client.quarterly_balance(year, quarter)
+            cf = client.quarterly_cashflow(year, quarter)
+
+            keys = ["ts_code", "name", "notice_date"]
+            return inc.join(bal, on=keys).join(cf, on=keys)
 
     @staticmethod
     def batch_quarterly_fundamentals(
-        yqs: Sequence[tuple[int, Quarter]],
+        start: date,
+        end: date,
     ) -> list[pl.DataFrame]:
-        @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=1, min=4, max=10),
-        )
-        def worker(yq: tuple[int, Quarter]) -> pl.DataFrame:
-            year, quarter = yq
-            return AkShareMicro.quarterly_fundamentals(year, quarter)
+        with EastMoney() as client:
+            incs = client.batch_quarterly_income(start, end)
+            bals = client.batch_quarterly_balance(start, end)
+            cfs = client.batch_quarterly_cashflow(start, end)
 
-        config = concur.BatchConfig.thread()
-        return concur.batch_fetch(config=config, worker=worker, items=yqs)
-        # with EastMoney() as client:
-
-        #     def worker(yq: tuple[int, Quarter]) -> pl.DataFrame:
-        #         year, quarter = yq
-        #         return concur.Try()(AkShareMicro._fundamental_worker)(
-        #             client, year, quarter
-        #         )
-
-        #     config = concur.BatchConfig.thread()
-        #     return concur.batch_fetch(
-        #         config=config,
-        #         worker=worker,
-        #         items=yqs,
-        #     )
+            keys = ["ts_code", "name", "notice_date"]
+            return [
+                inc.join(bal, on=keys).join(cf, on=keys)
+                for inc, bal, cf in zip(incs, bals, cfs, strict=True)
+            ]
 
 
 class AkShareMacro:

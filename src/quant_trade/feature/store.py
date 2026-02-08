@@ -1,5 +1,5 @@
-import datetime
 from collections.abc import Sequence
+from datetime import date
 from functools import reduce
 from typing import (
     ClassVar,
@@ -18,7 +18,6 @@ import quant_trade.provider.baostock as bs
 from quant_trade.config.arctic import ArcticAdapter, ArcticDB, Lib
 from quant_trade.config.logger import log
 from quant_trade.feature.process import MarginShort, Northbound, Shibor
-from quant_trade.provider.traits import Source
 
 from .process import (
     Behavioral,
@@ -150,24 +149,26 @@ class CNStockPool(AssetLib):
     REGION = "CN"
     SYMBOL = "stock"
 
-    type Book = Literal["stock_code", "industry_code"]
-    type Universe = Literal["sci","ssmi" , "csi500", "csi1000", "csi2000", "csia100","csia500_value"]
+    type Book = Literal["industry_code"]
+    type Universe = Literal[
+        "sci", "ssmi", "csi500", "csi1000", "csi2000", "csia100", "csia500_value"
+    ]
 
     def __init__(self, db: ArcticDB):
         AssetLib.__init__(self, db)
 
     @staticmethod
-    def _index_universe(universe: Universe, date: datetime.date) -> str:
+    def _index_universe(universe: Universe, date: date) -> str:
         return f"{universe}_{date}"
 
     def _fetch_whole(self, book: Book) -> pl.DataFrame:
         match book:
-            case "stock_code":
-                return ak.AkShareUniverse().stock_whole()
+            # case "stock_code":
+            #     return ak.AkShareUniverse().stock_whole()
             case "industry_code":
                 return ak.SWIndustryCls().stock_l1_industry_cls()
 
-    def _fetch_pool(self, universe: Universe, date: datetime.date) -> pl.DataFrame:
+    def _fetch_pool(self, universe: Universe, date: date) -> pl.DataFrame:
         match universe:
             case "sci":
                 return ak.AkShareUniverse().csi_index_cons("000001")
@@ -193,7 +194,7 @@ class CNStockPool(AssetLib):
     def read_pool(
         self,
         universe: Universe,
-        date: datetime.date,
+        date: date,
         industry_cls: bool = False,
         fresh: bool = False,
     ) -> pl.DataFrame:
@@ -212,9 +213,9 @@ class CNMarket(BookLib[str], BatchBookLib[str], AssetLib):
     REGION = "CN"
     SYMBOL = "market"
 
-    def __init__(self, db: ArcticDB, source: Source = "akshare"):
+    def __init__(self, db: ArcticDB, source: Literal["akshare","baostock"] = "akshare"):
         AssetLib.__init__(self, db)
-        self._source: Source = source
+        self._source= source
 
     def _key(self, book: str) -> str:
         return book
@@ -253,8 +254,8 @@ class CNMarket(BookLib[str], BatchBookLib[str], AssetLib):
     def range_read(
         self,
         books: Sequence[str],
-        start: datetime.date,
-        end: datetime.date,
+        start: date,
+        end: date,
         fresh: bool = False,
     ) -> pl.DataFrame:
         stack = self.stack_read(books=books, fresh=fresh)
@@ -270,15 +271,16 @@ class CNFundamental(BookLib[QuarterBook], BatchBookLib[QuarterBook], AssetLib):
         AssetLib.__init__(self, db)
 
     def _key(self, book: QuarterBook) -> str:
-        return book.to_key()
+        return book.key
 
     def _fetch(self, book: QuarterBook) -> pl.DataFrame:
         return ak.AkShareMicro().quarterly_fundamentals(book.year, book.literal_quarter)
 
-    def _fetch_batch(self, books: Sequence[QuarterBook]) -> list[pl.DataFrame]:
-        return ak.AkShareMicro().batch_quarterly_fundamentals(
-            yqs=[(book.year, book.literal_quarter) for book in books]
-        )
+    def _fetch_batch(self, books: Sequence[QuarterBook]) -> Sequence[pl.DataFrame]:
+        return [
+            ak.AkShareMicro().quarterly_fundamentals(book.year, book.literal_quarter)
+            for book in books
+        ]
 
     def _process(self, book: QuarterBook, raw: pl.DataFrame) -> pl.DataFrame:
         log.debug(f"raw df: {raw.head(5)}")
@@ -292,10 +294,27 @@ class CNFundamental(BookLib[QuarterBook], BatchBookLib[QuarterBook], AssetLib):
     def read(self, book: QuarterBook, fresh: bool = False) -> pl.DataFrame:
         return self._read(book, fresh=fresh)
 
-    def range_read(
-        self, start: datetime.date, end: datetime.date, fresh: bool = False
-    ) -> pl.DataFrame:
-        frames = self._batch_read(list(QuarterBook.date_range(start, end)), fresh=fresh)
+    def update_range(self, start: date, end: date, force: bool = False):
+        """
+        Optimized Batch Entry Point.
+        Fetches the entire range once, then distributes data to individual quarter books.
+        """
+        log.info(f"Batch updating {self.SYMBOL} from {start} to {end}")
+
+        raw_frames = ak.AkShareMicro().batch_quarterly_fundamentals(start, end)
+        books = list(QuarterBook.date_range(start, end))
+        for book, df in zip(books, raw_frames, strict=True):
+            if not df.is_empty() or force:
+                processed = self._process(book, df)
+                self._try_write(self._key(book), processed)
+
+    def range_read(self, start: date, end: date, fresh: bool = False) -> pl.DataFrame:
+        books = list(QuarterBook.date_range(start, end))
+        if fresh:
+            self.update_range(start, end)
+        frames = self._batch_read(books)
+        if not frames:
+            return pl.DataFrame()
         return pl.concat(frames, how="vertical_relaxed")
 
 

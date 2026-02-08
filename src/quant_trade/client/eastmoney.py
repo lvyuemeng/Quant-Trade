@@ -12,8 +12,9 @@ Uses generic traits from trait.py for reusable patterns.
 """
 
 import asyncio
-import datetime
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date
 from typing import Final
 
 import polars as pl
@@ -26,7 +27,7 @@ from quant_trade.client.traits import (
 )
 from quant_trade.config.logger import log
 
-from ..transform import AdjustCN, Period, quarter_range
+from ..transform import AdjustCN, Period, Quarter, quarter_range
 
 # =============================================================================
 # Constants
@@ -379,6 +380,7 @@ class BalanceSheetBuilder(BaseBuilder):
     OUTPUT_ORDER = [
         "ts_code",
         "name",
+        "notice_date",
         "total_asset",
         "total_asset_yoy",
         "cash",
@@ -391,7 +393,6 @@ class BalanceSheetBuilder(BaseBuilder):
         "debt_asset_ratio",
         "current_ratio",
         "total_equity",
-        "notice_date",
     ]
 
     DATE_COL = "notice_date"
@@ -420,6 +421,7 @@ class CashFlowBuilder(BaseBuilder):
     OUTPUT_ORDER = [
         "ts_code",
         "name",
+        "notice_date",
         "net_cashflow",
         "net_cashflow_yoy",
         "cfo",
@@ -428,7 +430,6 @@ class CashFlowBuilder(BaseBuilder):
         "cfi_ratio",
         "cff",
         "cff_ratio",
-        "notice_date",
     ]
 
     DATE_COL = "notice_date"
@@ -519,7 +520,7 @@ class ReportPipe:
         self._fetcher = fetcher
         self._config = config
 
-    async def fetch_one(self, year: int, quarter: int) -> pl.DataFrame:
+    async def fetch_one(self, year: int, quarter: Quarter) -> pl.DataFrame:
         """Fetch quarterly report data.
 
         Args:
@@ -587,10 +588,10 @@ class KlinePipe:
     async def fetch_one(
         self,
         symbol: str,
-        start_date,
-        end_date,
-        period,
-        adjust,
+        start_date: date,
+        end_date: date,
+        period: Period = "daily",
+        adjust: AdjustCN | None = None,
     ) -> pl.DataFrame:
         """Fetch stock historical data (kline).
 
@@ -612,7 +613,6 @@ class KlinePipe:
         )
 
         raw = await self._fetcher.fetch_once(EASTMONEY_KLINE_API, params)
-
         parser = KlineParser()
         data = parser.parse(raw)
         if not data:
@@ -623,11 +623,6 @@ class KlinePipe:
         builder = KlineBuilder()
         df = builder.normalize(df)
         return df
-
-
-# =============================================================================
-# Main Class (No Inner Fetcher Exposed)
-# =============================================================================
 
 
 class EastMoney:
@@ -667,63 +662,47 @@ class EastMoney:
             builder_class=CashFlowBuilder,
         )
 
-    def batch_fetch_by(
-        self, config: ReportConfig, start_date: datetime.date, end_date: datetime.date
+    def _report(
+        self, config: ReportConfig, year: int, quarter: Quarter
     ) -> pl.DataFrame:
-        log.info(f"Fetching quarterly income from {start_date} to {end_date}")
+        """Internal generic fetcher to DRY up the public API."""
+        log.info(f"Fetching {config.report_name} for {year} Q{quarter}")
         pipe = ReportPipe(self._fetcher, config)
-        date_range = quarter_range(start_date=start_date, end_date=end_date)
+        return self._fetcher.run(pipe.fetch_one(year, quarter))
+
+    def quarterly_income(self, year: int, quarter: Quarter) -> pl.DataFrame:
+        return self._report(self._income_config, year, quarter)
+
+    def quarterly_balance(self, year: int, quarter: Quarter) -> pl.DataFrame:
+        return self._report(self._balance_config, year, quarter)
+
+    def quarterly_cashflow(self, year: int, quarter: Quarter) -> pl.DataFrame:
+        return self._report(self._cashflow_config, year, quarter)
+
+    def _batch_report(
+        self, config: ReportConfig, start: date, end: date
+    ) -> list[pl.DataFrame]:
+        log.info(f"Fetching quarterly income from {start} to {end}")
+        pipe = ReportPipe(self._fetcher, config)
+        date_range = quarter_range(start_date=start, end_date=end)
         tasks = [pipe.fetch_one(year, quarter) for year, quarter in date_range]
         return self._fetcher.run(asyncio.gather(*tasks))
 
-    def quarterly_income(self, year: int, quarter: int) -> pl.DataFrame:
-        """Fetch quarterly income statement data.
+    def batch_quarterly_income(self, start: date, end: date) -> list[pl.DataFrame]:
+        return self._batch_report(self._income_config, start, end)
 
-        Args:
-            year: Report year (e.g., 2024)
-            quarter: Report quarter (1, 2, 3, or 4)
+    def batch_quarterly_balance(self, start: date, end: date) -> list[pl.DataFrame]:
+        return self._batch_report(self._balance_config, start, end)
 
-        Returns:
-            Polars DataFrame with income statement data
-        """
-        log.info(f"Fetching quarterly income for {year} Q{quarter}")
-        pipe = ReportPipe(self._fetcher, self._income_config)
-        return self._fetcher.run(pipe.fetch_one(year, quarter))
-
-    def quarterly_balance(self, year: int, quarter: int) -> pl.DataFrame:
-        """Fetch quarterly balance sheet data.
-
-        Args:
-            year: Report year (e.g., 2024)
-            quarter: Report quarter (1, 2, 3, or 4)
-
-        Returns:
-            Polars DataFrame with balance sheet data
-        """
-        log.info(f"Fetching quarterly balance for {year} Q{quarter}")
-        pipe = ReportPipe(self._fetcher, self._balance_config)
-        return self._fetcher.run(pipe.fetch_one(year, quarter))
-
-    def quarterly_cashflow(self, year: int, quarter: int) -> pl.DataFrame:
-        """Fetch quarterly cash flow statement data.
-
-        Args:
-            year: Report year (e.g., 2024)
-            quarter: Report quarter (1, 2, 3, or 4)
-
-        Returns:
-            Polars DataFrame with cash flow data
-        """
-        log.info(f"Fetching quarterly cashflow for {year} Q{quarter}")
-        pipe = ReportPipe(self._fetcher, self._cashflow_config)
-        return self._fetcher.run(pipe.fetch_one(year, quarter))
+    def batch_quarterly_cashflow(self, start: date, end: date) -> list[pl.DataFrame]:
+        return self._batch_report(self._cashflow_config, start, end)
 
     def batch_stock_hist(
         self,
-        symbols: list[str],
+        symbols: Sequence[str],
         period: Period = "daily",
-        start_date: datetime.date | None = None,
-        end_date: datetime.date | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> list[pl.DataFrame]:
         """Fetch stock historical data (kline).
@@ -741,11 +720,11 @@ class EastMoney:
         log.info(f"Fetching stock historical data for {symbols}")
         pipe = KlinePipe(self._fetcher)
         if start_date is None:
-            start_date = datetime.date(1970, 1, 1)
+            start_date = date(1970, 1, 1)
         if end_date is None:
-            end_date = datetime.date(2050, 1, 1)
+            end_date = date(2050, 1, 1)
         tasks = [
-            pipe.fetch_one(symbol, period, start_date, end_date, adjust)
+            pipe.fetch_one(symbol, start_date, end_date, period, adjust)
             for symbol in symbols
         ]
         return self._fetcher.run(asyncio.gather(*tasks))
@@ -754,8 +733,8 @@ class EastMoney:
         self,
         symbol: str,
         period: Period = "daily",
-        start_date: datetime.date | None = None,
-        end_date: datetime.date | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
         adjust: AdjustCN | None = "hfq",
     ) -> pl.DataFrame:
         """Fetch stock historical data (kline).

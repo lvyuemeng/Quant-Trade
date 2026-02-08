@@ -46,6 +46,22 @@ def to_ymd_str(d: DateLike, sep: str = "") -> str:
     return dt.strftime("%Y%m%d")
 
 
+def cur_quarter() -> tuple[int, Quarter]:
+    """Most recent completed quarter end (explicit — no None handling)"""
+    today = datetime.now().date()
+    year = today.year
+    month = today.month
+
+    if month <= 3:
+        return (year - 1, 4)
+    elif month <= 6:
+        return (year, 1)
+    elif month <= 9:
+        return (year, 2)
+    else:
+        return (year, 3)
+
+
 def quarter_next(year: int, quarter: Quarter) -> tuple[int, Quarter]:
     """Get the next quarter."""
     if quarter == 4:

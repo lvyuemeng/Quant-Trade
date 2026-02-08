@@ -1,9 +1,9 @@
 from datetime import date
+from pathlib import Path
 
 import polars as pl
 
 from quant_trade.config.arctic import ArcticDB
-from quant_trade.config.logger import debug_null_profile
 from quant_trade.feature.query import MacroBook
 from quant_trade.feature.store import (
     CNFundamental,
@@ -13,7 +13,6 @@ from quant_trade.feature.store import (
     CNStockPool,
 )
 from quant_trade.model.lgb import (
-    MetricConfig,
     Predictor,
     Processor,
     Trainer,
@@ -24,7 +23,6 @@ from quant_trade.model.process import (
     WalkForwardValidation,
 )
 from quant_trade.model.store import FSStorage, ModelStore
-from tests.conftest import smoke_configure
 
 LABEL = [
     "ret_1m",
@@ -84,123 +82,108 @@ SELECTED_NEUTRAL = [
 
 
 def reorder(data: pl.DataFrame, label: str) -> pl.DataFrame:
-    return data.select(
-        [
-            pl.col("date"),
-            pl.col("ts_code"),
-            pl.col(label),
-            pl.all().exclude("date", "ts_code", label),
-        ]
-    )
+    """Consistently orders columns: IDs first, then Label (if exists), then Features."""
+    base_cols = ["date", "ts_code"]
+    cols = [c for c in [*base_cols, label] if c in data.columns]
+    return data.select([*cols, pl.all().exclude([*base_cols, label])])
 
 
 def stack_all(
     market: pl.DataFrame, fund: pl.DataFrame, macro: pl.DataFrame
 ) -> pl.DataFrame:
-    market = market.sort(by="date").with_columns(pl.col("date").cast(pl.Date))
-    fund = fund.sort(by=["ts_code", "notice_date"]).with_columns(
-        pl.col("notice_date").cast(pl.Date)
-    )
-    macro = macro.sort(by=["date"]).with_columns(pl.col("date").cast(pl.Date))
-
+    """Joins datasets using Point-in-Time (PIT) logic."""
+    market = market.sort("date").with_columns(pl.col("date").cast(pl.Date))
+    fund = fund.sort("notice_date").with_columns(pl.col("notice_date").cast(pl.Date))
+    macro = macro.sort("date").with_columns(pl.col("date").cast(pl.Date))
     merged = market.join_asof(
         fund,
         left_on="date",
         right_on="notice_date",
-        by=["ts_code"],
+        by="ts_code",
         strategy="backward",
     )
-    merged = merged.join(macro, on="date", how="inner")
-    merged = merged.sort("ts_code", "date")
-    print(f"debug null profile {debug_null_profile(merged)}")
-
-    # merged = merged.filter(
-    # (pl.col("date").diff().over("ts_code") > pl.duration(days=5))
-    # | (pl.col("date").diff().over("ts_code").is_null())
-    # )
-
-    # print(f"merged: {merged.filter(pl.col("date") > date(2025,12,1))}")
-    return merged
+    merged = merged.join(macro, on="date", how="left")
+    return merged.sort("ts_code", "date")
 
 
 def merged_data(
-    zfeatures: list[str],symbol:str, label: str, start: date, end: date
+    zfeatures: list[str], symbol: str, label: str, start: date, end: date
 ) -> tuple[pl.DataFrame, list[str]]:
+    """Loads and merges daily data, then downsamples for modeling."""
     db = ArcticDB.from_config()
     pool = CNStockPool(db)
     market = CNMarket(db, source="akshare")
     fund = CNFundamental(db)
     macro = CNMacro(db)
-    cons = pool.read_pool(symbol, date=end) # pyright: ignore[reportArgumentType]
+
+    cons = pool.read_pool(symbol, date=end)  # pyright: ignore[reportArgumentType]
     ts_codes = cons["ts_code"].to_list()
-    market_df = (
-            market.range_read(books=ts_codes, start=start, end=end)
-            .filter(pl.col("date").dt.weekday() == 5)
-        )
+
+    market_df = market.range_read(books=ts_codes, start=start, end=end)
     fund_df = fund.range_read(start=start, end=end)
+
     sector = CNIndustrySectorGroup(db, factors=zfeatures, zsuffix="z")
     neu_fund_df = sector(fund_df)
     north_df = macro.read(book=MacroBook("northbound"))
 
     merged = stack_all(market_df, neu_fund_df, north_df)
-    merged = reorder(merged, label=label).filter(pl.col("date").dt.weekday() == 5)
-    # sample_code = "000012"
-    # check = merged.filter(pl.col("ts_code") == sample_code).select(["date", "notice_date", "roe"])
-    # print(check.tail(20))
-    # print(merged.filter(pl.col("ts_code") == "000012").select(pl.col("notice_date").min()))
-    # full_info_sample = merged.filter(
-    #     pl.col("roe").is_not_null() & 
-    #     pl.col("gross_margin").is_not_null()
-    # ).head(10)
-
-    # print("Rows where fundamentals are fully present:")
-    # print(full_info_sample.select(["date", "ts_code", "roe", "gross_margin"]))
+    merged = merged.filter(pl.col("date").dt.weekday() == 5)
+    merged = reorder(merged, label)
     return (merged, sector.zfactors())
 
 
-def train(data: pl.DataFrame, name: str, label: str, features: list[str]):
-    # Use DiscreteLabelBuilder for LambdaRank (discrete relevance labels)
-    discrete_label = DiscreteLabelBuilder(label, rank_by="date", num_bins=6)
-    metric_config = MetricConfig.ranking(discrete_label)
-    processor = Processor(idents=["ts_code"], features=features, config=metric_config)
-    trainer = Trainer(processor=processor)
+def train(data: pl.DataFrame, model_name: str, label: str, features: list[str]):
+    """Standardizes the training flow."""
+    print(f"Starting Training: {model_name} on {label}")
 
+    discrete_label = DiscreteLabelBuilder(label, rank_by="date", num_bins=6)
+    processor = Processor.ranking(discrete_label)
+    trainer = Trainer(processor=processor, features=features)
     data_batch = WalkForwardValidation(5, horizon_days=0, embargo_days=0).split(
         data, date_col="date"
     )
+
     result = trainer.batch_train(data_batch, TuneConfig())
-    print(f"{result}")
-    card = result.pack(name=name)
+    card = result.pack(name=model_name)
     store = ModelStore(FSStorage(base_dir="./model"))
     store.register(card=card, overwrite=True)
+    print(f"Model {model_name} successfully stored.")
 
 
-def predict(data: pl.DataFrame, name: str, label: str) -> pl.DataFrame:
+def predict(data: pl.DataFrame, model_name: str, label: str) -> pl.DataFrame:
+    """Standardizes the inference flow."""
+    print(f"Starting Prediction using: {model_name}")
+
     store = ModelStore(FSStorage(base_dir="./model"))
-    discrete_label = DiscreteLabelBuilder(label, rank_by="date", num_bins=6)
-    config = MetricConfig.ranking(discrete_label)
-    predictor = Predictor.from_store(["ts_code"], config, store, name)
-    return predictor.predict(data, score_name="predict_score").sort(
-        by="predict_score", descending=True
-    )
+    predictor = Predictor.from_store(model_name, store=store)
+    scored_df = predictor.predict(data, score_name="predict_score")
+
+    return scored_df.sort(by=["date", "predict_score"], descending=[False, True])
 
 
+# --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    # smoke_configure()
-    label = "ret_1m"
-    # pl.Config(tbl_cols=20, tbl_rows=100)
-    # start = date(2016, 9, 1)
-    # end = date(2025, 1, 1)
-    # data, zfactors = merged_data(SELECTED_NEUTRAL, "csi1000",label, start, end)
-    # train(
-    #     data, name=f"17_25_{label}", label=label, features=zfactors + SELECTED
-    # )
-    symbol = "ssmi"
-    start = date(2025, 2, 1)
-    end = date(2026, 2, 7)
-    data, zfactors = merged_data(SELECTED_NEUTRAL,symbol, label, start, end)
-    data = reorder(data, label)
-    res = predict(data=data, name=f"17_25_{label}", label=label)
-    res = res.filter(pl.col("date").is_between(date(2025, 12, 1), date(2026, 2, 7)))
-    print(f"{res.columns} \n {res}")
-    res.to_pandas().to_excel(f"./predict/predict_{label}_{symbol}.xlsx",)
+    current_label = "ret_1m"
+    model_id = f"v1_17_25_{current_label}"
+
+    # train_start, train_end = date(2017, 1, 1), date(2024, 12, 31)
+    # train_raw, z_feats = merged_data(SELECTED_NEUTRAL, "csi1000", current_label, train_start, train_end)
+    # full_features = z_feats + SELECTED
+    # run_training_pipeline(train_raw, model_id, current_label, full_features)
+
+    pred_symbol = "ssmi"
+    pred_start, pred_end = date(2025, 2, 1), date(2026, 2, 7)
+    pred_raw, _ = merged_data(
+        SELECTED_NEUTRAL, pred_symbol, current_label, pred_start, pred_end
+    )
+    pred_raw = reorder(pred_raw, current_label)
+    results = predict(pred_raw, model_id, current_label)
+
+    final_view = results.filter(
+        pl.col("date").is_between(date(2025, 12, 1), date(2026, 2, 7))
+    )
+    out_dir = Path("./predict")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    file_path = out_dir / f"output_{current_label}_{pred_symbol}.xlsx"
+    final_view.to_pandas().to_excel(file_path, index=False)
+    print(f"Final predictions saved to {file_path}")

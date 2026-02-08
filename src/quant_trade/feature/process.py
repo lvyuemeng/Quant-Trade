@@ -17,10 +17,6 @@ from quant_trade.config.logger import log
 from ..transform import GSIZE
 
 
-class Metric(Protocol):
-    @staticmethod
-    def metrics(df: pl.DataFrame) -> pl.DataFrame: ...
-
 
 class Fundamental:
     """Fundamental factor engineering for Chinese A-shares quarterly data.
@@ -1277,7 +1273,6 @@ class SectorGroup:
         return [self.flow.col_name(f, self.zsuffix, is_tmp=False) for f in self.factors]
 
     def normalize(self, df: pl.DataFrame) -> pl.DataFrame:
-        # ---- validate ----
         missing = set(self.by).difference(df.columns)
         if missing:
             log.warning(f"Missing group keys {missing}, skip normalization")

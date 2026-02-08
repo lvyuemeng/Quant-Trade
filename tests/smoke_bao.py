@@ -1,12 +1,10 @@
 from datetime import date
-from typing import Final
 
 import quant_trade.provider.baostock as bs
+from tests.conftest import smoke_configure
 
-from .conftest import smoke_configure
-
-INDEX_CODE: Final[str] = "000001"
-PERIOD: Final[str] = "daily"
+INDEX_CODE = "000001"
+PERIOD = "daily"
 
 
 def test_stock_daily(m: bs.BaoMicro):

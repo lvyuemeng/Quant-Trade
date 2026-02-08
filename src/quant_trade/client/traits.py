@@ -204,7 +204,7 @@ class BaseFetcher:
                 ),
                 reraise=True,
             )
-            async def _do():
+            async def _do() -> Any:
                 return await self._fetch_once(url, params)
 
             try:
@@ -223,6 +223,7 @@ class BaseFetcher:
                 await self.controller.record_failure(
                     weight=1.0 if "429" in str(e) else 0.5
                 )
+                log.error(f"Fetching error: {e}")
                 return {}
 
     async def _fetch_page(self, url: str, params: dict, page: int) -> Any:

@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Final
 
 import polars as pl
@@ -10,8 +11,7 @@ from quant_trade.feature.process import (
     Northbound,
     Shibor,
 )
-
-from .conftest import smoke_configure
+from tests.conftest import smoke_configure
 
 INDEX_CODE: Final[str] = "000001"
 PERIOD: Final[str] = "daily"
@@ -46,6 +46,17 @@ def test_quarter_cashflow(m: ak.AkShareMicro):
 def test_quarter_fundamental(m: ak.AkShareMicro):
     df = m.quarterly_fundamentals(year=SHEET_YEAR, quarter=SHEET_QUATER)
     print(f"quarter balance: {df.columns} \n {len(df)} {df}")
+
+
+def test_batch_quarter_fundamental(m: ak.AkShareMicro):
+    dfs = m.batch_quarterly_fundamentals(date(2015, 1, 1), date(2015, 12, 1))
+    print(f"quarters fetched: {len(dfs)}")
+    for df in dfs[:3]:
+        if df.is_empty():
+            print("DataFrame is empty")
+        else:
+            print(f"Shape: {df.shape}")
+            print(df.head(5))
 
 
 def test_northbound(m: ak.AkShareMacro):
@@ -120,14 +131,16 @@ def test_shiborf(m: ak.AkShareMacro):
 
 if __name__ == "__main__":
     smoke_configure()
+    pl.Config(tbl_cols=20)
 
     # === Micro ===
     micro = ak.AkShareMicro()
-    test_stock_daily(micro)
+    # test_stock_daily(micro)
     # test_quarter_income(micro)
     # test_quarter_balance(micro)
     # test_quarter_cashflow(micro)
     # test_quarter_fundamental(micro)
+    test_batch_quarter_fundamental(micro)
     # === Macro ===
     macro = ak.AkShareMacro()
     # test_northbound(macro)
