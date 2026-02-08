@@ -538,7 +538,7 @@ class ReportPipe:
         builder = self._config.builder_class()
 
         fetcher = self._fetcher
-        raw =await fetcher.fetch_once(self._config.url, params)
+        raw = await fetcher.fetch_once(self._config.url, params)
         if not raw:
             log.error("Failed to fetch raw data")
             return pl.DataFrame()
@@ -553,7 +553,9 @@ class ReportPipe:
         # Fetch remaining pages concurrently
         if total_pages > 1:
             pages_to_fetch = list(range(2, total_pages + 1))
-            page_results = await fetcher.fetch_pages_concurrent(self._config.url, params, pages_to_fetch)
+            page_results = await fetcher.fetch_pages_concurrent(
+                self._config.url, params, pages_to_fetch
+            )
 
             for page_raw in page_results:
                 page_data = parser.parse(page_raw)
@@ -665,11 +667,13 @@ class EastMoney:
             builder_class=CashFlowBuilder,
         )
 
-    def batch_fetch_by(self,config:ReportConfig,start_date:datetime.date,end_date:datetime.date) -> pl.DataFrame:
+    def batch_fetch_by(
+        self, config: ReportConfig, start_date: datetime.date, end_date: datetime.date
+    ) -> pl.DataFrame:
         log.info(f"Fetching quarterly income from {start_date} to {end_date}")
-        pipe = ReportPipe(self._fetcher,config)
-        date_range = quarter_range(start_date=start_date,end_date=end_date)
-        tasks = [pipe.fetch_one(year,quarter) for year,quarter in date_range]
+        pipe = ReportPipe(self._fetcher, config)
+        date_range = quarter_range(start_date=start_date, end_date=end_date)
+        tasks = [pipe.fetch_one(year, quarter) for year, quarter in date_range]
         return self._fetcher.run(asyncio.gather(*tasks))
 
     def quarterly_income(self, year: int, quarter: int) -> pl.DataFrame:
@@ -740,7 +744,10 @@ class EastMoney:
             start_date = datetime.date(1970, 1, 1)
         if end_date is None:
             end_date = datetime.date(2050, 1, 1)
-        tasks = [pipe.fetch_one(symbol, period, start_date, end_date, adjust) for symbol in symbols]
+        tasks = [
+            pipe.fetch_one(symbol, period, start_date, end_date, adjust)
+            for symbol in symbols
+        ]
         return self._fetcher.run(asyncio.gather(*tasks))
 
     def stock_hist(
@@ -763,7 +770,13 @@ class EastMoney:
         Returns:
             Polars DataFrame with historical stock data
         """
-        return self.batch_stock_hist([symbol],period=period,start_date=start_date,end_date=end_date,adjust=adjust)[0]
+        return self.batch_stock_hist(
+            [symbol],
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+        )[0]
 
     def close(self) -> None:
         """Close the fetcher."""

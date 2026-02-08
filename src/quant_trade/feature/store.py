@@ -151,7 +151,7 @@ class CNStockPool(AssetLib):
     SYMBOL = "stock"
 
     type Book = Literal["stock_code", "industry_code"]
-    type Universe = Literal["sci", "csi500", "csi1000", "csi2000", "csia100"]
+    type Universe = Literal["sci","ssmi" , "csi500", "csi1000", "csi2000", "csia100","csia500_value"]
 
     def __init__(self, db: ArcticDB):
         AssetLib.__init__(self, db)
@@ -171,6 +171,8 @@ class CNStockPool(AssetLib):
         match universe:
             case "sci":
                 return ak.AkShareUniverse().csi_index_cons("000001")
+            case "ssmi":
+                return ak.AkShareUniverse().csi_index_cons("000046")
             case "csia100":
                 return ak.AkShareUniverse().csi_index_cons("000903")
             case "csi500":
@@ -179,6 +181,8 @@ class CNStockPool(AssetLib):
                 return ak.AkShareUniverse().csi_index_cons("932000")
             case "csi1000":
                 return ak.AkShareUniverse().csi_index_cons("000852")
+            case "csia500_value":
+                return ak.AkShareUniverse().csi_index_cons("932497")
 
     def read_codes(self, book: Book, fresh: bool = False) -> pl.DataFrame:
         if fresh or not self._has(book):
@@ -243,7 +247,6 @@ class CNMarket(BookLib[str], BatchBookLib[str], AssetLib):
 
     def stack_read(self, books: Sequence[str], fresh: bool = False) -> pl.DataFrame:
         frames = self._batch_read(books, fresh=fresh)
-        frames = [frame for frame in frames if not frame.is_empty()]
         df = pl.concat(frames, how="diagonal")
         return df
 
@@ -364,7 +367,6 @@ class CNMacro(BookLib[MacroBook], AssetLib):
         for book in MacroBook.list():
             try:
                 m = self._read(book, fresh=fresh)
-                m = m.rename({c: f"{c}_{book}" for c in m.columns if c != "date"})
                 frames.append(m)
             except KeyError as e:
                 log.warning(f"Failed to read book '{book}': {e}")
@@ -445,10 +447,10 @@ class CNIndustrySectorGroup(SectorGroup):
         self,
         db: ArcticDB,
         factors: list[str],
-        std_suffix: str = "z",
-        min_group_size: int = 5,
-        skip_winsor: bool = False,
         by: list[str] | None = None,
+        zsuffix: str = "z",
+        min_group_size: int = 5,
+        winsorize: bool = True,
         winsor_limits: tuple[float, float] = (0.01, 0.99),
     ):
         self.stock_pool = CNStockPool(db)
@@ -457,9 +459,9 @@ class CNIndustrySectorGroup(SectorGroup):
         super().__init__(
             by=group_by,
             factors=factors,
-            std_suffix=std_suffix,
+            zsuffix=zsuffix,
             min_group_size=min_group_size,
-            skip_winsor=skip_winsor,
+            winsorize=winsorize,
             winsor_limits=winsor_limits,
         )
 

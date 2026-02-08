@@ -1178,123 +1178,84 @@ class Shibor:
 
 @dataclass(frozen=True)
 class CrossSectionFlow:
-    """Build shared group-level statistics for multiple factors."""
-
     by: list[str]
     namespace: str = "cs"
     sep: str = "_"
+    q_limits: tuple[float, float] = (0.01, 0.99)
+    # Formalized internal prefix to avoid collisions with user columns
+    _TMP_PREFIX: str = "__tmp_cs_internal__"
 
-    @property
-    def prefix(self) -> str:
-        return f"{self.namespace}{self.sep}"
+    def col_name(self, factor: str, suffix: str, is_tmp: bool = False) -> str:
+        prefix = self._TMP_PREFIX if is_tmp else f"{self.namespace}{self.sep}"
+        return f"{prefix}{factor}{self.sep}{suffix}"
 
-    def alias(self, factor: str, suffix: str | None) -> str:
-        if suffix is None:
-            return f"{self.prefix}{factor}"
-        return f"{self.prefix}{factor}{self.sep}{suffix}"
-
-    def mean(self, factors: list[str]) -> list[pl.Expr]:
-        return [
-            pl.col(f).mean().over(self.by).alias(self.alias(f, "mean")) for f in factors
-        ]
-
-    def std(
+    def apply(
         self,
+        df: pl.DataFrame | pl.LazyFrame,
         factors: list[str],
-        *,
-        ddof: int = 1,
-        min_std: float = 1e-8,
-    ) -> list[pl.Expr]:
-        return [
-            pl.col(f)
-            .std(ddof=ddof)
-            .over(self.by)
-            .clip(lower_bound=min_std)
-            .alias(self.alias(f, "std"))
-            for f in factors
-        ]
-
-    def quantiles(
-        self,
-        factors: list[str],
-        limits: tuple[float, float],
-    ) -> list[pl.Expr]:
-        lo, hi = limits
-        exprs: list[pl.Expr] = []
+        winsorize: bool = True,
+        zsuffix: str = "z",
+    ) -> pl.DataFrame:
+        # 1. Build Intermediate Expressions
+        # We only include quantile expressions if winsorize is actually requested
+        stats_exprs = []
         for f in factors:
-            exprs.extend(
+            stats_exprs.extend(
                 [
-                    pl.col(f).quantile(lo).over(self.by).alias(self.alias(f, "qlo")),
-                    pl.col(f).quantile(hi).over(self.by).alias(self.alias(f, "qhi")),
+                    pl.col(f)
+                    .mean()
+                    .over(self.by)
+                    .alias(self.col_name(f, "mean", True)),
+                    pl.col(f).std().over(self.by).alias(self.col_name(f, "std", True)),
                 ]
             )
-        return exprs
 
-    # ---------- transforms (NO dependency on generated cols) ----------
+            if winsorize:
+                lo, hi = self.q_limits
+                stats_exprs.extend(
+                    [
+                        pl.col(f)
+                        .quantile(lo)
+                        .over(self.by)
+                        .alias(self.col_name(f, "qlo", True)),
+                        pl.col(f)
+                        .quantile(hi)
+                        .over(self.by)
+                        .alias(self.col_name(f, "qhi", True)),
+                    ]
+                )
 
-    def winsor(
-        self,
-        factors: list[str],
-        limits: tuple[float, float],
-    ) -> list[pl.Expr]:
-        """```
-        return [
-            pl.col(f)
-            .clip(
-                pl.col(f).quantile(lo).over(self.by),
-                pl.col(f).quantile(hi).over(self.by),
-            )
-            .alias(self.alias(f, "win"))
-            for f in factors
-        ]
-        ```
-        """
-        lo, hi = limits
-        return [
-            pl.col(f)
-            .clip(
-                pl.col(f).quantile(lo).over(self.by),
-                pl.col(f).quantile(hi).over(self.by),
-            )
-            .alias(self.alias(f, "win"))
-            for f in factors
-        ]
-
-    def zscore(
-        self,
-        factors: list[str],
-        *,
-        input_suffix: str | None = None,
-        output_suffix: str = "z",
-    ) -> list[pl.Expr]:
-        """Z-score using raw column or winsorized column."""
-        exprs: list[pl.Expr] = []
+        # 2. Build Final Transformation Expressions
+        trans_exprs = []
         for f in factors:
-            x = pl.col(self.alias(f, input_suffix)) if input_suffix else pl.col(f)
-            exprs.append(
-                (
-                    (x - pl.col(self.alias(f, "mean"))) / pl.col(self.alias(f, "std"))
-                ).alias(self.alias(f, output_suffix))
-            )
-        return exprs
+            # References to internals
+            mean = pl.col(self.col_name(f, "mean", True))
+            std = pl.col(self.col_name(f, "std", True)).clip(lower_bound=1e-9)
 
-    # ---------- utils ----------
+            if winsorize:
+                win_expr = pl.col(f).clip(
+                    pl.col(self.col_name(f, "qlo", True)),
+                    pl.col(self.col_name(f, "qhi", True)),
+                )
+                trans_exprs.append(win_expr.alias(self.col_name(f, "win")))
+                z_input = win_expr
+            else:
+                z_input = pl.col(f)
 
-    def stat_cols(self, df: pl.DataFrame) -> list[str]:
-        return [c for c in df.columns if c.startswith(self.prefix)]
+            z_score = ((z_input - mean) / std).alias(self.col_name(f, zsuffix))
+            trans_exprs.append(z_score)
 
-    @staticmethod
-    def rank(
-        factor: str | pl.Expr,
-        by: str | list[str],
-        ascending: bool = False,
-        name: str | None = None,
-    ) -> pl.Expr:
-        if isinstance(by, str):
-            by = [by]
-        c = pl.col(factor) if isinstance(factor, str) else factor
-        out = name or (c.meta.output_name() or "value") + "_rank"
-        return c.rank("average", descending=not ascending).over(by).alias(out)
+        # 3. Execution Pipeline
+        # We convert to lazy if it's not already to allow Polars to optimize the graph
+        is_lazy = isinstance(df, pl.LazyFrame)
+        lf = df.lazy() if not is_lazy else df
+
+        processed = (
+            lf.with_columns(stats_exprs)
+            .with_columns(trans_exprs)
+            .drop(pl.selectors.starts_with(self._TMP_PREFIX))
+        )
+        return processed.collect()
 
 
 @dataclass
@@ -1305,15 +1266,15 @@ class SectorGroup:
     factors: list[str]
 
     winsor_limits: tuple[float, float] = field(default=(0.01, 0.99))
-    skip_winsor: bool = field(default=False)
+    winsorize: bool = field(default=False)
     min_group_size: int = field(default=5)
-    std_suffix: str = field(default="z")
+    zsuffix: str = "z"
 
     def __post_init__(self):
-        self.flow = CrossSectionFlow(by=self.by)
+        self.flow = CrossSectionFlow(by=self.by, q_limits=self.winsor_limits)
 
     def zfactors(self) -> list[str]:
-        return [self.flow.alias(f, self.std_suffix) for f in self.factors]
+        return [self.flow.col_name(f, self.zsuffix, is_tmp=False) for f in self.factors]
 
     def normalize(self, df: pl.DataFrame) -> pl.DataFrame:
         # ---- validate ----
@@ -1327,7 +1288,6 @@ class SectorGroup:
             log.info("No valid factors to normalize")
             return df
 
-        flow = self.flow
         # ---- drop small groups ----
         if self.min_group_size > 1:
             df = (
@@ -1336,32 +1296,8 @@ class SectorGroup:
                 .drop(GSIZE)
             )
 
-        stat_exprs: list[pl.Expr] = []
-        stat_exprs += flow.mean(factors)
-        stat_exprs += flow.std(factors)
-
-        if not self.skip_winsor and self.winsor_limits is not None:
-            stat_exprs += flow.quantiles(factors, self.winsor_limits)
-
-        df = df.with_columns(stat_exprs)
-
-        out_exprs: list[pl.Expr] = []
-
-        if not self.skip_winsor and self.winsor_limits is not None:
-            df = df.with_columns(flow.winsor(factors, self.winsor_limits))
-            out_exprs += flow.zscore(
-                factors,
-                input_suffix="win",
-                output_suffix=self.std_suffix,
-            )
-        else:
-            out_exprs += flow.zscore(
-                factors,
-                input_suffix=None,
-                output_suffix=self.std_suffix,
-            )
-
-        df = df.with_columns(out_exprs)
-        df = df.drop(flow.stat_cols(df)).sort(self.by)
-
-        return df
+        flow = self.flow
+        processed = flow.apply(
+            df, factors, winsorize=self.winsorize, zsuffix=self.zsuffix
+        )
+        return processed
