@@ -23,6 +23,7 @@ from quant_trade.model.process import (
     WalkForwardValidation,
 )
 from quant_trade.model.store import FSStorage, ModelStore
+from tests.conftest import smoke_configure
 
 LABEL = [
     "ret_1m",
@@ -112,7 +113,7 @@ def merged_data(
     """Loads and merges daily data, then downsamples for modeling."""
     db = ArcticDB.from_config()
     pool = CNStockPool(db)
-    market = CNMarket(db, source="akshare")
+    market = CNMarket(db, source="baostock")
     fund = CNFundamental(db)
     macro = CNMacro(db)
 
@@ -150,7 +151,7 @@ def train(data: pl.DataFrame, model_name: str, label: str, features: list[str]):
     print(f"Model {model_name} successfully stored.")
 
 
-def predict(data: pl.DataFrame, model_name: str, label: str) -> pl.DataFrame:
+def predict(data: pl.DataFrame, model_name: str) -> pl.DataFrame:
     """Standardizes the inference flow."""
     print(f"Starting Prediction using: {model_name}")
 
@@ -163,21 +164,22 @@ def predict(data: pl.DataFrame, model_name: str, label: str) -> pl.DataFrame:
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    current_label = "ret_1m"
-    model_id = f"v1_17_25_{current_label}"
+    smoke_configure()
+    current_label = "ret_1q"
+    model_id = f"17_25_{current_label}"
 
     # train_start, train_end = date(2017, 1, 1), date(2024, 12, 31)
     # train_raw, z_feats = merged_data(SELECTED_NEUTRAL, "csi1000", current_label, train_start, train_end)
+    # print(f"{train_raw.columns}")
     # full_features = z_feats + SELECTED
-    # run_training_pipeline(train_raw, model_id, current_label, full_features)
+    # train(train_raw, model_id, current_label, full_features)
 
-    pred_symbol = "ssmi"
+    pred_symbol = "csi1000"
     pred_start, pred_end = date(2025, 2, 1), date(2026, 2, 7)
     pred_raw, _ = merged_data(
         SELECTED_NEUTRAL, pred_symbol, current_label, pred_start, pred_end
     )
-    pred_raw = reorder(pred_raw, current_label)
-    results = predict(pred_raw, model_id, current_label)
+    results = predict(pred_raw, model_id)
 
     final_view = results.filter(
         pl.col("date").is_between(date(2025, 12, 1), date(2026, 2, 7))

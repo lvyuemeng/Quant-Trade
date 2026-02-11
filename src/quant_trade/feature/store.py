@@ -215,7 +215,7 @@ class CNMarket(BookLib[str], BatchBookLib[str], AssetLib):
 
     def __init__(self, db: ArcticDB, source: Literal["akshare","baostock"] = "akshare"):
         AssetLib.__init__(self, db)
-        self._source= source
+        self._source:Literal["akshare","baostock"] = source
 
     def _key(self, book: str) -> str:
         return book

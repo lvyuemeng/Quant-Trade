@@ -385,12 +385,12 @@ class Behavioral:
 
         return (
             df.with_columns(
-                ret_1=pl.col("close").pct_change(1),
-                ret_4=pl.col("close").pct_change(4),
-                ret_12=pl.col("close").pct_change(12),
-                ret_1m=pl.col("close").pct_change(22),
-                ret_1q=pl.col("close").pct_change(65),
-                ret_1y=pl.col("close").pct_change(261),
+                ret_1=pl.col("close").shift(-1) / pl.col("close") - 1,
+                ret_4=pl.col("close").shift(-4) / pl.col("close") - 1,
+                ret_12=pl.col("close").shift(-12) / pl.col("close") - 1,
+                ret_1m=pl.col("close").shift(-22) / pl.col("close") - 1,
+                ret_1q=pl.col("close").shift(-65) / pl.col("close") - 1,
+                ret_1y=pl.col("close").shift(-261) / pl.col("close") - 1,
                 ma_4=pl.col("close").rolling_mean(4, min_samples=2),
                 ma_12=pl.col("close").rolling_mean(12, min_samples=4),
                 ma_24=pl.col("close").rolling_mean(24, min_samples=8),
